@@ -1,0 +1,33 @@
+cabal-version:      3.0
+name:               cardano-sieve
+version:            0.1.0.0
+synopsis:           Pattern-filtered chain index for Cardano
+description:
+  A chain-index for Cardano: given a set of patterns, it tracks every
+  matching UTxO — when it was created, when it was spent, and by what.
+  Single-threaded pipelined indexing architecture (ADR-020).
+license:            Apache-2.0
+author:             Jordan Millar
+maintainer:         jordan.millar@iohk.io
+build-type:         Simple
+
+common project-config
+  default-language: Haskell2010
+  ghc-options:
+    -Wall -Wcompat -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wredundant-constraints
+    -Wunused-packages
+
+library
+  import:          project-config
+  hs-source-dirs:  src
+  exposed-modules: Cardano.Sieve
+  build-depends:   base >=4.14
+
+executable cardano-sieve
+  import:         project-config
+  hs-source-dirs: app
+  main-is:        Main.hs
+  build-depends:
+    , base >=4.14
+    , cardano-sieve
