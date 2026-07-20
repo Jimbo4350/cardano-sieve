@@ -22,10 +22,12 @@ library
   import:          project-config
   hs-source-dirs:  src
   exposed-modules: Cardano.Sieve
+                   Cardano.Sieve.Selector
                    Cardano.Sieve.Node.Fetch
                    Cardano.Sieve.Node.Insert
   build-depends:
     , base                     >=4.14
+    , bytestring               ^>=0.12
     , cardano-api              ^>=11.2
     , cardano-slotting         ^>=0.2
     , optparse-applicative     ^>=0.19
@@ -42,3 +44,14 @@ executable cardano-sieve
   build-depends:
     , base >=4.14
     , cardano-sieve
+
+test-suite cardano-sieve-test
+  import:         project-config
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base          >=4.14
+    , cardano-sieve
+    , tasty         ^>=1.5
+    , tasty-hunit   ^>=0.10
