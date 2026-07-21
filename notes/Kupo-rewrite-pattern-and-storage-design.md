@@ -216,14 +216,61 @@ indexed (PK, `created_at`, txid slice); `spends` is append-only. Index the
 small table, not the big one. Historical / spent-inclusive queries are
 best-effort (scan, or an opt-in index on `outputs`), not first-class-fast.
 
+# Storage schema (Phase 3)
+
+Realised in `Cardano.Sieve.Schema` (authoritative DDL — `createSchema` +
+`installDeferredIndexes`), as inline `CREATE TABLE IF NOT EXISTS` string
+literals matching the Phase-1 convention. No migration engine yet:
+wipe-and-resync during development. The Phase-1 placeholder `block_header` table
+is superseded by these tables and is removed from the ingest path when Phase 4
+repoints ingest. Verified valid against `sqlite3` (foreign-key graph sound).
+
+Tables (columns are `BLOB` unless noted; `?` = nullable):
+
+- **blocks** (`slot_no` INT PK, `header_hash`) — durable slot → header-hash for
+  `created_at`/`spent_at` in results; one row per block with matched activity,
+  never pruned (sparse `checkpoints` can't serve this).
+- **outputs** (`output_reference` PK, `transaction_id`, `address`, `value`,
+  `datum_hash?`, `script_hash?`, `created_slot` INT) — append-only history,
+  never mutated, primary-key-only.
+- **unspent** (as `outputs` plus `payment_credential?`, `delegation_credential?`)
+  — the live set; INSERT on create, DELETE by PK on spend; carries every query
+  index.
+- **spends** (`output_reference` PK, `spending_transaction_id`,
+  `spending_input_index` INT, `spent_slot` INT, `redeemer?`) — append-only
+  provenance.
+- **policies** (`output_reference`, `policy_id`, PK both, FK → `outputs`) —
+  policy/asset index over full history; unspent-by-policy joins to `unspent` by
+  PK.
+- **binary_data** (`datum_hash` PK, `datum`), **scripts** (`script_hash` PK,
+  `script`) — deduplicated preimages.
+- **patterns** (`selector` TEXT PK) — active selectors (text form coupled to
+  Phase 8). **checkpoints** (`slot_no` INT PK, `header_hash`) — sparse pruned
+  resume points.
+
+Deferred indexes (installed post-sync), all on the small tables: `unspent` by
+`address` / `payment_credential` / `delegation_credential` / `transaction_id` /
+`created_slot`; `policies(policy_id)`; `spends(spent_slot)`. `outputs` stays
+primary-key-only.
+
+Micro-decisions settled during Phase 3: (1) a `blocks` table rather than a
+per-row header hash — narrower hot table (tier-2 memory) and a reliable hash
+source; (2) `value` carried in `unspent` so the common query (unspent UTxOs by
+address/credential/policy) is join-free; (3) real
+`payment_credential`/`delegation_credential` columns populated at insert, not
+kupo-style virtual/generated columns; (4) `policies` → `outputs` (append-only,
+INSERT-only) so historical policy/asset queries stay indexed, at the cost of a
+PK join on the unspent-by-policy path.
+
 # Open questions
 
 **Q1 — How fat is the `unspent` row? — RESOLVED.** Thin-but-covering: the
 `unspent` row carries the columns we filter and commonly return (address,
 value, datum hash) plus all the query indexes, and PK-joins back to `outputs`
-only for rare heavy fields (datum preimage, script). The `policies` / asset
-index follows `unspent` and cascade-deletes on spend. See "Pattern-query
-coverage and where the indexes live" above for the reasoning.
+only for rare heavy fields (datum preimage, script). See "Pattern-query
+coverage and where the indexes live" above for the reasoning, and "Storage
+schema (Phase 3)" for the realised tables (note the `policies` index was later
+pointed at `outputs`, not `unspent`, so historical policy queries stay indexed).
 
 **Q2 — `Pattern` constructor set — RESOLVED by the parity goal.** Mirror
 kupo's full set: `MatchAny` (with the bootstrap toggle for `*` vs `*/*`),
@@ -261,12 +308,16 @@ the source of truth, the syntax is one way to construct it. Deliberately last.
 
 # Next steps (ordered)
 
-1. **Freeze the `Pattern` ADT** — resolve Q2; mirror kupo's match constructors,
-   decide on `MatchMetadataTag`. This is the semantic core everything else
-   hangs off.
-2. **Design the `outputs` / `unspent` / `spends` schema** with the
-   match-dimension indexes; resolve Q1 (fat vs thin) and where the policy/asset
-   index attaches.
-3. **Design the parser** (Q6) as a projection onto the frozen ADT.
-4. **Park explicitly as future:** metadata content (Q3), per-pattern backfill
-   (Q4), and the storage-backend abstraction question (Q5).
+1. ~~**Freeze the `Pattern` ADT**~~ — DONE as `Cardano.Sieve.Selector`
+   (Phase 1) and the pure matcher `Cardano.Sieve.Satisfies.satisfies`
+   (Phase 2, tested).
+2. ~~**Design the `outputs` / `unspent` / `spends` schema**~~ — DONE as
+   `Cardano.Sieve.Schema` (Phase 3); Q1 resolved (thin-but-covering), policy
+   index over `outputs`. See "Storage schema (Phase 3)" above.
+3. **Decode stage (Phase 4)** — build `OutputContext` (+ the fields the schema
+   needs for persistence) from decoded blocks; repoint ingest at the Phase-3
+   tables and retire the `block_header` placeholder. This is ADR-020's
+   targeted-extraction vs full-decode tension.
+4. **Design the parser** (Q6) as a projection onto the frozen ADT.
+5. **Park explicitly as future:** metadata serving/refetch (Q3), per-pattern
+   backfill (Q4), and prune/GC around the stability window.

@@ -24,6 +24,7 @@ library
   exposed-modules: Cardano.Sieve
                    Cardano.Sieve.Selector
                    Cardano.Sieve.Satisfies
+                   Cardano.Sieve.Schema
                    Cardano.Sieve.Node.Fetch
                    Cardano.Sieve.Node.Insert
   build-depends:
