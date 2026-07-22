@@ -1,4 +1,4 @@
-# Kupo Rewrite: Pattern ADT & Storage Model — Design Notes and Next Steps
+# Kupo Rewrite: Selector ADT & Storage Model — Design Notes and Next Steps
 
 # Status
 
@@ -8,8 +8,12 @@
 
 Companion to [ADR-020](./Kupo-rewrite-ADR-020-indexing-architecture.md). This
 records the outcome of a design session on two questions ADR-020 left open:
-what the `Pattern` ADT should look like, and how matched data should be laid out
-on disk. It is a decision-record-plus-next-steps, not a frozen ADR.
+what the sieve's match ADT should look like, and how matched data should be laid
+out on disk. It is a decision-record-plus-next-steps, not a frozen ADR.
+
+**Naming.** Sieve's match ADT is `Selector` (constructors `Select*`), the
+equivalent of kupo's `Pattern` (constructors `Match*`). This doc uses
+`Selector`/`Select*` for sieve and reserves `Pattern`/`Match*` for kupo.
 
 The design lens throughout is the project's performance priority (see the
 benchmark goal): **tier 1 = query latency + fast syncing, tier 2 = memory
@@ -94,7 +98,7 @@ inherit phantom ones:
      cheap) and the redeemer / script context (opt-in, since redeemers are the
      heavy bytes). This keeps the big historical table append-only and avoids
      update-with-row-growth on the sync hot path.
-   - No new `Pattern` constructors are needed: patterns still match at output
+   - No new `Selector` constructors are needed: selectors still match at output
      *creation*; spends are captured automatically for already-tracked outputs.
      The expensive half (checking each tx input against tracked outputs) is work
      kupo already does — the only delta is the bytes written.
@@ -149,7 +153,7 @@ Carried over from kupo, tied in as follows:
   must hang off `unspent` and cascade-delete on spend (rather than off
   `outputs` and be filtered). Resolve alongside the fat-vs-thin question.
 
-# Pattern-query coverage and where the indexes live
+# Selector coverage: what can be queried, and where the indexes live
 
 Checked strictly from a "what can be queried" standpoint: the schema serves
 every kupo pattern-query dimension and more — with one gap.
@@ -267,19 +271,21 @@ PK join on the unspent-by-policy path.
 **Q1 — How fat is the `unspent` row? — RESOLVED.** Thin-but-covering: the
 `unspent` row carries the columns we filter and commonly return (address,
 value, datum hash) plus all the query indexes, and PK-joins back to `outputs`
-only for rare heavy fields (datum preimage, script). See "Pattern-query
-coverage and where the indexes live" above for the reasoning, and "Storage
+only for rare heavy fields (datum preimage, script). See "Selector coverage:
+what can be queried, and where the indexes live" above for the reasoning, and
+"Storage
 schema (Phase 3)" for the realised tables (note the `policies` index was later
 pointed at `outputs`, not `unspent`, so historical policy queries stay indexed).
 
-**Q2 — `Pattern` constructor set — RESOLVED by the parity goal.** Mirror
-kupo's full set: `MatchAny` (with the bootstrap toggle for `*` vs `*/*`),
-`MatchExact`, `MatchPayment`, `MatchDelegation`, `MatchPaymentAndDelegation`,
-`MatchTransactionId`, `MatchOutputReference`, `MatchPolicyId`, `MatchAssetId`,
-`MatchMetadataTag`. Each is a type case *and* a demand on the decode path /
-indexes. `MatchMetadataTag` is the odd one out: it is ingest-only (a decode
-cost — the matcher must see each tx's metadata — but no storage and no query
-index), per the coverage section above.
+**Q2 — `Selector` constructor set — RESOLVED by the parity goal.** Realised as
+`Cardano.Sieve.Selector` (Phase 1), mirroring kupo's `Pattern` 1:1: `SelectAll`
+(with the `BootstrapFilter` toggle for `*` vs `*/*`) ↔ `MatchAny`, then
+`SelectExact`, `SelectPayment`, `SelectDelegation`, `SelectPaymentAndDelegation`,
+`SelectTransactionId`, `SelectOutputReference`, `SelectPolicyId`,
+`SelectAssetId`, `SelectMetadataTag`. Each is a type case *and* a demand on the
+decode path / indexes. `SelectMetadataTag` is the odd one out: it is ingest-only
+(a decode cost — the matcher must see each tx's metadata — but no storage and no
+query index), per the coverage section above.
 
 **Q3 — Metadata serving — RESOLVED (no storage).** Verified: kupo does not
 store metadata at all. `MatchMetadataTag` is ingest-only (see coverage), and
@@ -308,7 +314,7 @@ the source of truth, the syntax is one way to construct it. Deliberately last.
 
 # Next steps (ordered)
 
-1. ~~**Freeze the `Pattern` ADT**~~ — DONE as `Cardano.Sieve.Selector`
+1. ~~**Freeze the `Selector` ADT**~~ — DONE as `Cardano.Sieve.Selector`
    (Phase 1) and the pure matcher `Cardano.Sieve.Satisfies.satisfies`
    (Phase 2, tested).
 2. ~~**Design the `outputs` / `unspent` / `spends` schema**~~ — DONE as
