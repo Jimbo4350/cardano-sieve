@@ -22,6 +22,8 @@
 module Cardano.Sieve.Satisfies
   ( OutputContext (..)
   , satisfies
+  , paymentHash
+  , delegationHash
   )
 where
 

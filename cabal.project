@@ -11,25 +11,51 @@ repository cardano-haskell-packages
     c00aae8461a256275598500ea0e187588c35a5d5d7454fb57eac18d9edb86a56
     d4a35cd3121aa00d18544bb0ac01c3e1691d618f462c46129271bccf39f7e8ee
 
+-- Match cardano-api's own index-state so the source-repository-package below
+-- (cardano-api master, 11.3) resolves its dependency set.
 index-state:
-  , hackage.haskell.org 2026-05-28T20:13:41Z
-  , cardano-haskell-packages 2026-05-28T08:12:31Z
+  , hackage.haskell.org 2026-07-01T00:33:51Z
+  , cardano-haskell-packages 2026-06-29T12:05:19Z
 
 active-repositories:
   , :rest
   , cardano-haskell-packages:override
 
--- Match the compiler the store's cardano-api was built with, so the build
--- reuses the store instead of rebuilding the whole cardano-api tree.
 with-compiler: ghc-9.10.3
 
--- Pin the dependency set to the versions already present in the cabal store
--- (built for this compiler), so the build reuses them instead of resolving to
--- newer CHaP releases and rebuilding the entire tree.
+-- Mirror the dependency workarounds from cardano-api's own cabal.project that a
+-- from-source build of it needs. cardano-api requires aeson >= 2.3, which
+-- conflicts with the upper bounds of cborg-json and friends; allow-newer relaxes
+-- those. (cardano-api's WASM-only source-repository-packages are not needed for
+-- a native ghc-9.10.3 build.)
+allow-newer:
+  , cborg-json:aeson
+  , criterion-measurement:aeson
+  , deriving-aeson:aeson
+  , grapesy:aeson
+  , grpc-spec:aeson
+  , hedgehog-extras:aeson
+  , microstache:aeson
+  , monad-control:transformers
+  , http-api-data:text-iso8601
+
 constraints:
-  , cardano-api ==11.2.0.0
-  , ouroboros-network ==1.1.0.0
-  , typed-protocols ==1.2.0.0
-  , io-classes ==1.8.0.1
+  , any.crypton-x509-system < 1.6.8
+
+package crypton
+  flags: -support_rdrand
+
+package bitvec
+  flags: -simd
+
+-- Build cardano-api from our branch instead of the released CHaP version, so we
+-- can extend cardano-api as sieve needs it. Currently carries PR #1262, which
+-- re-exports the ledger accessors auxDataTxL / metadataTxAuxDataL used to read
+-- transaction metadata. No local version pin — the SRP is the source of truth.
+source-repository-package
+  type: git
+  location: https://github.com/IntersectMBO/cardano-api
+  tag: f202918f146b03e5b69280fdcb78eb78fcd20233
+  subdir: cardano-api
 
 packages: .

@@ -26,13 +26,16 @@ library
                    Cardano.Sieve.Satisfies
                    Cardano.Sieve.Schema
                    Cardano.Sieve.Node.Fetch
+                   Cardano.Sieve.Node.Filter
                    Cardano.Sieve.Node.Insert
   build-depends:
+    , aeson                    >=2.2
     , base                     >=4.14
     , bytestring               ^>=0.12
-    , cardano-api              ^>=11.2
+    , cardano-api              >=11.2
     , containers               ^>=0.7
     , cardano-slotting         ^>=0.2
+    , microlens                ^>=0.4
     , optparse-applicative     ^>=0.19
     , ouroboros-network:protocols ^>=1.1
     , sqlite-simple            ^>=0.4
@@ -56,7 +59,7 @@ test-suite cardano-sieve-test
   build-depends:
     , base          >=4.14
     , bytestring    ^>=0.12
-    , cardano-api   ^>=11.2
+    , cardano-api   >=11.2
     , cardano-sieve
     , containers    ^>=0.7
     , tasty         ^>=1.5

@@ -61,11 +61,11 @@ tables =
     -- mutated. The header hash for created_slot is obtained by joining @blocks@.
     "CREATE TABLE IF NOT EXISTS outputs \
     \( output_reference BLOB    NOT NULL PRIMARY KEY \
-    \, transaction_id   BLOB    NOT NULL \
+    \, transaction_id   BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
     \, address          BLOB    NOT NULL \
     \, value            BLOB    NOT NULL \
     \, datum_hash       BLOB \
-    \, script_hash      BLOB \
+    \, reference_script_hash BLOB \
     \, created_slot     INTEGER NOT NULL \
     \)"
   , -- The live UTxO set: INSERT on create, DELETE by primary key on spend.
@@ -73,13 +73,13 @@ tables =
     -- holds all the query indexes, joining out only for heavy preimages.
     "CREATE TABLE IF NOT EXISTS unspent \
     \( output_reference      BLOB    NOT NULL PRIMARY KEY \
-    \, transaction_id        BLOB    NOT NULL \
+    \, transaction_id        BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
     \, address               BLOB    NOT NULL \
     \, payment_credential    BLOB \
     \, delegation_credential BLOB \
     \, value                 BLOB    NOT NULL \
     \, datum_hash            BLOB \
-    \, script_hash           BLOB \
+    \, reference_script_hash BLOB \
     \, created_slot          INTEGER NOT NULL \
     \)"
   , -- Append-only spend provenance, keyed by the consumed output reference. The
@@ -92,8 +92,8 @@ tables =
     \, redeemer                BLOB \
     \)"
   , -- The set of active selectors, so they survive restarts. The text form is
-    -- coupled to the Phase-8 surface syntax; until then it is a canonical
-    -- serialisation of a 'Cardano.Sieve.Selector.Selector'.
+    -- coupled to the (not-yet-defined) surface syntax; until then it is a
+    -- canonical serialisation of a 'Cardano.Sieve.Selector.Selector'.
     "CREATE TABLE IF NOT EXISTS patterns \
     \( selector TEXT NOT NULL PRIMARY KEY \
     \)"

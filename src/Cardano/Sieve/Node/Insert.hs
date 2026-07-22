@@ -1,62 +1,88 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Persistence layer: dump block headers into a SQLite database.
+-- | Persistence layer: write matched outputs into the SQLite schema.
 --
--- This is the Phase-1 storage milestone from ADR-020 ("just drop block headers
--- into the database for now"). It uses 'sqlite-simple' — the same library kupo
--- uses — so throughput/memory comparisons stay apples to apples.
+-- 'openDatabase' installs the schema ('Cardano.Sieve.Schema.createSchema') and
+-- 'writeSelected' persists the outputs that survived the sieve into @blocks@,
+-- @outputs@, @unspent@ and @policies@. It uses 'sqlite-simple' — the same
+-- library kupo uses — so throughput/memory comparisons stay apples to apples.
+--
+-- This module is deliberately SQLite-only: it knows nothing about
+-- @cardano-api@. The decode stage ("Cardano.Sieve.Node.Filter") turns a block
+-- into ready-to-store 'StoredOutput's (all fields already serialised to bytes),
+-- and this module just writes them.
 --
 -- Writes are /batched/: inserts accumulate inside a single open transaction and
--- only COMMIT every N rows, amortising SQLite's per-commit @fsync@ over the
+-- only COMMIT every N outputs, amortising SQLite's per-commit @fsync@ over the
 -- batch. The open transaction is SQLite's own buffer, so this needs no
 -- application-level queue (ADR-020 Decision 1). The final partial batch is
 -- committed by 'closeDatabase'; run it via 'Control.Exception.finally' so it
 -- also fires when the caller is torn down by an async exception.
+--
+-- Not persisted yet: datum/script /preimages/ (@binary_data@ / @scripts@) — we
+-- store the hashes on the output rows but not the bodies — and /spends/ (the
+-- @spends@ table and delete-from-@unspent@ on consumption). Both are the next
+-- write-path cut.
 module Cardano.Sieve.Node.Insert
   ( DbHandle
-  , BlockHeaderRow (..)
+  , StoredOutput (..)
   , openDatabase
   , closeDatabase
-  , writeHeader
+  , writeSelected
   , rollbackAbove
   )
 where
 
+import Cardano.Sieve.Schema (createSchema)
+
 import Control.Exception (onException)
 import Control.Monad (when)
+import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.Text (Text)
 import Database.SQLite.Simple
   ( Connection
   , Only (Only)
-  , ToRow (toRow)
   , close
   , execute
   , execute_
   , open
   , query_
+  , (:.) ((:.))
   )
 
--- | One row of the @block_header@ table.
-data BlockHeaderRow = BlockHeaderRow
-  { rowBlockNo :: Int64
-  , rowSlotNo :: Int64
-  , rowHash :: Text
+-- | One matched output, with every field already serialised to the bytes the
+-- schema stores. Produced by "Cardano.Sieve.Node.Filter"; consumed here.
+data StoredOutput = StoredOutput
+  { soOutputRef :: ByteString
+  -- ^ Encoded output reference (transaction id ++ big-endian output index).
+  -- The schema derives @transaction_id@ from this, so it is not stored again.
+  , soAddress :: ByteString
+  -- ^ Raw bytes of the output's address.
+  , soPayCred :: Maybe ByteString
+  -- ^ 28-byte payment credential hash (Nothing for Byron addresses).
+  , soDelegCred :: Maybe ByteString
+  -- ^ 28-byte delegation credential hash (Nothing unless a base address).
+  , soValue :: ByteString
+  -- ^ Serialised value (see "Cardano.Sieve.Node.Filter" for the encoding).
+  , soDatumHash :: Maybe ByteString
+  -- ^ Datum hash, if the output carries a datum (hash or inline).
+  , soReferenceScriptHash :: Maybe ByteString
+  -- ^ Reference-script hash, if the output carries one.
+  , soPolicyIds :: [ByteString]
+  -- ^ Distinct policy ids of the assets in the value (ada excluded).
   }
 
-instance ToRow BlockHeaderRow where
-  toRow (BlockHeaderRow b s h) = toRow (b, s, h)
-
--- | A handle to the block-header SQLite database; header writes are batched.
+-- | A handle to the SQLite database; output writes are batched.
 data DbHandle = DbHandle
   { dbConn :: Connection
   , dbBatchSize :: Int
-  -- ^ COMMIT once this many rows have accumulated in the open transaction.
+  -- ^ COMMIT once this many outputs have accumulated in the open transaction.
   , dbUncommittedRows :: IORef Int
-  -- ^ Rows written into the open transaction but not yet committed; climbs to
-  -- 'dbBatchSize', then a COMMIT resets it to 0 (also the open-transaction flag:
-  -- 0 = no transaction open).
+  -- ^ Outputs written into the open transaction but not yet committed; climbs
+  -- to 'dbBatchSize', then a COMMIT resets it to 0 (also the open-transaction
+  -- flag: 0 = no transaction open).
   }
 
 -- | Open the database, prepare it (pragmas + schema) and return a batched
@@ -78,20 +104,17 @@ closeDatabase db = do
   close (dbConn db)
 
 -- | Ready a freshly-opened connection for batched writes: set the session
--- PRAGMAs, then create the @block_header@ table if it is not already there.
+-- PRAGMAs, then create the schema.
 --
 -- @journal_mode=WAL@ lets the writer commit without blocking readers and keeps
 -- each commit cheap; @synchronous=NORMAL@ replaces the per-commit @fsync@ with
--- one at each WAL checkpoint. The database is never left corrupt, and a process
--- crash loses nothing (a commit still writes the WAL frames to the OS, it just
--- skips the fsync); only a power loss or OS crash can roll back transactions
--- committed since the last checkpoint. Together with batching, that is where
--- the write throughput comes from. @CREATE TABLE IF NOT EXISTS@ makes reopening
--- an existing database a no-op.
+-- one at each WAL checkpoint. @foreign_keys=ON@ enforces the @policies@ →
+-- @outputs@ reference the schema declares. Together with batching, WAL +
+-- NORMAL is where the write throughput comes from.
 --
--- The PRAGMAs go through 'query_' rather than 'execute_' because @PRAGMA
--- journal_mode@ returns a row (the mode it settled on) and 'execute_' rejects
--- statements that produce output.
+-- The two mode PRAGMAs go through 'query_' rather than 'execute_' because
+-- @PRAGMA journal_mode@ returns a row (the mode it settled on) and 'execute_'
+-- rejects statements that produce output.
 prepare :: Connection -> IO ()
 prepare conn = do
   mapM_
@@ -99,25 +122,61 @@ prepare conn = do
     [ "PRAGMA journal_mode=WAL"
     , "PRAGMA synchronous=NORMAL"
     ]
-  execute_
-    conn
-    "CREATE TABLE IF NOT EXISTS block_header (block_no INTEGER PRIMARY KEY, slot_no INTEGER NOT NULL, hash TEXT NOT NULL)"
+  execute_ conn "PRAGMA foreign_keys=ON"
+  createSchema conn
 
--- | Insert one header. Opens a transaction lazily on the first row of a batch
--- and commits once 'dbBatchSize' rows have accumulated. @INSERT OR REPLACE@
--- keeps it idempotent across restarts and re-syncs.
-writeHeader :: DbHandle -> BlockHeaderRow -> IO ()
-writeHeader (DbHandle conn batchSize pending) row = do
+-- | Persist a block's matched outputs. Records the block in @blocks@ and each
+-- output in @outputs@ + @unspent@ (+ a @policies@ row per policy), all under the
+-- same @created_slot@. A no-op when nothing matched, so blocks with no matched
+-- activity open no transaction and add no @blocks@ row.
+--
+-- Opens a transaction lazily on the first output of a batch and commits once
+-- 'dbBatchSize' outputs have accumulated. All inserts are @INSERT OR IGNORE@:
+-- an output's data never changes, so this is idempotent across restarts and
+-- re-syncs, and it avoids the @INSERT OR REPLACE@ delete that would trip the
+-- @policies@ foreign key.
+writeSelected :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> IO ()
+writeSelected _ _ _ [] = pure ()
+writeSelected (DbHandle conn batchSize pending) slot headerHash outs = do
   n <- readIORef pending
   when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
   execute
     conn
-    "INSERT OR REPLACE INTO block_header (block_no, slot_no, hash) VALUES (?, ?, ?)"
-    row
-  let n' = n + 1
+    "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
+    (slot, headerHash)
+  mapM_ (insertOutput conn slot) outs
+  let n' = n + length outs
   if n' >= batchSize
     then execute_ conn "COMMIT" >> writeIORef pending 0
     else writeIORef pending n'
+
+-- | Write one matched output. @outputs@ is inserted before @policies@ so the
+-- foreign key is satisfied within the transaction.
+insertOutput :: Connection -> Int64 -> StoredOutput -> IO ()
+insertOutput conn slot o = do
+  execute
+    conn
+    "INSERT OR IGNORE INTO outputs \
+    \(output_reference, address, value, datum_hash, reference_script_hash, created_slot) \
+    \VALUES (?, ?, ?, ?, ?, ?)"
+    ((soOutputRef o, soAddress o, soValue o, soDatumHash o) :. (soReferenceScriptHash o, slot))
+  execute
+    conn
+    "INSERT OR IGNORE INTO unspent \
+    \(output_reference, address, payment_credential, delegation_credential, \
+    \value, datum_hash, reference_script_hash, created_slot) \
+    \VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ( (soOutputRef o, soAddress o, soPayCred o, soDelegCred o)
+        :. (soValue o, soDatumHash o, soReferenceScriptHash o, slot)
+    )
+  mapM_
+    ( \pid ->
+        execute
+          conn
+          "INSERT OR IGNORE INTO policies (output_reference, policy_id) VALUES (?, ?)"
+          (soOutputRef o, pid)
+    )
+    (soPolicyIds o)
 
 -- | Commit the currently open (partial) batch, if any.
 flush :: DbHandle -> IO ()
@@ -125,12 +184,33 @@ flush (DbHandle conn _ pending) = do
   n <- readIORef pending
   when (n > 0) $ execute_ conn "COMMIT" >> writeIORef pending 0
 
--- | On a chain rollback, drop persisted headers strictly newer than the
--- rollback point. 'Nothing' means roll back to genesis (delete everything).
--- Commits any open batch first so the delete sees a consistent table.
+-- | On a chain rollback, drop everything strictly newer than the rollback
+-- point. 'Nothing' means roll back to genesis (delete everything). Commits any
+-- open batch first so the deletes see a consistent database.
+--
+-- @policies@ is deleted before @outputs@ so the foreign key does not block the
+-- @outputs@ delete. Restoring @unspent@ rows for outputs whose spend is rolled
+-- back is deferred along with the @spends@ write path.
 rollbackAbove :: DbHandle -> Maybe Int64 -> IO ()
 rollbackAbove db@(DbHandle conn _ _) mSlot = do
   flush db
   case mSlot of
-    Nothing -> execute_ conn "DELETE FROM block_header"
-    Just slot -> execute conn "DELETE FROM block_header WHERE slot_no > ?" (Only slot)
+    Nothing ->
+      mapM_
+        (execute_ conn)
+        [ "DELETE FROM policies"
+        , "DELETE FROM unspent"
+        , "DELETE FROM spends"
+        , "DELETE FROM outputs"
+        , "DELETE FROM blocks"
+        ]
+    Just slot -> do
+      execute
+        conn
+        "DELETE FROM policies WHERE output_reference IN \
+        \(SELECT output_reference FROM outputs WHERE created_slot > ?)"
+        (Only slot)
+      execute conn "DELETE FROM unspent WHERE created_slot > ?" (Only slot)
+      execute conn "DELETE FROM spends WHERE spent_slot > ?" (Only slot)
+      execute conn "DELETE FROM outputs WHERE created_slot > ?" (Only slot)
+      execute conn "DELETE FROM blocks WHERE slot_no > ?" (Only slot)

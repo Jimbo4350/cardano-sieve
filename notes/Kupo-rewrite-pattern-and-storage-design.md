@@ -235,8 +235,11 @@ Tables (columns are `BLOB` unless noted; `?` = nullable):
   `created_at`/`spent_at` in results; one row per block with matched activity,
   never pruned (sparse `checkpoints` can't serve this).
 - **outputs** (`output_reference` PK, `transaction_id`, `address`, `value`,
-  `datum_hash?`, `script_hash?`, `created_slot` INT) — append-only history,
-  never mutated, primary-key-only.
+  `datum_hash?`, `reference_script_hash?`, `created_slot` INT) — append-only
+  history, never mutated, primary-key-only. `reference_script_hash` is the
+  output's reference script only; script *credentials* (script-locked
+  addresses) are captured in `payment_credential`/`delegation_credential` as
+  bare, key/script-agnostic hashes, not here.
 - **unspent** (as `outputs` plus `payment_credential?`, `delegation_credential?`)
   — the live set; INSERT on create, DELETE by PK on spend; carries every query
   index.
@@ -247,10 +250,26 @@ Tables (columns are `BLOB` unless noted; `?` = nullable):
   policy/asset index over full history; unspent-by-policy joins to `unspent` by
   PK.
 - **binary_data** (`datum_hash` PK, `datum`), **scripts** (`script_hash` PK,
-  `script`) — deduplicated preimages.
+  `script`) — deduplicated preimage bodies. **Not yet populated:** sieve
+  currently stores only the hashes (on `outputs`/`unspent`), not the bodies.
+  Kupo stores both — datum bodies in `binary_data` (from *both* inline datums
+  and witness-set datums, via `witnessedDatums`) and reference-script bodies in
+  `scripts` — and serves them via `GET /datums/{hash}` / `GET /scripts/{hash}`
+  and inline under `?resolve_hashes`. Capturing the bodies is the deferred
+  preimage cut.
 - **patterns** (`selector` TEXT PK) — active selectors (text form coupled to
   Phase 8). **checkpoints** (`slot_no` INT PK, `header_hash`) — sparse pruned
   resume points.
+
+Decode & cardano-api dependency: outputs are decoded from the experimental
+`TxOut` (`Cardano.Api.Experimental.Tx`) wrapping the ledger output, read via
+ledger lenses (`addrTxOutL` / `valueTxOutL` / `datumTxOutF` /
+`referenceScriptTxOutL`), with transaction metadata labels via `auxDataTxL` /
+`metadataTxAuxDataL`. Those ledger accessors are not exposed by the released
+cardano-api, so sieve builds cardano-api from a branch via a
+`source-repository-package` (IntersectMBO/cardano-api PR #1262, which
+re-exports them from `Cardano.Api.Ledger`); there is no local cardano-api
+version pin.
 
 Deferred indexes (installed post-sync), all on the small tables: `unspent` by
 `address` / `payment_credential` / `delegation_credential` / `transaction_id` /

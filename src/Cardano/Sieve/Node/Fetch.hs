@@ -2,13 +2,13 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 
--- | Follow the chain over the node-to-client ChainSync protocol (pipelined) and
--- print the block number of every block that is rolled forward.
+-- | Follow the chain over the node-to-client ChainSync protocol (pipelined),
+-- sieve each block's outputs, and write the matches to SQLite.
 --
--- This is the Phase-1 proof-of-life for the indexing loop described in ADR-020:
--- a single-threaded, pipelined ChainSync client with no application-level queue.
--- The buffering below the application (node send buffer, kernel, mux ingress)
--- provides flow control; pipelining depth is the only bound on in-flight data.
+-- The indexing loop (ADR-020) is a single-threaded, pipelined ChainSync client
+-- with no application-level queue. The buffering below the application (node
+-- send buffer, kernel, mux ingress) provides flow control; pipelining depth is
+-- the only bound on in-flight data.
 module Cardano.Sieve.Node.Fetch
   ( fetch
   )
@@ -30,18 +30,18 @@ import Cardano.Api
   , SocketPath
   , connectToLocalNode
   , getBlockHeader
-  , serialiseToRawBytesHexText
+  , serialiseToRawBytes
   )
 
+import Cardano.Sieve.Node.Filter (selectedStored)
 import Cardano.Sieve.Node.Insert
-  ( BlockHeaderRow (..)
-  , DbHandle
+  ( DbHandle
   , closeDatabase
   , openDatabase
   , rollbackAbove
-  , writeHeader
+  , writeSelected
   )
-import Cardano.Slotting.Block (unBlockNo)
+import Cardano.Sieve.Selector (Selector)
 import Cardano.Slotting.Slot (WithOrigin (At, Origin), unSlotNo)
 import Ouroboros.Network.Protocol.ChainSync.ClientPipelined qualified as CSP
 import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
@@ -54,10 +54,11 @@ import Data.Int (Int64)
 import Data.Word (Word16)
 import Network.TypedProtocol.Core (Nat (Succ, Zero))
 
--- | Follow a local node's chain, writing each block header to SQLite (committing
--- every @batchSize@ headers) and printing its block number.
-fetch :: SocketPath -> NetworkId -> FilePath -> Int -> IO ()
-fetch socketPath networkId dbPath batchSize =
+-- | Follow a local node's chain: sieve each block's outputs against the given
+-- selectors, persist the matches to SQLite (committing every @batchSize@
+-- outputs), and print each block number with how many of its outputs matched.
+fetch :: SocketPath -> NetworkId -> FilePath -> Int -> [Selector] -> IO ()
+fetch socketPath networkId dbPath batchSize selectors =
   bracket
     (openDatabase dbPath batchSize)
     closeDatabase
@@ -80,7 +81,7 @@ fetch socketPath networkId dbPath batchSize =
   protocols :: DbHandle -> LocalNodeClientProtocolsInMode
   protocols dbHandle =
     LocalNodeClientProtocols
-      { localChainSyncClient = LocalChainSyncClientPipelined (chainSyncClient dbHandle)
+      { localChainSyncClient = LocalChainSyncClientPipelined (chainSyncClient dbHandle selectors)
       , localTxSubmissionClient = Nothing
       , localStateQueryClient = Nothing
       , localTxMonitoringClient = Nothing
@@ -88,12 +89,13 @@ fetch socketPath networkId dbPath batchSize =
 
 -- | The pipelined ChainSync client. It keeps up to 'maxInFlight' requests in
 -- flight, collecting a response whenever 'pipelineDecisionMax' says to, and on
--- every roll-forward writes the header via the 'DbHandle' and prints the
--- block number.
+-- every roll-forward sieves the block's outputs against 'selectors', writes the
+-- matches via the 'DbHandle', and prints the block number and match count.
 chainSyncClient
   :: DbHandle
+  -> [Selector]
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-chainSyncClient dbHandle =
+chainSyncClient dbHandle selectors =
   CSP.ChainSyncClientPipelined (pure (clientIdle Origin Origin Zero))
  where
   -- Initial pipelining depth (ADR-020 Decision 1: the only bound on this path).
@@ -130,18 +132,18 @@ chainSyncClient dbHandle =
     -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
   clientNext n =
     CSP.ClientStNext
-      { CSP.recvMsgRollForward = \(BlockInMode _ block) serverTip -> do
+      { CSP.recvMsgRollForward = \blockInMode@(BlockInMode _ block) serverTip -> do
           let BlockHeader slotNo hash blockNo = getBlockHeader block
-          -- Persist the header as one row — block and slot numbers as integers,
-          -- the header hash as lowercase base16 text; buffered into the open
-          -- transaction and committed per the batch size.
-          writeHeader dbHandle $
-            BlockHeaderRow
-              { rowBlockNo = fromIntegral (unBlockNo blockNo)
-              , rowSlotNo = fromIntegral (unSlotNo slotNo)
-              , rowHash = serialiseToRawBytesHexText hash
-              }
-          putStrLn ("block " <> show blockNo)
+              selected = selectedStored selectors blockInMode
+          -- Sieve the block's outputs and persist those the selectors kept,
+          -- tagged with this block's slot and header hash; buffered into the
+          -- open transaction and committed per the batch size.
+          writeSelected
+            dbHandle
+            (fromIntegral (unSlotNo slotNo))
+            (serialiseToRawBytes hash)
+            selected
+          putStrLn ("block " <> show blockNo <> " (" <> show (length selected) <> " selected)")
           pure (clientIdle (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
           -- Drop persisted headers newer than the rollback point so the table

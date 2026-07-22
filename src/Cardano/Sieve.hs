@@ -1,13 +1,14 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 
--- | Executable entry point. Parses command-line options and follows a local
--- node's chain, writing each block header into SQLite and printing its block
--- number as it is rolled forward.
+-- | Executable entry point. Parses command-line options, follows a local node's
+-- chain, sieves each block's outputs against the configured selectors, and
+-- writes the matches into SQLite, printing each block number and its match
+-- count as it is rolled forward.
 --
--- This is the Phase-1 storage milestone described in the architecture notes at
--- the bottom of this module (and ADR-020): connect to a local node over
--- node-to-client ChainSync and dump block headers into a database. No block
--- decoding or sieving yet.
+-- Connect over node-to-client ChainSync, decode each block, run the sieve, and
+-- persist matched outputs (ADR-020 and the architecture notes at the bottom of
+-- this module). The selector surface syntax is not wired to the CLI yet, so
+-- every output is matched for now.
 module Cardano.Sieve
   ( sieve
   )
@@ -21,6 +22,7 @@ import Cardano.Api
   )
 
 import Cardano.Sieve.Node.Fetch (fetch)
+import Cardano.Sieve.Selector (BootstrapFilter (IncludeBootstrap), Selector (SelectAll))
 
 import Control.Concurrent (myThreadId)
 import Control.Exception (AsyncException (UserInterrupt), throwTo)
@@ -75,7 +77,12 @@ sieve = do
   mainThread <- myThreadId
   _ <- installHandler sigTERM (CatchOnce (throwTo mainThread UserInterrupt)) Nothing
   opts <- execParser optionsInfo
-  fetch (socketPath opts) (networkId opts) (databasePath opts) (batchSize opts)
+  fetch (socketPath opts) (networkId opts) (databasePath opts) (batchSize opts) selectors
+ where
+  -- No surface syntax for selectors yet (see
+  -- notes/Kupo-rewrite-pattern-and-storage-design.md), so default to matching
+  -- every output. This exercises the full decode → sieve → write path.
+  selectors = [SelectAll IncludeBootstrap]
 
 optionsInfo :: ParserInfo Options
 optionsInfo =
@@ -83,7 +90,7 @@ optionsInfo =
     (optionsParser <**> helper)
     ( fullDesc
         <> progDesc "Follow a local node's chain and print each block number"
-        <> header "cardano-sieve - pattern-filtered chain index (Phase 1)"
+        <> header "cardano-sieve - pattern-filtered chain index"
     )
 
 optionsParser :: Parser Options
