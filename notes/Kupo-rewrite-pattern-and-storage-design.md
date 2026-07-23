@@ -333,16 +333,20 @@ the source of truth, the syntax is one way to construct it. Deliberately last.
 
 # Next steps (ordered)
 
-1. ~~**Freeze the `Selector` ADT**~~ — DONE as `Cardano.Sieve.Selector`
-   (Phase 1) and the pure matcher `Cardano.Sieve.Satisfies.satisfies`
-   (Phase 2, tested).
+1. ~~**Freeze the `Selector` ADT**~~ — DONE as `Cardano.Sieve.Selector`, which
+   now also holds the pure matcher `satisfies` (folded in from the former
+   `Cardano.Sieve.Satisfies`) and the surface codec (item 4).
 2. ~~**Design the `outputs` / `unspent` / `spends` schema**~~ — DONE as
    `Cardano.Sieve.Schema` (Phase 3); Q1 resolved (thin-but-covering), policy
    index over `outputs`. See "Storage schema (Phase 3)" above.
-3. **Decode stage (Phase 4)** — build `OutputContext` (+ the fields the schema
-   needs for persistence) from decoded blocks; repoint ingest at the Phase-3
-   tables and retire the `block_header` placeholder. This is ADR-020's
-   targeted-extraction vs full-decode tension.
-4. **Design the parser** (Q6) as a projection onto the frozen ADT.
+3. ~~**Decode stage (Phase 4)**~~ — DONE as `Cardano.Sieve.Node.Decode` (renamed
+   from `Node.Filter`): block → `DecodedOutput`/`SpentInput` → `StoredOutput`.
+   Spend recording + unspent maintenance (the delete-from-set model) landed in
+   `Node.Insert.applyBlock`/`recordSpend`.
+4. ~~**Design the parser** (Q6)~~ — DONE: `selectorFromText`/`selectorToText` in
+   `Cardano.Sieve.Selector`, dispatch-then-decode, round-trip + unit tested, and
+   wired to the CLI as the repeatable `--select` option.
 5. **Park explicitly as future:** metadata serving/refetch (Q3), per-pattern
    backfill (Q4), and prune/GC around the stability window.
+6. **Next up:** first end-to-end sync benchmark vs kupo (the project goal), then
+   the query API for the latency benchmark.

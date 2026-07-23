@@ -4,7 +4,7 @@
 -- | The decode + sieve stage: turn a decoded block into the outputs that match
 -- the configured selectors, ready to persist.
 --
--- It bridges the pure matcher ("Cardano.Sieve.Satisfies") and the write path
+-- It bridges the pure matcher ("Cardano.Sieve.Selector") and the write path
 -- ("Cardano.Sieve.Node.Insert"):
 --
 --   * 'outputsInBlock' walks a block's transactions and builds a
@@ -18,17 +18,18 @@
 -- 'addrTxOutL', value via 'valueTxOutL', the datum via 'datumTxOutF', and the
 -- reference script via 'referenceScriptTxOutL'. Datums and reference scripts
 -- only exist from Alonzo and Babbage onwards respectively, so those reads sit
--- inside the corresponding era-onwards case.
+-- inside the matching 'ShelleyBasedEra' branches (Alonzo+ and Babbage+).
 --
 -- Value encoding: @cardano-api@'s 'Value' has no raw-bytes/CBOR instance, so
 -- 'toStored' serialises it as JSON (the database is wipe-and-resync for now; a
 -- compact ledger-CBOR encoding is a later refinement).
-module Cardano.Sieve.Node.Filter
+module Cardano.Sieve.Node.Decode
   ( DecodedOutput (..)
   , outputsInBlock
   , toContext
   , selectedOutputs
   , selectedStored
+  , spentInputs
   )
 where
 
@@ -36,15 +37,15 @@ import Cardano.Api
   ( AddressAny
   , AssetId (AssetId)
   , BlockInMode (BlockInMode)
+  , ShelleyBasedEra (..)
   , Tx (ShelleyTx)
   , TxIn (TxIn)
   , TxIx (TxIx)
   , Value
-  , caseShelleyToAlonzoOrBabbageEraOnwards
-  , caseShelleyToMaryOrAlonzoEraOnwards
   , fromLedgerValue
   , fromShelleyAddrToAny
   , fromShelleyScriptHash
+  , fromShelleyTxIn
   , getBlockTxs
   , getTxIdShelley
   , serialiseToRawBytes
@@ -53,14 +54,14 @@ import Cardano.Api
 import Cardano.Api.Experimental.Tx (TxOut (TxOut))
 import Cardano.Api.Ledger qualified as L
 
-import Cardano.Sieve.Node.Insert (StoredOutput (..))
-import Cardano.Sieve.Satisfies
+import Cardano.Sieve.Node.Insert (SpentInput (..), StoredOutput (..))
+import Cardano.Sieve.Selector
   ( OutputContext (..)
+  , Selector
   , delegationHash
   , paymentHash
   , satisfies
   )
-import Cardano.Sieve.Selector (Selector)
 
 import Data.Aeson (encode)
 import Data.ByteString (ByteString)
@@ -75,7 +76,7 @@ import GHC.Exts (toList)
 import Lens.Micro ((^.))
 
 -- | Everything one output contributes, decoded once: the fields
--- 'Cardano.Sieve.Satisfies.satisfies' reads (via 'toContext') plus the extra
+-- 'Cardano.Sieve.Selector.satisfies' reads (via 'toContext') plus the extra
 -- hashes the schema persists. The creation slot is not here — it is a property
 -- of the whole block and is supplied at write time.
 data DecodedOutput = DecodedOutput
@@ -108,25 +109,31 @@ txOutputs (ShelleyTx sbe ledgerTx) =
 
         -- Datums exist from Alonzo onwards; 'datumTxOutF' yields the full
         -- datum, so an inline datum is hashed rather than reported as absent.
-        datumHash o =
-          caseShelleyToMaryOrAlonzoEraOnwards
-            (const Nothing)
-            ( const $ case o ^. L.datumTxOutF of
-                L.NoDatum -> Nothing
-                L.DatumHash dh -> Just (L.hashToBytes (L.extractHash dh))
-                L.Datum bd -> Just (L.hashToBytes (L.extractHash (L.hashBinaryData bd)))
-            )
-            sbe
+        datumHash o = case sbe of
+          ShelleyBasedEraShelley -> Nothing
+          ShelleyBasedEraAllegra -> Nothing
+          ShelleyBasedEraMary -> Nothing
+          ShelleyBasedEraAlonzo -> hashDatum (o ^. L.datumTxOutF)
+          ShelleyBasedEraBabbage -> hashDatum (o ^. L.datumTxOutF)
+          ShelleyBasedEraConway -> hashDatum (o ^. L.datumTxOutF)
+         where
+          hashDatum d = case d of
+            L.NoDatum -> Nothing
+            L.DatumHash dh -> Just (L.hashToBytes (L.extractHash dh))
+            L.Datum bd -> Just (L.hashToBytes (L.extractHash (L.hashBinaryData bd)))
 
         -- Reference scripts exist from Babbage onwards.
-        refScriptHash o =
-          caseShelleyToAlonzoOrBabbageEraOnwards
-            (const Nothing)
-            ( const $ case o ^. L.referenceScriptTxOutL of
-                L.SNothing -> Nothing
-                L.SJust s -> Just (serialiseToRawBytes (fromShelleyScriptHash (L.hashScript s)))
-            )
-            sbe
+        refScriptHash o = case sbe of
+          ShelleyBasedEraShelley -> Nothing
+          ShelleyBasedEraAllegra -> Nothing
+          ShelleyBasedEraMary -> Nothing
+          ShelleyBasedEraAlonzo -> Nothing
+          ShelleyBasedEraBabbage -> hashRefScript (o ^. L.referenceScriptTxOutL)
+          ShelleyBasedEraConway -> hashRefScript (o ^. L.referenceScriptTxOutL)
+         where
+          hashRefScript ms = case ms of
+            L.SNothing -> Nothing
+            L.SJust s -> Just (serialiseToRawBytes (fromShelleyScriptHash (L.hashScript s)))
 
         mkOutput ix (TxOut o) =
           DecodedOutput
@@ -157,6 +164,29 @@ selectedOutputs selectors blk =
 -- | The selected outputs of a block, serialised for the writer.
 selectedStored :: [Selector] -> BlockInMode -> [StoredOutput]
 selectedStored selectors = map toStored . selectedOutputs selectors
+
+-- | Every consumed input of every transaction in a block. These are surfaced
+-- for /all/ inputs (an input carries no data to run a selector against); the
+-- writer keeps only the ones whose consumed output is tracked.
+spentInputs :: BlockInMode -> [SpentInput]
+spentInputs (BlockInMode _ block) = concatMap txSpends (getBlockTxs block)
+
+-- | The consumed inputs of one transaction, each tagged with the spending
+-- transaction's id and the input's index.
+txSpends :: Tx era -> [SpentInput]
+txSpends (ShelleyTx sbe ledgerTx) =
+  shelleyBasedEraConstraints sbe $
+    let txid = serialiseToRawBytes (getTxIdShelley sbe (ledgerTx ^. L.bodyTxL))
+     in zipWith
+          ( \ix li ->
+              SpentInput
+                { siConsumed = encodeOutputRef (fromShelleyTxIn li)
+                , siSpendingTxId = txid
+                , siInputIndex = ix
+                }
+          )
+          [0 ..]
+          (F.toList (ledgerTx ^. L.bodyTxL . L.inputsTxBodyL))
 
 -- | Serialise a selected output to the bytes the schema stores.
 toStored :: DecodedOutput -> StoredOutput

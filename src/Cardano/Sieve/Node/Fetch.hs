@@ -33,13 +33,13 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Sieve.Node.Filter (selectedStored)
+import Cardano.Sieve.Node.Decode (selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
+  , applyBlock
   , closeDatabase
   , openDatabase
   , rollbackAbove
-  , writeSelected
   )
 import Cardano.Sieve.Selector (Selector)
 import Cardano.Slotting.Slot (WithOrigin (At, Origin), unSlotNo)
@@ -135,15 +135,25 @@ chainSyncClient dbHandle selectors =
       { CSP.recvMsgRollForward = \blockInMode@(BlockInMode _ block) serverTip -> do
           let BlockHeader slotNo hash blockNo = getBlockHeader block
               selected = selectedStored selectors blockInMode
-          -- Sieve the block's outputs and persist those the selectors kept,
-          -- tagged with this block's slot and header hash; buffered into the
-          -- open transaction and committed per the batch size.
-          writeSelected
+              spent = spentInputs blockInMode
+          -- Persist the outputs the selectors kept and record spends of any
+          -- tracked outputs the block's transactions consumed, tagged with this
+          -- block's slot and header hash; buffered and committed per batch.
+          applyBlock
             dbHandle
             (fromIntegral (unSlotNo slotNo))
             (serialiseToRawBytes hash)
             selected
-          putStrLn ("block " <> show blockNo <> " (" <> show (length selected) <> " selected)")
+            spent
+          putStrLn
+            ( "block "
+                <> show blockNo
+                <> " ("
+                <> show (length selected)
+                <> " selected, "
+                <> show (length spent)
+                <> " inputs)"
+            )
           pure (clientIdle (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
           -- Drop persisted headers newer than the rollback point so the table

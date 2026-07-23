@@ -26,9 +26,10 @@
 module Cardano.Sieve.Node.Insert
   ( DbHandle
   , StoredOutput (..)
+  , SpentInput (..)
   , openDatabase
   , closeDatabase
-  , writeSelected
+  , applyBlock
   , rollbackAbove
   )
 where
@@ -36,7 +37,7 @@ where
 import Cardano.Sieve.Schema (createSchema)
 
 import Control.Exception (onException)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
@@ -72,6 +73,18 @@ data StoredOutput = StoredOutput
   -- ^ Reference-script hash, if the output carries one.
   , soPolicyIds :: [ByteString]
   -- ^ Distinct policy ids of the assets in the value (ada excluded).
+  }
+
+-- | One consumed transaction input, for recording a spend; fields already
+-- serialised. @siConsumed@ is the encoded reference of the output being spent
+-- — the same encoding as @soOutputRef@ — so it can be matched against @outputs@.
+data SpentInput = SpentInput
+  { siConsumed :: ByteString
+  -- ^ Encoded output reference of the consumed output.
+  , siSpendingTxId :: ByteString
+  -- ^ Raw id of the transaction doing the spending.
+  , siInputIndex :: Int64
+  -- ^ Index of this input within the spending transaction.
   }
 
 -- | A handle to the SQLite database; output writes are batched.
@@ -125,27 +138,33 @@ prepare conn = do
   execute_ conn "PRAGMA foreign_keys=ON"
   createSchema conn
 
--- | Persist a block's matched outputs. Records the block in @blocks@ and each
--- output in @outputs@ + @unspent@ (+ a @policies@ row per policy), all under the
--- same @created_slot@. A no-op when nothing matched, so blocks with no matched
--- activity open no transaction and add no @blocks@ row.
+-- | Apply a block's effect: persist the selected outputs it created and record
+-- the spends of any tracked outputs its transactions consumed, in one batched
+-- unit. Created outputs go into @outputs@ + @unspent@ (+ a @policies@ row per
+-- policy) under @created_slot@; each spend appends to @spends@ (only when the
+-- consumed output is one we track) and removes it from the live @unspent@ set.
+-- A no-op only for an empty block.
 --
--- Opens a transaction lazily on the first output of a batch and commits once
--- 'dbBatchSize' outputs have accumulated. All inserts are @INSERT OR IGNORE@:
--- an output's data never changes, so this is idempotent across restarts and
--- re-syncs, and it avoids the @INSERT OR REPLACE@ delete that would trip the
--- @policies@ foreign key.
-writeSelected :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> IO ()
-writeSelected _ _ _ [] = pure ()
-writeSelected (DbHandle conn batchSize pending) slot headerHash outs = do
+-- Created outputs are written before spends are recorded, so an output created
+-- and spent within the same block is visible to the spend's existence check.
+--
+-- Opens a transaction lazily and commits once 'dbBatchSize' rows have
+-- accumulated. Inserts are @INSERT OR IGNORE@ — idempotent across re-syncs, and
+-- avoiding the @INSERT OR REPLACE@ delete that would trip the @policies@
+-- foreign key.
+applyBlock :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> [SpentInput] -> IO ()
+applyBlock _ _ _ [] [] = pure ()
+applyBlock (DbHandle conn batchSize pending) slot headerHash created spent = do
   n <- readIORef pending
   when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
-  execute
-    conn
-    "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
-    (slot, headerHash)
-  mapM_ (insertOutput conn slot) outs
-  let n' = n + length outs
+  unless (null created) $
+    execute
+      conn
+      "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
+      (slot, headerHash)
+  mapM_ (insertOutput conn slot) created
+  mapM_ (recordSpend conn slot) spent
+  let n' = n + length created + length spent
   if n' >= batchSize
     then execute_ conn "COMMIT" >> writeIORef pending 0
     else writeIORef pending n'
@@ -177,6 +196,24 @@ insertOutput conn slot o = do
           (soOutputRef o, pid)
     )
     (soPolicyIds o)
+
+-- | Record one spend. Appends to @spends@ only when the consumed output is one
+-- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
+-- @unspent@ set. The redeemer is not captured yet (left NULL). Untracked inputs
+-- no-op on both statements.
+recordSpend :: Connection -> Int64 -> SpentInput -> IO ()
+recordSpend conn slot si = do
+  execute
+    conn
+    "INSERT OR IGNORE INTO spends \
+    \(output_reference, spending_transaction_id, spending_input_index, spent_slot) \
+    \SELECT ?, ?, ?, ? \
+    \WHERE EXISTS (SELECT 1 FROM outputs WHERE output_reference = ?)"
+    (siConsumed si, siSpendingTxId si, siInputIndex si, slot, siConsumed si)
+  execute
+    conn
+    "DELETE FROM unspent WHERE output_reference = ?"
+    (Only (siConsumed si))
 
 -- | Commit the currently open (partial) batch, if any.
 flush :: DbHandle -> IO ()

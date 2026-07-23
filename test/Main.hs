@@ -23,6 +23,7 @@ import Cardano.Api
   , PolicyId (PolicyId)
   , ScriptHash
   , SerialiseAsRawBytes
+  , StakeAddress
   , StakeAddressReference (NoStakeAddress, StakeAddressByValue)
   , StakeCredential (StakeCredentialByKey)
   , StakeKey
@@ -33,15 +34,22 @@ import Cardano.Api
   , deserialiseAddress
   , deserialiseFromRawBytes
   , makeShelleyAddress
+  , makeStakeAddress
+  , serialiseAddress
+  , serialiseToRawBytesHexText
   , toAddressAny
   )
 
-import Cardano.Sieve.Satisfies (OutputContext (..), satisfies)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
   , CredentialHash
+  , OutputContext (..)
   , Selector (..)
+  , SelectorParseError (..)
   , credentialHashFromBytes
+  , satisfies
+  , selectorFromText
+  , selectorToText
   )
 
 import Data.ByteString (ByteString)
@@ -63,6 +71,7 @@ tests =
     "cardano-sieve"
     [ selectorTests
     , matcherTests
+    , parserTests
     ]
 
 -- ----------------------------------------------------------------------------
@@ -112,6 +121,11 @@ scriptPayAddr :: AddressAny
 scriptPayAddr =
   toAddressAny $
     makeShelleyAddress Mainnet (PaymentCredentialByScript payScriptHash) NoStakeAddress
+
+-- | A bech32 stake address carrying 'stakeKeyHash'; parsing it selects the
+-- delegation part.
+stakeAddr :: StakeAddress
+stakeAddr = makeStakeAddress Mainnet (StakeCredentialByKey stakeKeyHash)
 
 -- | A real mainnet Byron (bootstrap) address; constructing one programmatically
 -- is awkward, so we parse a known-valid one.
@@ -174,7 +188,7 @@ selectorTests =
 matcherTests :: TestTree
 matcherTests =
   testGroup
-    "Satisfies.satisfies"
+    "Selector.satisfies"
     [ testCase "SelectExact matches only the exact address" $ do
         satisfies (ctxAt baseAddr) (SelectExact baseAddr) @?= True
         satisfies (ctxAt baseAddr) (SelectExact enterpriseAddr) @?= False
@@ -220,3 +234,50 @@ matcherTests =
         satisfies (ctxAt baseAddr) (SelectAll OnlyShelley) @?= True
         satisfies (ctxAt byronAddr) (SelectAll OnlyShelley) @?= False
     ]
+
+parserTests :: TestTree
+parserTests =
+  testGroup
+    "Selector.selectorFromText / selectorToText"
+    [ testCase "round-trips every constructor via selectorToText" $
+        mapM_
+          roundTrips
+          [ SelectAll IncludeBootstrap
+          , SelectAll OnlyShelley
+          , SelectExact baseAddr
+          , SelectExact byronAddr
+          , SelectPayment payCH
+          , SelectDelegation stakeCH
+          , SelectPaymentAndDelegation payCH stakeCH
+          , SelectTransactionId txid
+          , SelectOutputReference outRef0
+          , SelectPolicyId policyId
+          , SelectAssetId policyId assetName
+          , SelectMetadataTag 674
+          ]
+    , testCase "parses the wildcard forms" $ do
+        selectorFromText "*" @?= Right (SelectAll IncludeBootstrap)
+        selectorFromText "*/*" @?= Right (SelectAll OnlyShelley)
+    , testCase "parses a metadata tag" $
+        selectorFromText "{674}" @?= Right (SelectMetadataTag 674)
+    , testCase "a bech32 stake address selects its delegation part" $
+        selectorFromText (serialiseAddress stakeAddr) @?= Right (SelectDelegation stakeCH)
+    , testCase "a base16 address parses as an exact match" $
+        selectorFromText (serialiseToRawBytesHexText baseAddr) @?= Right (SelectExact baseAddr)
+    , testGroup
+        "rejects malformed input with a shape-specific error"
+        [ testCase "shapeless bare token is a bad address" $
+            selectorFromText "hello" @?= Left (BadAddress "hello")
+        , testCase "too many dots is an unrecognised shape" $
+            selectorFromText "a.b.c" @?= Left (UnrecognisedShape "a.b.c")
+        , testCase "a malformed credential" $
+            selectorFromText "zz/*" @?= Left (BadCredential "zz")
+        , testCase "a non-numeric metadata tag" $
+            selectorFromText "{nope}" @?= Left (BadMetadataTag "nope")
+        , testCase "a valid policy with a malformed asset name" $
+            selectorFromText (serialiseToRawBytesHexText policyId <> ".zz")
+              @?= Left (BadAssetName "zz")
+        ]
+    ]
+ where
+  roundTrips s = selectorFromText (selectorToText s) @?= Right s
