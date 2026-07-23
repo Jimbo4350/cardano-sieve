@@ -58,11 +58,14 @@ test-suite cardano-sieve-test
   hs-source-dirs: test
   main-is:        Main.hs
   build-depends:
-    , base          >=4.14
-    , bytestring    ^>=0.12
-    , cardano-api   >=11.2
+    , base            >=4.14
+    , bytestring      ^>=0.12
+    , cardano-api     >=11.2
+    , cardano-api:gen >=11.2
     , cardano-sieve
-    , containers    ^>=0.7
-    , tasty         ^>=1.5
-    , tasty-hunit   ^>=0.10
-    , text          ^>=2.1
+    , containers      ^>=0.7
+    , hedgehog
+    , tasty           ^>=1.5
+    , tasty-hedgehog
+    , tasty-hunit     ^>=0.10
+    , text            ^>=2.1

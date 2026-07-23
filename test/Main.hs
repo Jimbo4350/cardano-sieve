@@ -47,6 +47,8 @@ import Cardano.Sieve.Selector
   , Selector (..)
   , SelectorParseError (..)
   , credentialHashFromBytes
+  , delegationHash
+  , paymentHash
   , satisfies
   , selectorFromText
   , selectorToText
@@ -59,8 +61,21 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import GHC.Exts (fromList)
 
+import Test.Gen.Cardano.Api.Typed
+  ( genAddressByron
+  , genAddressShelley
+  , genAssetName
+  , genPolicyId
+  , genTxId
+  , genTxIn
+  )
+
+import Hedgehog (Gen, Property, failure, forAll, property, success, (===))
+import Hedgehog.Gen qualified as Gen
+import Hedgehog.Range qualified as Range
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (testCase, (@?=))
+import Test.Tasty.Hedgehog (testProperty)
 
 main :: IO ()
 main = defaultMain tests
@@ -72,6 +87,8 @@ tests =
     [ selectorTests
     , matcherTests
     , parserTests
+    , parserPropertyTests
+    , matcherPropertyTests
     ]
 
 -- ----------------------------------------------------------------------------
@@ -281,3 +298,101 @@ parserTests =
     ]
  where
   roundTrips s = selectorFromText (selectorToText s) @?= Right s
+
+-- ----------------------------------------------------------------------------
+-- Property tests
+-- ----------------------------------------------------------------------------
+
+parserPropertyTests :: TestTree
+parserPropertyTests =
+  testGroup
+    "Selector properties"
+    [ testProperty "selectorFromText . selectorToText == Right" prop_selectorRoundTrip
+    ]
+
+-- | Rendering a selector and parsing it back yields the same selector, across
+-- the generated space of every constructor.
+prop_selectorRoundTrip :: Property
+prop_selectorRoundTrip = property $ do
+  s <- forAll genSelector
+  selectorFromText (selectorToText s) === Right s
+
+genSelector :: Gen Selector
+genSelector =
+  Gen.choice
+    [ SelectAll <$> Gen.element [IncludeBootstrap, OnlyShelley]
+    , SelectExact <$> genAddressAny
+    , SelectPayment <$> genCredentialHash
+    , SelectDelegation <$> genCredentialHash
+    , SelectPaymentAndDelegation <$> genCredentialHash <*> genCredentialHash
+    , SelectTransactionId <$> genTxId
+    , SelectOutputReference <$> genTxIn
+    , SelectPolicyId <$> genPolicyId
+    , SelectAssetId <$> genPolicyId <*> genAssetName
+    , SelectMetadataTag <$> Gen.word64 Range.constantBounded
+    ]
+
+genAddressAny :: Gen AddressAny
+genAddressAny =
+  Gen.choice
+    [ toAddressAny <$> genAddressByron
+    , toAddressAny <$> genAddressShelley
+    ]
+
+genCredentialHash :: Gen CredentialHash
+genCredentialHash =
+  fromMaybe (error "genCredentialHash: not 28 bytes")
+    . credentialHashFromBytes
+    <$> Gen.bytes (Range.singleton 28)
+
+matcherPropertyTests :: TestTree
+matcherPropertyTests =
+  testGroup
+    "Selector.satisfies properties"
+    [ testProperty "SelectAll IncludeBootstrap matches any address" prop_wildcardMatchesEverything
+    , testProperty "SelectExact matches itself" prop_selectExactMatchesSelf
+    , testProperty "SelectExact discriminates distinct addresses" prop_selectExactDiscriminates
+    , testProperty
+        "SelectPayment matches an address's own payment part"
+        prop_selectPaymentMatchesPaymentPart
+    , testProperty
+        "SelectDelegation matches an address's delegation part when present"
+        prop_selectDelegationMatches
+    ]
+
+prop_wildcardMatchesEverything :: Property
+prop_wildcardMatchesEverything = property $ do
+  a <- forAll genAddressAny
+  satisfies (ctxAt a) (SelectAll IncludeBootstrap) === True
+
+prop_selectExactMatchesSelf :: Property
+prop_selectExactMatchesSelf = property $ do
+  a <- forAll genAddressAny
+  satisfies (ctxAt a) (SelectExact a) === True
+
+prop_selectExactDiscriminates :: Property
+prop_selectExactDiscriminates = property $ do
+  a <- forAll genAddressAny
+  b <- forAll genAddressAny
+  if a == b
+    then success
+    else satisfies (ctxAt a) (SelectExact b) === False
+
+-- Every Shelley address has a payment credential, so a 'SelectPayment' built
+-- from that address's own payment part must match it.
+prop_selectPaymentMatchesPaymentPart :: Property
+prop_selectPaymentMatchesPaymentPart = property $ do
+  a <- forAll (toAddressAny <$> genAddressShelley)
+  case credentialHashFromBytes =<< paymentHash a of
+    Nothing -> failure
+    Just ch -> satisfies (ctxAt a) (SelectPayment ch) === True
+
+-- Only base addresses carry a delegation part by value; when one is present, a
+-- 'SelectDelegation' built from it must match. Enterprise/pointer addresses have
+-- none, so the law is vacuous there.
+prop_selectDelegationMatches :: Property
+prop_selectDelegationMatches = property $ do
+  a <- forAll (toAddressAny <$> genAddressShelley)
+  case credentialHashFromBytes =<< delegationHash a of
+    Nothing -> success
+    Just ch -> satisfies (ctxAt a) (SelectDelegation ch) === True
