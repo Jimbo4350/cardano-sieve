@@ -16,6 +16,10 @@
 #   CARDANO_NODE_REPO   checkout with built cardano-node/cardano-testnet
 #                       (default: ~/repos/work/cardano-node)
 #   TESTNET_MAGIC       network magic (default: 42)
+#   SIEVE_BATCH_SIZE    commit to SQLite every N headers (default: 10). Kept
+#                       small so committed rows show up promptly in the poller
+#                       below; the sieve's own default is 1000.
+#   POLL_INTERVAL       seconds between DB polls while the sieve runs (default: 5)
 
 set -euo pipefail
 
@@ -24,6 +28,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARDANO_NODE_REPO="${CARDANO_NODE_REPO:-$HOME/repos/work/cardano-node}"
 TESTNET_MAGIC="${TESTNET_MAGIC:-42}"
+SIEVE_BATCH_SIZE="${SIEVE_BATCH_SIZE:-10}"
+POLL_INTERVAL="${POLL_INTERVAL:-5}"
 
 log() { printf '\033[1;36m[sieve-test]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[sieve-test] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -66,6 +72,7 @@ TN_LOG="$RUN_DIR/testnet.log"
 
 cleanup() {
   trap - EXIT INT TERM
+  [ -n "${POLL_PID:-}" ]  && kill "$POLL_PID"  2>/dev/null || true
   [ -n "${SIEVE_PID:-}" ] && kill "$SIEVE_PID" 2>/dev/null || true
   if [ -n "${TN_PID:-}" ]; then
     log "stopping testnet (pid $TN_PID) ..."
@@ -114,19 +121,50 @@ sleep 3
 # --- run the sieve -----------------------------------------------------------
 
 DB="$RUN_DIR/headers.db"
-log "running cardano-sieve — headers -> $DB, block numbers follow (Ctrl-C to stop):"
+
+# Poll the header count from a *separate* SQLite connection while the sieve runs.
+# The sieve is the writer; this is an independent reader, so a rising count here
+# proves rows are actually being committed and made visible to other readers
+# (WAL + synchronous=NORMAL), not merely buffered in the writer's open
+# transaction. Nothing becomes visible until a batch COMMITs, hence the small
+# SIEVE_BATCH_SIZE default above.
+poll_db() {
+  while :; do
+    sleep "$POLL_INTERVAL"
+    [ -f "$DB" ] || continue
+    # '|| true': a poll may momentarily lose a race with a WAL checkpoint; skip
+    # that tick rather than let 'set -e' kill the whole run.
+    summary="$(sqlite3 "$DB" \
+      'SELECT count(*)||" rows committed, block_no "||COALESCE(min(block_no),-1)||".."||COALESCE(max(block_no),-1) FROM block_header;' \
+      2>/dev/null || true)"
+    [ -n "$summary" ] && printf '\033[1;35m[db-poll]\033[0m %s\n' "$summary"
+  done
+}
+
+log "running cardano-sieve — headers -> $DB (batch size $SIEVE_BATCH_SIZE), block numbers follow (Ctrl-C to stop):"
+if command -v sqlite3 >/dev/null 2>&1; then
+  log "polling committed rows every ${POLL_INTERVAL}s (lines tagged [db-poll])"
+  poll_db &
+  POLL_PID=$!
+else
+  log "(install sqlite3 to watch committed rows during the run)"
+fi
 echo "--------------------------------------------------------------------------"
 if [ -n "${SIEVE_DURATION:-}" ]; then
   timeout "${SIEVE_DURATION}" "$SIEVE_BIN" \
-    --socket-path "$SOCKET" --testnet-magic "$TESTNET_MAGIC" --database "$DB" &
+    --socket-path "$SOCKET" --testnet-magic "$TESTNET_MAGIC" --database "$DB" --batch-size "$SIEVE_BATCH_SIZE" &
   SIEVE_PID=$!
   wait "$SIEVE_PID" || true
 else
   "$SIEVE_BIN" \
-    --socket-path "$SOCKET" --testnet-magic "$TESTNET_MAGIC" --database "$DB" &
+    --socket-path "$SOCKET" --testnet-magic "$TESTNET_MAGIC" --database "$DB" --batch-size "$SIEVE_BATCH_SIZE" &
   SIEVE_PID=$!
   wait "$SIEVE_PID" || true
 fi
+
+# Stop the poller before the final summary so their output does not interleave.
+[ -n "${POLL_PID:-}" ] && kill "$POLL_PID" 2>/dev/null || true
+POLL_PID=""
 
 # --- report what landed in the database --------------------------------------
 
