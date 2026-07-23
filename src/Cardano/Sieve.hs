@@ -1,4 +1,5 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | Executable entry point. Parses command-line options, follows a local node's
 -- chain, sieves each block's outputs against the configured selectors, and
@@ -16,24 +17,30 @@ module Cardano.Sieve
 where
 
 import Cardano.Api
-  ( File (File)
+  ( BlockHeader
+  , ChainPoint (ChainPoint, ChainPointAtGenesis)
+  , File (File)
+  , Hash
   , NetworkId (Testnet)
   , NetworkMagic (NetworkMagic)
   , SocketPath
+  , deserialiseFromRawBytesHex
   )
 
-import Cardano.Sieve.Node.Fetch (fetch)
+import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap)
   , Selector (SelectAll)
   , selectorFromText
   )
+import Cardano.Slotting.Slot (SlotNo (SlotNo))
 
-import Control.Applicative (many)
+import Control.Applicative (many, optional)
 import Control.Concurrent (myThreadId)
 import Control.Exception (AsyncException (UserInterrupt), throwTo)
 import Data.Bifunctor (first)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import Options.Applicative
   ( Parser
   , ParserInfo
@@ -50,12 +57,14 @@ import Options.Applicative
   , option
   , progDesc
   , showDefault
+  , showDefaultWith
   , strOption
   , value
   , (<**>)
   )
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
 import System.Posix.Signals (Handler (CatchOnce), installHandler, sigTERM)
+import Text.Read (readMaybe)
 
 -- | Command-line options for the @cardano-sieve@ executable.
 data Options = Options
@@ -70,6 +79,12 @@ data Options = Options
   , selectors :: [Selector]
   -- ^ Selectors to sieve outputs against (from repeatable @--select@); an empty
   -- list means match every output.
+  , sincePoint :: ChainPoint
+  -- ^ Chain point to start indexing from (@--since@); 'ChainPointAtGenesis' when
+  -- omitted.
+  , untilSlot :: Maybe SlotNo
+  -- ^ Slot to stop indexing at, inclusive (@--until@); 'Nothing' follows the
+  -- chain indefinitely.
   }
 
 -- | Parse options and stream the chain, writing each header to SQLite and
@@ -89,12 +104,24 @@ sieve = do
   mainThread <- myThreadId
   _ <- installHandler sigTERM (CatchOnce (throwTo mainThread UserInterrupt)) Nothing
   opts <- execParser optionsInfo
-  fetch
-    (socketPath opts)
-    (networkId opts)
-    (databasePath opts)
-    (batchSize opts)
-    (configuredSelectors opts)
+  case untilSlot opts of
+    Nothing ->
+      fetch
+        (socketPath opts)
+        (networkId opts)
+        (databasePath opts)
+        (batchSize opts)
+        (configuredSelectors opts)
+        (sincePoint opts)
+    Just u ->
+      fetchBounded
+        (socketPath opts)
+        (networkId opts)
+        (databasePath opts)
+        (batchSize opts)
+        (configuredSelectors opts)
+        (sincePoint opts)
+        u
  where
   -- Default to matching every output when no --select is given, so the full
   -- decode → sieve → write path is still exercised out of the box.
@@ -119,6 +146,8 @@ optionsParser =
     <*> pDatabasePath
     <*> pBatchSize
     <*> pSelectors
+    <*> pSince
+    <*> pUntil
  where
   pSocketPath :: Parser SocketPath
   pSocketPath =
@@ -168,6 +197,40 @@ optionsParser =
             <> help
               "Selector to index, e.g. an address or 'policyid.*' (repeatable; omit to index every output)"
         )
+
+  pSince :: Parser ChainPoint
+  pSince =
+    option
+      (eitherReader readChainPoint)
+      ( long "since"
+          <> metavar "SLOT.HEADERHASH"
+          <> value ChainPointAtGenesis
+          <> showDefaultWith (const "origin")
+          <> help "Point to start indexing from: 'origin' or SLOT.HEADERHASH"
+      )
+
+  pUntil :: Parser (Maybe SlotNo)
+  pUntil =
+    optional $
+      option
+        (SlotNo <$> auto)
+        ( long "until"
+            <> metavar "SLOT"
+            <> help "Stop indexing after this slot, inclusive (default: follow the chain)"
+        )
+
+-- | Parse a @--since@ argument: @origin@, or @SLOT.HEADERHASH@ — a decimal slot
+-- and a base16 block-header hash, as kupo and cardano-cli render chain points.
+readChainPoint :: String -> Either String ChainPoint
+readChainPoint "origin" = Right ChainPointAtGenesis
+readChainPoint s =
+  case break (== '.') s of
+    (slotStr, '.' : hashStr)
+      | Just slot <- readMaybe slotStr ->
+          first show $
+            ChainPoint (SlotNo slot)
+              <$> deserialiseFromRawBytesHex @(Hash BlockHeader) (encodeUtf8 (T.pack hashStr))
+    _ -> Left "expected 'origin' or SLOT.HEADERHASH"
 
 {-
 

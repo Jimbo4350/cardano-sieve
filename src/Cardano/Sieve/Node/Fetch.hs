@@ -9,8 +9,14 @@
 -- with no application-level queue. The buffering below the application (node
 -- send buffer, kernel, mux ingress) provides flow control; pipelining depth is
 -- the only bound on in-flight data.
+--
+-- There are two clients, both starting from a configurable point (@--since@,
+-- genesis by default) and sharing 'sieveBlock' for the roll-forward body:
+-- 'followingClient' streams forever; 'boundedClient' stops after a given slot
+-- (@--until@), draining the requests still in flight before it finishes.
 module Cardano.Sieve.Node.Fetch
   ( fetch
+  , fetchBounded
   )
 where
 
@@ -42,7 +48,7 @@ import Cardano.Sieve.Node.Insert
   , rollbackAbove
   )
 import Cardano.Sieve.Selector (Selector)
-import Cardano.Slotting.Slot (WithOrigin (At, Origin), unSlotNo)
+import Cardano.Slotting.Slot (SlotNo, WithOrigin (At, Origin), unSlotNo)
 import Ouroboros.Network.Protocol.ChainSync.ClientPipelined qualified as CSP
 import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
   ( PipelineDecision (Collect)
@@ -54,11 +60,55 @@ import Data.Int (Int64)
 import Data.Word (Word16)
 import Network.TypedProtocol.Core (Nat (Succ, Zero))
 
--- | Follow a local node's chain: sieve each block's outputs against the given
--- selectors, persist the matches to SQLite (committing every @batchSize@
--- outputs), and print each block number with how many of its outputs matched.
-fetch :: SocketPath -> NetworkId -> FilePath -> Int -> [Selector] -> IO ()
-fetch socketPath networkId dbPath batchSize selectors =
+-- | Follow a local node's chain forever, starting at @since@ (genesis by
+-- default): sieve each block's outputs against the selectors and persist the
+-- matches to SQLite, committing every @batchSize@ outputs.
+fetch
+  :: SocketPath
+  -> NetworkId
+  -> FilePath
+  -> Int
+  -> [Selector]
+  -> ChainPoint
+  -> IO ()
+fetch socketPath networkId dbPath batchSize selectors since =
+  runSync
+    socketPath
+    networkId
+    dbPath
+    batchSize
+    (\dbHandle -> followingClient dbHandle selectors since)
+
+-- | As 'fetch', but index only from @since@ up to and including @untilSlot@,
+-- then stop. For bounded backfills and benchmark runs.
+fetchBounded
+  :: SocketPath
+  -> NetworkId
+  -> FilePath
+  -> Int
+  -> [Selector]
+  -> ChainPoint
+  -> SlotNo
+  -> IO ()
+fetchBounded socketPath networkId dbPath batchSize selectors since untilSlot =
+  runSync
+    socketPath
+    networkId
+    dbPath
+    batchSize
+    (\dbHandle -> boundedClient dbHandle selectors since untilSlot)
+
+-- | Open the database, connect to the local node, and drive the given
+-- pipelined ChainSync client, flushing the database on exit. The bounded and
+-- following entry points differ only in which client they hand to this.
+runSync
+  :: SocketPath
+  -> NetworkId
+  -> FilePath
+  -> Int
+  -> (DbHandle -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ())
+  -> IO ()
+runSync socketPath networkId dbPath batchSize mkClient =
   bracket
     (openDatabase dbPath batchSize)
     closeDatabase
@@ -81,43 +131,70 @@ fetch socketPath networkId dbPath batchSize selectors =
   protocols :: DbHandle -> LocalNodeClientProtocolsInMode
   protocols dbHandle =
     LocalNodeClientProtocols
-      { localChainSyncClient = LocalChainSyncClientPipelined (chainSyncClient dbHandle selectors)
+      { localChainSyncClient = LocalChainSyncClientPipelined (mkClient dbHandle)
       , localTxSubmissionClient = Nothing
       , localStateQueryClient = Nothing
       , localTxMonitoringClient = Nothing
       }
 
--- | The pipelined ChainSync client. It keeps up to 'maxInFlight' requests in
--- flight, collecting a response whenever 'pipelineDecisionMax' says to, and on
--- every roll-forward sieves the block's outputs against 'selectors', writes the
--- matches via the 'DbHandle', and prints the block number and match count.
-chainSyncClient
+-- | Sieve one block's outputs against the selectors, persist the matches, and
+-- record spends of any tracked outputs the block's transactions consumed;
+-- print a one-line summary. Returns the block's header — the bounded client
+-- needs its slot to detect the stop point.
+sieveBlock :: DbHandle -> [Selector] -> BlockInMode -> IO BlockHeader
+sieveBlock dbHandle selectors blockInMode@(BlockInMode _ block) = do
+  let header = getBlockHeader block
+      BlockHeader slotNo hash blockNo = header
+      selected = selectedStored selectors blockInMode
+      spent = spentInputs blockInMode
+  applyBlock
+    dbHandle
+    (fromIntegral (unSlotNo slotNo))
+    (serialiseToRawBytes hash)
+    selected
+    spent
+  putStrLn
+    ( "block "
+        <> show blockNo
+        <> " ("
+        <> show (length selected)
+        <> " selected, "
+        <> show (length spent)
+        <> " inputs)"
+    )
+  pure header
+
+-- | A pipelined ChainSync client that finds its intersection at @since@ and
+-- then streams the chain forever, sieving each roll-forward and rewinding on
+-- rollback. This is the original follow-the-tip behaviour, generalised only by
+-- the configurable start point.
+followingClient
   :: DbHandle
   -> [Selector]
+  -> ChainPoint
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-chainSyncClient dbHandle selectors =
-  CSP.ChainSyncClientPipelined (pure (clientIdle Origin Origin Zero))
+followingClient dbHandle selectors since =
+  CSP.ChainSyncClientPipelined (pure clientIntersect)
  where
-  -- Initial pipelining depth (ADR-020 Decision 1: the only bound on this path).
   maxInFlight :: Word16
   maxInFlight = 50
 
-  -- Decide whether to pipeline another request or collect a pending response.
-  -- The two 'WithOrigin BlockNo' tips feed 'pipelineDecisionMax' so it can back
-  -- off pipelining as we approach the server's tip.
+  clientIntersect =
+    CSP.SendMsgFindIntersect [since] $
+      CSP.ClientPipelinedStIntersect
+        { CSP.recvMsgIntersectFound = \_point serverTip ->
+            pure (clientIdle Origin (fromChainTip serverTip) Zero)
+        , CSP.recvMsgIntersectNotFound = \_serverTip ->
+            fail ("--since point not on the node's chain: " <> show since)
+        }
+
   clientIdle
     :: WithOrigin BlockNo
-    -- \^ Our tip (last block we have seen)
     -> WithOrigin BlockNo
-    -- \^ The server's reported tip
     -> Nat n
-    -- \^ Requests currently in flight
     -> CSP.ClientPipelinedStIdle n BlockInMode ChainPoint ChainTip IO ()
   clientIdle clientTip serverTip n =
     case pipelineDecisionMax maxInFlight n clientTip serverTip of
-      -- 'Collect' is GADT-refined to @n ~ 'S' n1@, so a request is guaranteed to
-      -- be in flight and this 'Succ' match is total (a 'Zero' case would be
-      -- inaccessible by types).
       Collect -> case n of
         Succ predN -> CSP.CollectResponse Nothing (clientNext predN)
       _ ->
@@ -125,52 +202,96 @@ chainSyncClient dbHandle selectors =
           (pure ())
           (clientIdle clientTip serverTip (Succ n))
 
-  -- Handle the next response. We recompute the tips from the block/tip carried
-  -- by the message rather than threading them through the pipeline.
-  clientNext
-    :: Nat n
-    -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  clientNext :: Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
   clientNext n =
     CSP.ClientStNext
-      { CSP.recvMsgRollForward = \blockInMode@(BlockInMode _ block) serverTip -> do
-          let BlockHeader slotNo hash blockNo = getBlockHeader block
-              selected = selectedStored selectors blockInMode
-              spent = spentInputs blockInMode
-          -- Persist the outputs the selectors kept and record spends of any
-          -- tracked outputs the block's transactions consumed, tagged with this
-          -- block's slot and header hash; buffered and committed per batch.
-          applyBlock
-            dbHandle
-            (fromIntegral (unSlotNo slotNo))
-            (serialiseToRawBytes hash)
-            selected
-            spent
-          putStrLn
-            ( "block "
-                <> show blockNo
-                <> " ("
-                <> show (length selected)
-                <> " selected, "
-                <> show (length spent)
-                <> " inputs)"
-            )
+      { CSP.recvMsgRollForward = \blockInMode serverTip -> do
+          BlockHeader _ _ blockNo <- sieveBlock dbHandle selectors blockInMode
           pure (clientIdle (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
-          -- Drop persisted headers newer than the rollback point so the table
-          -- stays consistent with the chain. We do not track our own block
-          -- history here, so we forget our tip and let pipelining ramp back up
-          -- from Origin.
           rollbackAbove dbHandle (chainPointSlot point)
           pure (clientIdle Origin (fromChainTip serverTip) n)
       }
 
-  fromChainTip :: ChainTip -> WithOrigin BlockNo
-  fromChainTip = \case
-    ChainTipAtGenesis -> Origin
-    ChainTip _slotNo _hash blockNo -> At blockNo
+-- | A pipelined ChainSync client that indexes from @since@ up to and including
+-- @untilSlot@, then stops. On reaching the bound it stops issuing new requests,
+-- drains the responses still in flight ('SendMsgDone' is only legal with none
+-- outstanding), and finishes — so the run ends with a clean commit via
+-- 'fetch''s bracket. Blocks that arrive during the drain are past the bound and
+-- discarded.
+--
+-- Rollbacks below an already-reached bound are not re-crossed here (the drain
+-- ignores them); on an immutable historical range none occur, which is the
+-- intended use.
+boundedClient
+  :: DbHandle
+  -> [Selector]
+  -> ChainPoint
+  -> SlotNo
+  -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
+boundedClient dbHandle selectors since untilSlot =
+  CSP.ChainSyncClientPipelined (pure clientIntersect)
+ where
+  maxInFlight :: Word16
+  maxInFlight = 50
 
-  -- The slot of a rollback point, or 'Nothing' for a rollback to genesis.
-  chainPointSlot :: ChainPoint -> Maybe Int64
-  chainPointSlot = \case
-    ChainPointAtGenesis -> Nothing
-    ChainPoint slotNo _hash -> Just (fromIntegral (unSlotNo slotNo))
+  clientIntersect =
+    CSP.SendMsgFindIntersect [since] $
+      CSP.ClientPipelinedStIntersect
+        { CSP.recvMsgIntersectFound = \_point serverTip ->
+            pure (clientIdle False Origin (fromChainTip serverTip) Zero)
+        , CSP.recvMsgIntersectNotFound = \_serverTip ->
+            fail ("--since point not on the node's chain: " <> show since)
+        }
+
+  -- The 'Bool' is whether we have reached the bound and are draining: no new
+  -- requests are issued, outstanding responses are collected, and once none
+  -- remain we are done.
+  clientIdle
+    :: Bool
+    -> WithOrigin BlockNo
+    -> WithOrigin BlockNo
+    -> Nat n
+    -> CSP.ClientPipelinedStIdle n BlockInMode ChainPoint ChainTip IO ()
+  clientIdle draining clientTip serverTip n
+    | draining =
+        case n of
+          Zero -> CSP.SendMsgDone ()
+          Succ predN -> CSP.CollectResponse Nothing (clientNext True predN)
+    | otherwise =
+        case pipelineDecisionMax maxInFlight n clientTip serverTip of
+          Collect -> case n of
+            Succ predN -> CSP.CollectResponse Nothing (clientNext False predN)
+          _ ->
+            CSP.SendMsgRequestNextPipelined
+              (pure ())
+              (clientIdle False clientTip serverTip (Succ n))
+
+  clientNext :: Bool -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  clientNext draining n =
+    CSP.ClientStNext
+      { CSP.recvMsgRollForward = \blockInMode serverTip ->
+          if draining
+            then pure (clientIdle True Origin (fromChainTip serverTip) n)
+            else do
+              BlockHeader slotNo _ blockNo <- sieveBlock dbHandle selectors blockInMode
+              pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
+      , CSP.recvMsgRollBackward = \point serverTip ->
+          if draining
+            then pure (clientIdle True Origin (fromChainTip serverTip) n)
+            else do
+              rollbackAbove dbHandle (chainPointSlot point)
+              pure (clientIdle False Origin (fromChainTip serverTip) n)
+      }
+
+-- | The server tip as a 'WithOrigin' block number, for 'pipelineDecisionMax'.
+fromChainTip :: ChainTip -> WithOrigin BlockNo
+fromChainTip = \case
+  ChainTipAtGenesis -> Origin
+  ChainTip _slotNo _hash blockNo -> At blockNo
+
+-- | The slot of a rollback point, or 'Nothing' for a rollback to genesis.
+chainPointSlot :: ChainPoint -> Maybe Int64
+chainPointSlot = \case
+  ChainPointAtGenesis -> Nothing
+  ChainPoint slotNo _hash -> Just (fromIntegral (unSlotNo slotNo))
