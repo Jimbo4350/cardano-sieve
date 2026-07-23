@@ -7,8 +7,9 @@
 --
 -- Connect over node-to-client ChainSync, decode each block, run the sieve, and
 -- persist matched outputs (ADR-020 and the architecture notes at the bottom of
--- this module). The selector surface syntax is not wired to the CLI yet, so
--- every output is matched for now.
+-- this module). Selectors come from repeatable @--select@ options, each parsed
+-- by 'Cardano.Sieve.Selector.selectorFromText'; with none given, every output is
+-- matched.
 module Cardano.Sieve
   ( sieve
   )
@@ -22,14 +23,22 @@ import Cardano.Api
   )
 
 import Cardano.Sieve.Node.Fetch (fetch)
-import Cardano.Sieve.Selector (BootstrapFilter (IncludeBootstrap), Selector (SelectAll))
+import Cardano.Sieve.Selector
+  ( BootstrapFilter (IncludeBootstrap)
+  , Selector (SelectAll)
+  , selectorFromText
+  )
 
+import Control.Applicative (many)
 import Control.Concurrent (myThreadId)
 import Control.Exception (AsyncException (UserInterrupt), throwTo)
+import Data.Bifunctor (first)
+import Data.Text qualified as T
 import Options.Applicative
   ( Parser
   , ParserInfo
   , auto
+  , eitherReader
   , execParser
   , fullDesc
   , header
@@ -58,6 +67,9 @@ data Options = Options
   -- ^ SQLite file to write block headers into.
   , batchSize :: Int
   -- ^ Commit to SQLite every this many headers.
+  , selectors :: [Selector]
+  -- ^ Selectors to sieve outputs against (from repeatable @--select@); an empty
+  -- list means match every output.
   }
 
 -- | Parse options and stream the chain, writing each header to SQLite and
@@ -77,12 +89,18 @@ sieve = do
   mainThread <- myThreadId
   _ <- installHandler sigTERM (CatchOnce (throwTo mainThread UserInterrupt)) Nothing
   opts <- execParser optionsInfo
-  fetch (socketPath opts) (networkId opts) (databasePath opts) (batchSize opts) selectors
+  fetch
+    (socketPath opts)
+    (networkId opts)
+    (databasePath opts)
+    (batchSize opts)
+    (configuredSelectors opts)
  where
-  -- No surface syntax for selectors yet (see
-  -- notes/Kupo-rewrite-pattern-and-storage-design.md), so default to matching
-  -- every output. This exercises the full decode → sieve → write path.
-  selectors = [SelectAll IncludeBootstrap]
+  -- Default to matching every output when no --select is given, so the full
+  -- decode → sieve → write path is still exercised out of the box.
+  configuredSelectors o = case selectors o of
+    [] -> [SelectAll IncludeBootstrap]
+    xs -> xs
 
 optionsInfo :: ParserInfo Options
 optionsInfo =
@@ -100,6 +118,7 @@ optionsParser =
     <*> pNetworkId
     <*> pDatabasePath
     <*> pBatchSize
+    <*> pSelectors
  where
   pSocketPath :: Parser SocketPath
   pSocketPath =
@@ -138,6 +157,17 @@ optionsParser =
           <> showDefault
           <> help "Commit to SQLite every N block headers"
       )
+
+  pSelectors :: Parser [Selector]
+  pSelectors =
+    many $
+      option
+        (eitherReader (first show . selectorFromText . T.pack))
+        ( long "select"
+            <> metavar "SELECTOR"
+            <> help
+              "Selector to index, e.g. an address or 'policyid.*' (repeatable; omit to index every output)"
+        )
 
 {-
 
