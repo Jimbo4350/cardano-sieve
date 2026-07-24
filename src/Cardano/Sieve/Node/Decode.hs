@@ -54,6 +54,8 @@ import Cardano.Api
 import Cardano.Api.Experimental.Tx (TxOut (TxOut))
 import Cardano.Api.Ledger qualified as L
 
+import Cardano.Ledger.Alonzo.Tx (IsValid (..), isValidTxL)
+import Cardano.Ledger.Babbage.TxBody (collateralReturnTxBodyL)
 import Cardano.Sieve.Node.Insert (SpentInput (..), StoredOutput (..))
 import Cardano.Sieve.Selector
   ( OutputContext (..)
@@ -144,7 +146,30 @@ txOutputs (ShelleyTx sbe ledgerTx) =
             , doReferenceScriptHash = refScriptHash o
             , doMetadataTags = tags
             }
-     in zipWith mkOutput [0 ..] (TxOut <$> F.toList (ledgerTx ^. L.bodyTxL . L.outputsTxBodyL))
+        declared = F.toList (ledgerTx ^. L.bodyTxL . L.outputsTxBodyL)
+        declaredOutputs = zipWith mkOutput [0 ..] (TxOut <$> declared)
+     in -- Every era enumerated (no wildcard) so a future era must be handled
+        -- explicitly, not silently take the pre-Babbage path. On a
+        -- Babbage/Conway isValid=false (phase-2 failure) tx the declared outputs
+        -- were never created; the only created output is the collateral return,
+        -- at index = number of declared outputs. Each branch builds
+        -- DecodedOutputs directly (mkOutput applied where the ledger era is
+        -- concrete) so the case result carries no era index.
+        case sbe of
+          ShelleyBasedEraShelley -> declaredOutputs
+          ShelleyBasedEraAllegra -> declaredOutputs
+          ShelleyBasedEraMary -> declaredOutputs
+          ShelleyBasedEraAlonzo -> declaredOutputs
+          ShelleyBasedEraBabbage -> case ledgerTx ^. isValidTxL of
+            IsValid True -> declaredOutputs
+            IsValid False -> case ledgerTx ^. L.bodyTxL . collateralReturnTxBodyL of
+              L.SJust o -> [mkOutput (fromIntegral (length declared)) (TxOut o)]
+              L.SNothing -> []
+          ShelleyBasedEraConway -> case ledgerTx ^. isValidTxL of
+            IsValid True -> declaredOutputs
+            IsValid False -> case ledgerTx ^. L.bodyTxL . collateralReturnTxBodyL of
+              L.SJust o -> [mkOutput (fromIntegral (length declared)) (TxOut o)]
+              L.SNothing -> []
 
 -- | Project the matcher's view out of a decoded output.
 toContext :: DecodedOutput -> OutputContext
@@ -177,6 +202,23 @@ txSpends :: Tx era -> [SpentInput]
 txSpends (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $
     let txid = serialiseToRawBytes (getTxIdShelley sbe (ledgerTx ^. L.bodyTxL))
+        regular = F.toList (ledgerTx ^. L.bodyTxL . L.inputsTxBodyL)
+
+        -- On a Babbage/Conway isValid=false tx the regular inputs are NOT
+        -- consumed; the collateral inputs are. Pre-Babbage: the regular inputs.
+        consumedOf isv collateral = case isv of
+          IsValid True -> regular
+          IsValid False -> collateral
+
+        consumed = case sbe of
+          ShelleyBasedEraShelley -> regular
+          ShelleyBasedEraAllegra -> regular
+          ShelleyBasedEraMary -> regular
+          ShelleyBasedEraAlonzo -> regular
+          ShelleyBasedEraBabbage ->
+            consumedOf (ledgerTx ^. isValidTxL) (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
+          ShelleyBasedEraConway ->
+            consumedOf (ledgerTx ^. isValidTxL) (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
      in zipWith
           ( \ix li ->
               SpentInput
@@ -186,7 +228,7 @@ txSpends (ShelleyTx sbe ledgerTx) =
                 }
           )
           [0 ..]
-          (F.toList (ledgerTx ^. L.bodyTxL . L.inputsTxBodyL))
+          consumed
 
 -- | Serialise a selected output to the bytes the schema stores.
 toStored :: DecodedOutput -> StoredOutput

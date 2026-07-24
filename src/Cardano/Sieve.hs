@@ -182,9 +182,15 @@ optionsParser =
       auto
       ( long "batch-size"
           <> metavar "N"
-          <> value 1000
+          -- 50000 is near the bottom of the commit-overhead vs WAL-bloat
+          -- U-curve for bulk sync (see bench/batch-sweep.sh): too small means
+          -- frequent COMMITs and fsync stalls; too big means the WAL can't
+          -- checkpoint mid-transaction, grows huge, and every read slows down.
+          -- (A fixed value is a bulk-sync compromise; tip-following ideally
+          -- wants smaller/adaptive batches for query freshness.)
+          <> value 50000
           <> showDefault
-          <> help "Commit to SQLite every N block headers"
+          <> help "Commit to SQLite every N written rows (outputs + spends)"
       )
 
   pSelectors :: Parser [Selector]

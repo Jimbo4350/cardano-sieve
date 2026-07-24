@@ -14,6 +14,9 @@ build-type:         Simple
 common project-config
   default-language: Haskell2010
   ghc-options:
+    -- -O2 for a fair benchmark against kupo (which builds -O2); cabal defaults
+    -- to -O1 otherwise.
+    -O2
     -Wall -Wcompat -Wincomplete-record-updates
     -Wincomplete-uni-patterns -Wredundant-constraints
     -Wunused-packages
@@ -34,6 +37,8 @@ library
     , bech32                    ^>=1.1
     , bytestring               ^>=0.12
     , cardano-api              >=11.2
+    , cardano-ledger-alonzo
+    , cardano-ledger-babbage
     , containers               ^>=0.7
     , cardano-slotting         ^>=0.2
     , microlens                ^>=0.4
