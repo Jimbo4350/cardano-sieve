@@ -42,8 +42,24 @@ RUNS="${RUNS:-3}"
 COOLDOWN="${COOLDOWN:-15}"   # seconds idle before each run so the CPU doesn't thermally throttle
 KUPO_PORT="${KUPO_PORT:-1442}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SIEVE_BIN="${SIEVE_BIN:-$(cd "$REPO_ROOT" && cabal list-bin cardano-sieve 2>/dev/null || true)}"
-KUPO_BIN="${KUPO_BIN:-$(cd "$HOME/repos/kupo" && cabal list-bin kupo 2>/dev/null || true)}"
+KUPO_REPO="${KUPO_REPO:-$HOME/repos/kupo}"
+
+# Build both tools from source BEFORE locating their binaries, so we never
+# benchmark a stale build (`cabal list-bin` only *finds* a binary — it does not
+# rebuild it, so a code change like the --until fix would otherwise be missed).
+# `cabal build` is a no-op when nothing changed, so repeat runs stay fast.
+# Set BUILD=0 to skip, or pin SIEVE_BIN / KUPO_BIN to bypass build+locate for
+# that tool. The exe: prefix is required — bare `cardano-sieve` is ambiguous
+# (lib vs exe).
+BUILD="${BUILD:-1}"
+if [ "$BUILD" = 1 ]; then
+  [ -n "${SIEVE_BIN:-}" ] || ( cd "$REPO_ROOT" && cabal build exe:cardano-sieve -j4 ) \
+    || { echo "FATAL: building cardano-sieve failed" >&2; exit 1; }
+  [ -n "${KUPO_BIN:-}" ]  || ( cd "$KUPO_REPO"  && cabal build exe:kupo -j4 ) \
+    || { echo "FATAL: building kupo failed (pin KUPO_BIN or set BUILD=0)" >&2; exit 1; }
+fi
+SIEVE_BIN="${SIEVE_BIN:-$(cd "$REPO_ROOT" && cabal list-bin exe:cardano-sieve 2>/dev/null || true)}"
+KUPO_BIN="${KUPO_BIN:-$(cd "$KUPO_REPO"  && cabal list-bin exe:kupo 2>/dev/null || true)}"
 TIME_BIN="${TIME_BIN:-/usr/bin/time}"
 CARDANO_CLI="${CARDANO_CLI:-cardano-cli}"
 
