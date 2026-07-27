@@ -45,6 +45,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIEVE_BIN="${SIEVE_BIN:-$(cd "$REPO_ROOT" && cabal list-bin cardano-sieve 2>/dev/null || true)}"
 KUPO_BIN="${KUPO_BIN:-$(cd "$HOME/repos/kupo" && cabal list-bin kupo 2>/dev/null || true)}"
 TIME_BIN="${TIME_BIN:-/usr/bin/time}"
+CARDANO_CLI="${CARDANO_CLI:-cardano-cli}"
 
 WORK="$(mktemp -d -t sync-bench-XXXXXX)"
 trap 'rm -rf "$WORK"; pkill -INT -f "kupo .*--port $KUPO_PORT" 2>/dev/null || true' EXIT
@@ -53,11 +54,38 @@ log() { printf '\033[1;36m[bench]\033[0m %s\n' "$*"; }
 # ---- preflight --------------------------------------------------------------
 [ -x "${SIEVE_BIN:-}" ] || { echo "cardano-sieve binary not found (set SIEVE_BIN)"; exit 1; }
 [ -x "${KUPO_BIN:-}" ]  || { echo "kupo binary not found (set KUPO_BIN)"; exit 1; }
-[ -S "$NODE_SOCKET" ]   || { echo "no node socket at $NODE_SOCKET"; exit 1; }
 [ -f "$NODE_CONFIG" ]   || { echo "no node config at $NODE_CONFIG"; exit 1; }
-for t in "$TIME_BIN" curl jq sqlite3 stat; do
-  command -v "$t" >/dev/null || { echo "need $t on PATH"; exit 1; }
+for t in "$TIME_BIN" "$CARDANO_CLI" timeout curl jq sqlite3 stat; do
+  command -v "$t" >/dev/null || { echo "need $t on PATH (override via env)"; exit 1; }
 done
+
+# A live node is non-negotiable, and a socket file existing is NOT proof of one
+# (it can be stale after a crash). So: (1) require the socket, (2) actually query
+# the node, (3) confirm its tip has passed UNTIL_SLOT so the whole range is
+# replayable. Every failure is loud and tells you how to fix it.
+[ -S "$NODE_SOCKET" ] || {
+  echo "FATAL: no node socket at $NODE_SOCKET — is cardano-node running?" >&2
+  echo "  start one with:  $REPO_ROOT/bench/run-node.sh" >&2
+  echo "  (or point elsewhere with NODE_SOCKET=/path/to/node.socket)" >&2
+  exit 1
+}
+tip_json="$(timeout "${NODE_QUERY_TIMEOUT:-30}" "$CARDANO_CLI" query tip \
+              --socket-path "$NODE_SOCKET" --testnet-magic "$TESTNET_MAGIC" 2>&1)" || {
+  echo "FATAL: socket $NODE_SOCKET exists but no node answered 'query tip' in time." >&2
+  echo "  the node is down, unresponsive, or the socket is stale. cardano-cli said:" >&2
+  printf '%s\n' "$tip_json" | sed 's/^/    /' >&2
+  echo "  (re)start it with:  $REPO_ROOT/bench/run-node.sh" >&2
+  exit 1
+}
+tip_slot="$(printf '%s' "$tip_json" | jq -r '.slot // empty')"
+[ -n "$tip_slot" ] || { echo "FATAL: could not parse a slot from 'query tip': $tip_json" >&2; exit 1; }
+if [ "$tip_slot" -lt "$UNTIL_SLOT" ]; then
+  echo "FATAL: node tip slot $tip_slot is behind UNTIL_SLOT=$UNTIL_SLOT." >&2
+  echo "  the range origin..$UNTIL_SLOT is not on chain yet — let the node keep syncing" >&2
+  echo "  (bench/run-node.sh) until 'query tip' reports slot >= $UNTIL_SLOT, or lower UNTIL_SLOT." >&2
+  exit 1
+fi
+log "node live on $NODE_SOCKET, tip slot $tip_slot >= UNTIL_SLOT $UNTIL_SLOT"
 
 # GNU time -v: pull elapsed seconds + max RSS (KiB) out of the report.
 max_rss_kb() { awk '/Maximum resident set size/ {print $NF}' "$1"; }
