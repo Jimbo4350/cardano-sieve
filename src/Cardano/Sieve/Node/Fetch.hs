@@ -274,8 +274,18 @@ boundedClient dbHandle selectors since untilSlot =
           if draining
             then pure (clientIdle True Origin (fromChainTip serverTip) n)
             else do
-              BlockHeader slotNo _ blockNo <- sieveBlock dbHandle selectors blockInMode
-              pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
+              -- Peek the slot BEFORE indexing: a block past the bound must not
+              -- be written. --until is inclusive (kupo's <= semantics), so index
+              -- iff slot <= untilSlot; the first block beyond the bound flips us
+              -- to draining without being indexed. A block landing exactly on
+              -- untilSlot is indexed and starts the drain in the same step.
+              let BlockHeader slotNo _ blockNo =
+                    case blockInMode of BlockInMode _ block -> getBlockHeader block
+              if slotNo > untilSlot
+                then pure (clientIdle True Origin (fromChainTip serverTip) n)
+                else do
+                  _ <- sieveBlock dbHandle selectors blockInMode
+                  pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->
           if draining
             then pure (clientIdle True Origin (fromChainTip serverTip) n)
