@@ -71,8 +71,9 @@ data StoredOutput = StoredOutput
   -- ^ Datum hash, if the output carries a datum (hash or inline).
   , soReferenceScriptHash :: Maybe ByteString
   -- ^ Reference-script hash, if the output carries one.
-  , soPolicyIds :: [ByteString]
-  -- ^ Distinct policy ids of the assets in the value (ada excluded).
+  , soAssets :: [(ByteString, ByteString)]
+  -- ^ Distinct (policy id, asset name) pairs of the assets in the value (ada
+  -- excluded); both raw bytes, asset name possibly empty.
   }
 
 -- | One consumed transaction input, for recording a spend; fields already
@@ -189,13 +190,14 @@ insertOutput conn slot o = do
         :. (soValue o, soDatumHash o, soReferenceScriptHash o, slot)
     )
   mapM_
-    ( \pid ->
+    ( \(pid, name) ->
         execute
           conn
-          "INSERT OR IGNORE INTO policies (output_reference, policy_id) VALUES (?, ?)"
-          (soOutputRef o, pid)
+          "INSERT OR IGNORE INTO policies (output_reference, policy_id, asset_name, created_slot) \
+          \VALUES (?, ?, ?, ?)"
+          (soOutputRef o, pid, name, slot)
     )
-    (soPolicyIds o)
+    (soAssets o)
 
 -- | Record one spend. Appends to @spends@ only when the consumed output is one
 -- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
@@ -242,11 +244,7 @@ rollbackAbove db@(DbHandle conn _ _) mSlot = do
         , "DELETE FROM blocks"
         ]
     Just slot -> do
-      execute
-        conn
-        "DELETE FROM policies WHERE output_reference IN \
-        \(SELECT output_reference FROM outputs WHERE created_slot > ?)"
-        (Only slot)
+      execute conn "DELETE FROM policies WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM unspent WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM spends WHERE spent_slot > ?" (Only slot)
       execute conn "DELETE FROM outputs WHERE created_slot > ?" (Only slot)

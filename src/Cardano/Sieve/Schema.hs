@@ -114,14 +114,31 @@ tables =
     \( script_hash BLOB NOT NULL PRIMARY KEY \
     \, script      BLOB NOT NULL \
     \)"
-  , -- Policy index backing SelectPolicyId / SelectAssetId, over the /full/
-    -- history (append-only, never deleted) so spent-inclusive policy queries
-    -- stay indexed. Unspent-by-policy joins these hits to @unspent@ by primary
-    -- key.
+  , -- Policy/asset index backing SelectPolicyId / SelectAssetId, over the /full/
+    -- history (append-only, never deleted) so spent-inclusive policy/asset
+    -- queries stay indexed. Unspent-by-policy/asset joins these hits to @unspent@
+    -- by primary key. One row per (output, policy_id, asset_name) — an output can
+    -- hold several assets under one policy, so asset_name is part of the key.
+    -- @created_slot@ is denormalised from the output so the newest-first sort is
+    -- covered by the composite indexes below, without joining @unspent@ to sort.
+    --
+    -- KNOWN HOT SPOT / redesign escalation (if we need to change this table):
+    -- even with the composite indexes this table is full-history, so a query for
+    -- a hot policy still walks spent entries. If the kupo comparison shows we
+    -- lose here, give the UNSPENT policy/asset path its own live-set table,
+    -- mirroring outputs-vs-unspent:
+    --   unspent_policies(output_reference, policy_id, asset_name, created_slot),
+    --   insert-on-create / delete-on-spend like @unspent@, indexed
+    --   @(policy_id, created_slot)@ and @(policy_id, asset_name, created_slot)@ —
+    --   no spent entries to skip. Consistent with the "index the small live set"
+    --   philosophy, but it adds ingest write work (a tier-1 fast-sync cost), so
+    --   build it only once measured against kupo. See [[sieve-query-index-tuning]].
     "CREATE TABLE IF NOT EXISTS policies \
-    \( output_reference BLOB NOT NULL \
-    \, policy_id        BLOB NOT NULL \
-    \, PRIMARY KEY (output_reference, policy_id) \
+    \( output_reference BLOB    NOT NULL \
+    \, policy_id        BLOB    NOT NULL \
+    \, asset_name       BLOB    NOT NULL \
+    \, created_slot     INTEGER NOT NULL \
+    \, PRIMARY KEY (output_reference, policy_id, asset_name) \
     \, FOREIGN KEY (output_reference) REFERENCES outputs(output_reference) \
     \)"
   ]
@@ -129,13 +146,29 @@ tables =
 -- All secondary indexes live on the small @unspent@ table (plus @policies@ and
 -- @spends@); @outputs@ stays primary-key-only, so appending to history is cheap
 -- and spent-inclusive/historical queries are best-effort.
+--
+-- The point-dimension indexes are COMPOSITE @(filter, created_slot)@ so a single
+-- index serves both the @WHERE@ equality and the newest-first @ORDER BY
+-- created_slot@: SQLite reads the rows already in order (no separate sort pass)
+-- and @LIMIT@ stops early. Single-column versions were net-negative for hot keys
+-- — 126 ms vs 0.2 ms composite (query bench, 2026-07-28).
+--
+-- Two deliberate choices:
+--   * NOT covering. The composite ends at @created_slot@, not the returned
+--     @value@/@datum_hash@ — SQLite locates rows via the index, then fetches
+--     their columns by primary key. Adding @value@ (a large blob) to the index
+--     would bloat it for no measurable gain.
+--   * @DESC@ needs no special index. SQLite reads an ascending index backwards
+--     to satisfy @ORDER BY created_slot DESC@, so the index is defined ascending.
 indexes :: [Query]
 indexes =
-  [ "CREATE INDEX IF NOT EXISTS unspentByAddress              ON unspent(address)"
-  , "CREATE INDEX IF NOT EXISTS unspentByPaymentCredential    ON unspent(payment_credential)"
-  , "CREATE INDEX IF NOT EXISTS unspentByDelegationCredential ON unspent(delegation_credential)"
-  , "CREATE INDEX IF NOT EXISTS unspentByTransactionId        ON unspent(transaction_id)"
+  [ "CREATE INDEX IF NOT EXISTS unspentByAddress              ON unspent(address, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS unspentByPaymentCredential    ON unspent(payment_credential, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS unspentByDelegationCredential ON unspent(delegation_credential, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS unspentByPaymentAndDelegation ON unspent(payment_credential, delegation_credential, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS unspentByTransactionId        ON unspent(transaction_id, created_slot)"
   , "CREATE INDEX IF NOT EXISTS unspentByCreatedSlot          ON unspent(created_slot)"
-  , "CREATE INDEX IF NOT EXISTS policiesByPolicyId            ON policies(policy_id)"
+  , "CREATE INDEX IF NOT EXISTS policiesByPolicyId            ON policies(policy_id, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS policiesByAssetId             ON policies(policy_id, asset_name, created_slot)"
   , "CREATE INDEX IF NOT EXISTS spendsBySlot                  ON spends(spent_slot)"
   ]

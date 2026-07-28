@@ -241,7 +241,7 @@ toStored o =
     , soValue = LBS.toStrict (encode (doValue o))
     , soDatumHash = doDatumHash o
     , soReferenceScriptHash = doReferenceScriptHash o
-    , soPolicyIds = policyIdsOf (doValue o)
+    , soAssets = assetsOf (doValue o)
     }
 
 -- | Encode an output reference as the transaction id bytes followed by the
@@ -251,11 +251,11 @@ encodeOutputRef (TxIn txid (TxIx ix)) =
   serialiseToRawBytes txid
     <> LBS.toStrict (toLazyByteString (word64BE (fromIntegral ix)))
 
--- | The distinct policy ids of the positive-quantity assets in a value (ada
--- excluded).
-policyIdsOf :: Value -> [ByteString]
-policyIdsOf v =
+-- | The distinct (policy id, asset name) pairs of the positive-quantity assets
+-- in a value (ada excluded). Both are raw bytes; the asset name may be empty.
+assetsOf :: Value -> [(ByteString, ByteString)]
+assetsOf v =
   Set.toList
     ( Set.fromList
-        [serialiseToRawBytes pid | (AssetId pid _, q) <- toList v, q > 0]
+        [(serialiseToRawBytes pid, serialiseToRawBytes name) | (AssetId pid name, q) <- toList v, q > 0]
     )
