@@ -74,8 +74,11 @@ ensure_sieve_db() {
 
 # --- is each server up? -----------------------------------------------------
 sieve_up() { curl -sf -o /dev/null --max-time 3 "$SIEVE_URL/matches/00?unspent" 2>/dev/null; }
-kupo_slot() { curl -sf --max-time 3 "$KUPO_URL/health" 2>/dev/null | jq -r '.most_recent_checkpoint // 0' 2>/dev/null || echo 0; }
-kupo_up() { local s; s=$(kupo_slot); [ "${s:-0}" -ge "$UNTIL_SLOT" ] 2>/dev/null; }
+# kupo's /health is Prometheus text unless you ask for JSON.
+kupo_slot() { curl -sf -H 'Accept: application/json' --max-time 3 "$KUPO_URL/health" 2>/dev/null | jq -r '.most_recent_checkpoint // 0' 2>/dev/null || echo 0; }
+# Ready = kupo has reached the slot sieve reached. Both stop at the last block
+# <= UNTIL_SLOT, whose slot is a bit below UNTIL_SLOT, so don't compare to UNTIL_SLOT.
+kupo_up() { local s; s=$(kupo_slot); [ "${s:-0}" -ge "${REACHED:-$UNTIL_SLOT}" ] 2>/dev/null; }
 
 # --- print the commands to run in two terminals, then exit ------------------
 print_setup() {
@@ -112,10 +115,12 @@ warm() { local i; for ((i = 0; i < WARMUP; i++)); do curl -s -o /dev/null --max-
 
 # --- run --------------------------------------------------------------------
 ensure_sieve_db
+REACHED=$(sqlite3 "$SIEVE_DB" "SELECT max(created_slot) FROM unspent")
+log "range reached slot $REACHED (last block <= $UNTIL_SLOT)"
 
 if ! sieve_up || ! kupo_up; then
   sieve_up && log "sieve server: up" || log "sieve server: DOWN"
-  kupo_up  && log "kupo server: up"  || log "kupo server: DOWN (need slot >= $UNTIL_SLOT, have $(kupo_slot))"
+  kupo_up  && log "kupo server: up"  || log "kupo server: DOWN (need slot >= $REACHED, have $(kupo_slot))"
   print_setup
   exit 0
 fi
@@ -127,10 +132,15 @@ if [ -f "$KUPO_SQLITE" ] && ! sqlite3 "$KUPO_SQLITE" "SELECT name FROM sqlite_ma
   log "WARNING: kupo has no address index (bounded sync never hit real tip) — kupo numbers are unfairly slow."
 fi
 
-# Case: the busiest address as base16 — accepted by both servers.
-ADDR=$(sqlite3 "$SIEVE_DB" "SELECT hex(address) FROM unspent GROUP BY address ORDER BY count(*) DESC LIMIT 1")
+# Case: a realistic address, as base16 (both servers accept base16). We pick the
+# busiest address with <= 100 UTxOs: sieve's endpoint returns one page (LIMIT
+# 100) while kupo returns ALL matches, so a bigger address would return different
+# sizes and be incomparable (and huge). Aligning sieve's pagination with kupo is
+# a follow-up; until then, <=100 keeps the two result sets identical.
+ADDR=$(sqlite3 "$SIEVE_DB" "SELECT hex(address) FROM unspent GROUP BY address HAVING count(*) <= 100 ORDER BY count(*) DESC LIMIT 1")
+CARD=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM unspent WHERE address = X'$ADDR'")
 Q="/matches/$ADDR?unspent"
-log "case: unspent by address ${ADDR:0:16}…  (N=$N, warmup=$WARMUP)"
+log "case: unspent by address ${ADDR:0:16}…  ($CARD utxos; N=$N, warmup=$WARMUP)"
 
 # Sanity: both should return a similar number of rows.
 sc=$(curl -sf --max-time 30 "$SIEVE_URL$Q" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
