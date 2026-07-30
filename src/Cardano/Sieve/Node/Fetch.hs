@@ -57,7 +57,7 @@ import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
   )
 
 import Control.Exception (bracket)
-import Control.Monad (unless, when)
+import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.Word (Word16)
@@ -167,6 +167,11 @@ sieveBlock dbHandle selectors blockInMode@(BlockInMode _ block) = do
     )
   pure header
 
+-- | Whether the deferred query indexes have been built yet. The follower builds
+-- them once, the first time it reaches the node's tip; a named state reads
+-- better than a bare 'Bool' at the roll-forward guard.
+data IndexState = IndexesPending | IndexesBuilt
+
 -- | A pipelined ChainSync client that finds its intersection at @since@ and
 -- then streams the chain forever, sieving each roll-forward and rewinding on
 -- rollback. This is the original follow-the-tip behaviour, generalised only by
@@ -178,7 +183,7 @@ followingClient
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
 followingClient dbHandle selectors since =
   CSP.ChainSyncClientPipelined $ do
-    built <- newIORef False
+    built <- newIORef IndexesPending
     pure (clientIntersect built)
  where
   maxInFlight :: Word16
@@ -194,7 +199,7 @@ followingClient dbHandle selectors since =
         }
 
   clientIdle
-    :: IORef Bool
+    :: IORef IndexState
     -> WithOrigin BlockNo
     -> WithOrigin BlockNo
     -> Nat n
@@ -208,7 +213,7 @@ followingClient dbHandle selectors since =
           (pure ())
           (clientIdle built clientTip serverTip (Succ n))
 
-  clientNext :: IORef Bool -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  clientNext :: IORef IndexState -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
   clientNext built n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
@@ -218,10 +223,12 @@ followingClient dbHandle selectors since =
           -- once: bulk catch-up ran index-free, and from here tip updates are
           -- small increments on the indexed tables.
           when (At blockNo >= tip) $ do
-            done <- readIORef built
-            unless done $ do
-              buildIndexesOn dbHandle
-              writeIORef built True
+            st <- readIORef built
+            case st of
+              IndexesBuilt -> pure ()
+              IndexesPending -> do
+                buildIndexesOn dbHandle
+                writeIORef built IndexesBuilt
           pure (clientIdle built (At blockNo) tip n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
           rollbackAbove dbHandle (chainPointSlot point)
