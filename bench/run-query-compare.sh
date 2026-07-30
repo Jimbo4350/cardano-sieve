@@ -150,3 +150,11 @@ log "result rows: sieve=$sc  kupo=$kc  $([ "$sc" = "$kc" ] || echo '(DIFFER — 
 warm "$SIEVE_URL$Q"; warm "$KUPO_URL$Q"
 printf '\n%-6s %s\n' "sieve" "$(timings "$SIEVE_URL$Q" | stats)"
 printf '%-6s %s\n'   "kupo"  "$(timings "$KUPO_URL$Q"  | stats)"
+
+# Dump the actual results so the response SHAPES can be compared directly (this is
+# how you see what sieve still needs to return to match kupo).
+curl -s --max-time 30 "$SIEVE_URL$Q" >/tmp/qcmp-sieve.json 2>/dev/null || true
+curl -s --max-time 30 "$KUPO_URL$Q"  >/tmp/qcmp-kupo.json  2>/dev/null || true
+printf '\nsample match (first row) — full JSON in /tmp/qcmp-sieve.json and /tmp/qcmp-kupo.json:\n'
+echo "  sieve:"; jq -c '.[0]' /tmp/qcmp-sieve.json 2>/dev/null | sed 's/^/    /'
+echo "  kupo :"; jq -c '.[0]' /tmp/qcmp-kupo.json  2>/dev/null | sed 's/^/    /'
