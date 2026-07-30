@@ -31,12 +31,13 @@ module Cardano.Sieve.Node.Insert
   , closeDatabase
   , applyBlock
   , rollbackAbove
+  , installIndexes
   )
 where
 
-import Cardano.Sieve.Schema (createSchema)
+import Cardano.Sieve.Schema (createSchema, installDeferredIndexes)
 
-import Control.Exception (onException)
+import Control.Exception (bracket, onException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -110,6 +111,13 @@ openDatabase path batchSize = do
   prepare conn `onException` close conn
   pending <- newIORef 0
   pure (DbHandle conn (max 1 batchSize) pending)
+
+-- | Open an existing database, install the deferred secondary indexes that back
+-- the query API, and close. Run once after the initial sync — the indexes are
+-- omitted during ingest to keep writes cheap (see "Cardano.Sieve.Schema").
+installIndexes :: FilePath -> IO ()
+installIndexes path =
+  bracket (openDatabase path 1) closeDatabase (installDeferredIndexes . dbConn)
 
 -- | Commit the final partial batch (if any) and close the connection.
 closeDatabase :: DbHandle -> IO ()
