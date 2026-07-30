@@ -31,6 +31,7 @@ module Cardano.Sieve.Node.Insert
   , closeDatabase
   , applyBlock
   , rollbackAbove
+  , buildIndexesOn
   , installIndexes
   )
 where
@@ -112,12 +113,17 @@ openDatabase path batchSize = do
   pending <- newIORef 0
   pure (DbHandle conn (max 1 batchSize) pending)
 
--- | Open an existing database, install the deferred secondary indexes that back
--- the query API, and close. Run once after the initial sync — the indexes are
--- omitted during ingest to keep writes cheap (see "Cardano.Sieve.Schema").
+-- | Install the deferred secondary indexes on an already-open handle, committing
+-- the open batch first. Fired once on reaching the chain tip — bulk catch-up
+-- runs index-free to keep writes cheap (see "Cardano.Sieve.Schema").
+buildIndexesOn :: DbHandle -> IO ()
+buildIndexesOn db = flush db >> installDeferredIndexes (dbConn db)
+
+-- | Open an existing database, install the deferred query indexes, and close.
+-- The @--build-indexes@ one-shot, for databases that never reach live tip (e.g.
+-- a bounded @--until@ sync or the benchmark).
 installIndexes :: FilePath -> IO ()
-installIndexes path =
-  bracket (openDatabase path 1) closeDatabase (installDeferredIndexes . dbConn)
+installIndexes path = bracket (openDatabase path 1) closeDatabase buildIndexesOn
 
 -- | Commit the final partial batch (if any) and close the connection.
 closeDatabase :: DbHandle -> IO ()

@@ -43,6 +43,7 @@ import Cardano.Sieve.Node.Decode (selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , applyBlock
+  , buildIndexesOn
   , closeDatabase
   , openDatabase
   , rollbackAbove
@@ -56,6 +57,8 @@ import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
   )
 
 import Control.Exception (bracket)
+import Control.Monad (unless, when)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.Word (Word16)
 import Network.TypedProtocol.Core (Nat (Succ, Zero))
@@ -174,43 +177,55 @@ followingClient
   -> ChainPoint
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
 followingClient dbHandle selectors since =
-  CSP.ChainSyncClientPipelined (pure clientIntersect)
+  CSP.ChainSyncClientPipelined $ do
+    built <- newIORef False
+    pure (clientIntersect built)
  where
   maxInFlight :: Word16
   maxInFlight = 50
 
-  clientIntersect =
+  clientIntersect built =
     CSP.SendMsgFindIntersect [since] $
       CSP.ClientPipelinedStIntersect
         { CSP.recvMsgIntersectFound = \_point serverTip ->
-            pure (clientIdle Origin (fromChainTip serverTip) Zero)
+            pure (clientIdle built Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             fail ("--since point not on the node's chain: " <> show since)
         }
 
   clientIdle
-    :: WithOrigin BlockNo
+    :: IORef Bool
+    -> WithOrigin BlockNo
     -> WithOrigin BlockNo
     -> Nat n
     -> CSP.ClientPipelinedStIdle n BlockInMode ChainPoint ChainTip IO ()
-  clientIdle clientTip serverTip n =
+  clientIdle built clientTip serverTip n =
     case pipelineDecisionMax maxInFlight n clientTip serverTip of
       Collect -> case n of
-        Succ predN -> CSP.CollectResponse Nothing (clientNext predN)
+        Succ predN -> CSP.CollectResponse Nothing (clientNext built predN)
       _ ->
         CSP.SendMsgRequestNextPipelined
           (pure ())
-          (clientIdle clientTip serverTip (Succ n))
+          (clientIdle built clientTip serverTip (Succ n))
 
-  clientNext :: Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
-  clientNext n =
+  clientNext :: IORef Bool -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  clientNext built n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
           BlockHeader _ _ blockNo <- sieveBlock dbHandle selectors blockInMode
-          pure (clientIdle (At blockNo) (fromChainTip serverTip) n)
+          let tip = fromChainTip serverTip
+          -- On first catching the node's tip, build the deferred query indexes
+          -- once: bulk catch-up ran index-free, and from here tip updates are
+          -- small increments on the indexed tables.
+          when (At blockNo >= tip) $ do
+            done <- readIORef built
+            unless done $ do
+              buildIndexesOn dbHandle
+              writeIORef built True
+          pure (clientIdle built (At blockNo) tip n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
           rollbackAbove dbHandle (chainPointSlot point)
-          pure (clientIdle Origin (fromChainTip serverTip) n)
+          pure (clientIdle built Origin (fromChainTip serverTip) n)
       }
 
 -- | A pipelined ChainSync client that indexes from @since@ up to and including
