@@ -42,6 +42,7 @@ import Cardano.Api
 import Cardano.Sieve.Node.Decode (selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
+  , StoredOutput (soDatumHash, soReferenceScriptHash)
   , applyBlock
   , buildIndexesOn
   , closeDatabase
@@ -60,6 +61,7 @@ import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import Data.Maybe (isJust)
 import Data.Word (Word16)
 import Network.TypedProtocol.Core (Nat (Succ, Zero))
 
@@ -147,9 +149,11 @@ runSync socketPath networkId dbPath batchSize mkClient =
 sieveBlock :: DbHandle -> [Selector] -> BlockInMode -> IO BlockHeader
 sieveBlock dbHandle selectors blockInMode@(BlockInMode _ block) = do
   let header = getBlockHeader block
-      BlockHeader slotNo hash blockNo = header
+      BlockHeader slotNo hash _blockNo = header
       selected = selectedStored selectors blockInMode
       spent = spentInputs blockInMode
+      datums = length (filter (isJust . soDatumHash) selected)
+      scripts = length (filter (isJust . soReferenceScriptHash) selected)
   applyBlock
     dbHandle
     (fromIntegral (unSlotNo slotNo))
@@ -157,13 +161,16 @@ sieveBlock dbHandle selectors blockInMode@(BlockInMode _ block) = do
     selected
     spent
   putStrLn
-    ( "block "
-        <> show blockNo
-        <> " ("
+    ( "roll-forward  slot="
+        <> show (unSlotNo slotNo)
+        <> "  outputs="
         <> show (length selected)
-        <> " selected, "
+        <> "  datums="
+        <> show datums
+        <> "  scripts="
+        <> show scripts
+        <> "  spent="
         <> show (length spent)
-        <> " inputs)"
     )
   pure header
 

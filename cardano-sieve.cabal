@@ -50,6 +50,7 @@ library
     , text                     ^>=2.1
     , typed-protocols          ^>=1.2
     , unix                     ^>=2.8
+    , wai
     , warp
 
 executable cardano-sieve

@@ -23,11 +23,14 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (Null), eitherDecodeStrict, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString.Base16 qualified as Base16
+import Data.ByteString.Char8 qualified as B8
 import Data.Int (Int64)
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Database.SQLite.Simple (Only (Only), query, withConnection)
+import GHC.Clock (getMonotonicTime)
+import Network.Wai (Middleware, rawPathInfo, rawQueryString, requestMethod)
 import Network.Wai.Handler.Warp qualified as Warp
 
 import Servant (Capture, Get, Handler, JSON, QueryFlag, Server, serve, (:>))
@@ -41,8 +44,29 @@ type API =
 
 -- | Serve the query API on @port@, reading from the SQLite database at @dbPath@.
 runServer :: FilePath -> Int -> IO ()
-runServer dbPath port =
-  Warp.run port (serve (Proxy :: Proxy API) (server dbPath))
+runServer dbPath port = do
+  putStrLn
+    ("cardano-sieve query API: http://127.0.0.1:" <> show port <> "  (database " <> dbPath <> ")")
+  Warp.run port (logRequests (serve (Proxy :: Proxy API) (server dbPath)))
+
+-- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
+-- obvious the server is alive and requests are landing. The per-line cost is
+-- negligible next to the SQL query and the HTTP round-trip.
+logRequests :: Middleware
+logRequests app req respond = do
+  t0 <- getMonotonicTime
+  app req $ \res -> do
+    sent <- respond res
+    t1 <- getMonotonicTime
+    putStrLn $
+      B8.unpack (requestMethod req)
+        <> " "
+        <> B8.unpack (rawPathInfo req)
+        <> B8.unpack (rawQueryString req)
+        <> "  "
+        <> show (round ((t1 - t0) * 1000) :: Int)
+        <> "ms"
+    pure sent
 
 server :: FilePath -> Server API
 server = matchesByAddress
