@@ -25,6 +25,7 @@ library
   import:          project-config
   hs-source-dirs:  src
   exposed-modules: Cardano.Sieve
+                   Cardano.Server.Http
                    Cardano.Sieve.Selector
                    Cardano.Sieve.Schema
                    Cardano.Sieve.Node.Decode
@@ -44,15 +45,21 @@ library
     , microlens                ^>=0.4
     , optparse-applicative     ^>=0.19
     , ouroboros-network:protocols ^>=1.1
+    , servant-server
     , sqlite-simple            ^>=0.4
     , text                     ^>=2.1
     , typed-protocols          ^>=1.2
     , unix                     ^>=2.8
+    , warp
 
 executable cardano-sieve
   import:         project-config
   hs-source-dirs: app
   main-is:        Main.hs
+  -- -threaded: warp (the query server) needs the threaded RTS. No -N, so the
+  -- default stays one capability — the single-threaded indexer (ADR-020) and its
+  -- benchmark characteristics are unchanged; -N can still be given via +RTS.
+  ghc-options:    -threaded -rtsopts
   build-depends:
     , base >=4.14
     , cardano-sieve

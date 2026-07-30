@@ -27,6 +27,7 @@ import Cardano.Api
   , deserialiseFromRawBytesHex
   )
 
+import Cardano.Server.Http (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
 import Cardano.Sieve.Node.Insert (installIndexes)
 import Cardano.Sieve.Selector
@@ -90,6 +91,8 @@ data Options = Options
   , buildIndexes :: Bool
   -- ^ @--build-indexes@: instead of syncing, install the deferred query indexes
   -- on @--database@ and exit. Run once after the initial sync.
+  , servePort :: Maybe Int
+  -- ^ @--serve PORT@: instead of syncing, serve the read query API on this port.
   }
 
 -- | Parse options and stream the chain, writing each header to SQLite and
@@ -109,26 +112,28 @@ sieve = do
   mainThread <- myThreadId
   _ <- installHandler sigTERM (CatchOnce (throwTo mainThread UserInterrupt)) Nothing
   opts <- execParser optionsInfo
-  if buildIndexes opts
-    then installIndexes (databasePath opts)
-    else case untilSlot opts of
-      Nothing ->
-        fetch
-          (socketPath opts)
-          (networkId opts)
-          (databasePath opts)
-          (batchSize opts)
-          (configuredSelectors opts)
-          (sincePoint opts)
-      Just u ->
-        fetchBounded
-          (socketPath opts)
-          (networkId opts)
-          (databasePath opts)
-          (batchSize opts)
-          (configuredSelectors opts)
-          (sincePoint opts)
-          u
+  case servePort opts of
+    Just p -> runServer (databasePath opts) p
+    Nothing
+      | buildIndexes opts -> installIndexes (databasePath opts)
+      | otherwise -> case untilSlot opts of
+          Nothing ->
+            fetch
+              (socketPath opts)
+              (networkId opts)
+              (databasePath opts)
+              (batchSize opts)
+              (configuredSelectors opts)
+              (sincePoint opts)
+          Just u ->
+            fetchBounded
+              (socketPath opts)
+              (networkId opts)
+              (databasePath opts)
+              (batchSize opts)
+              (configuredSelectors opts)
+              (sincePoint opts)
+              u
  where
   -- Default to matching every output when no --select is given, so the full
   -- decode → sieve → write path is still exercised out of the box.
@@ -156,6 +161,7 @@ optionsParser =
     <*> pSince
     <*> pUntil
     <*> pBuildIndexes
+    <*> pServe
  where
   pSocketPath :: Parser SocketPath
   pSocketPath =
@@ -239,6 +245,16 @@ optionsParser =
       ( long "build-indexes"
           <> help "Install the deferred query indexes on --database and exit (run once after the initial sync)"
       )
+
+  pServe :: Parser (Maybe Int)
+  pServe =
+    optional $
+      option
+        auto
+        ( long "serve"
+            <> metavar "PORT"
+            <> help "Serve the read query API on this port (reads --database; does not sync)"
+        )
 
 -- | Parse a @--since@ argument: @origin@, or @SLOT.HEADERHASH@ — a decimal slot
 -- and a base16 block-header hash, as kupo and cardano-cli render chain points.
