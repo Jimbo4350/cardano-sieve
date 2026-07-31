@@ -21,6 +21,8 @@ where
 
 import Cardano.Api (AsType (AsAddressAny), deserialiseFromRawBytes, serialiseAddress)
 
+import Control.Exception (SomeException, try)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), eitherDecodeStrict, object, (.=))
 import Data.Aeson.Key qualified as Key
@@ -34,10 +36,12 @@ import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text, pack)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Word (Word64)
-import Database.SQLite.Simple (Only (Only), query, withConnection)
+import Database.SQLite.Simple (Connection, Only (Only), query, query_, withConnection)
 import GHC.Clock (getMonotonicTime)
 import Network.Wai (Middleware, rawPathInfo, rawQueryString, requestMethod)
 import Network.Wai.Handler.Warp qualified as Warp
+import System.Exit (die)
+import System.Posix.Files (fileExist)
 
 import Servant (Capture, Get, Handler, JSON, QueryFlag, Server, serve, (:>))
 
@@ -49,11 +53,64 @@ type API =
     :> Get '[JSON] [Value]
 
 -- | Serve the query API on @port@, reading from the SQLite database at @dbPath@.
+-- Refuses to start unless the database is present and readable ('describeDatabase').
 runServer :: FilePath -> Int -> IO ()
 runServer dbPath port = do
+  summary <- describeDatabase dbPath
   putStrLn
-    ("cardano-sieve query API: http://127.0.0.1:" <> show port <> "  (database " <> dbPath <> ")")
+    ( "cardano-sieve query API: http://127.0.0.1:"
+        <> show port
+        <> "  (database "
+        <> dbPath
+        <> " — "
+        <> summary
+        <> ")"
+    )
   Warp.run port (logRequests (serve (Proxy :: Proxy API) (server dbPath)))
+
+-- | Check the database before serving from it, and describe what is in it.
+--
+-- Worth doing loudly because the failure is otherwise silent: 'withConnection' is
+-- opened per request and SQLite /creates/ a missing file on open, so a deleted or
+-- mistyped @--database@ path used to start a server that logged nothing (no
+-- requests yet), then answered every query with @[]@. Dying here, and printing the
+-- row count and tip slot on success, makes "is this pointed at real data?"
+-- answerable from the startup line alone.
+describeDatabase :: FilePath -> IO String
+describeDatabase dbPath = do
+  exists <- fileExist dbPath
+  unless exists $
+    die (dbPath <> ": no such database — sync one first, or check --database")
+  probed <-
+    try (withConnection dbPath probe) :: IO (Either SomeException (Int, Maybe Int64, Bool))
+  case probed of
+    Left err ->
+      die (dbPath <> ": not a readable cardano-sieve database — " <> show err)
+    Right (rows, tip, indexed) -> do
+      when (rows == 0) $
+        putStrLn "WARNING: 0 unspent rows — every query will return []. Is the sync finished?"
+      unless indexed $
+        putStrLn "WARNING: query indexes absent — queries will be slow. Run with --build-indexes."
+      pure
+        ( show rows
+            <> " unspent rows, tip slot "
+            <> maybe "none" show tip
+            <> if indexed then ", indexed" else ", NOT indexed"
+        )
+ where
+  headOr :: a -> [Only a] -> a
+  headOr d rs = case rs of Only x : _ -> x; [] -> d
+
+  probe :: Connection -> IO (Int, Maybe Int64, Bool)
+  probe conn = do
+    rows <- query_ conn "SELECT count(*) FROM unspent"
+    tips <- query_ conn "SELECT max(created_slot) FROM unspent"
+    -- One representative deferred index; they are all installed together.
+    idxs <-
+      query_
+        conn
+        "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='unspentByAddress'"
+    pure (headOr 0 rows, headOr Nothing tips, headOr (0 :: Int) idxs > 0)
 
 -- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
 -- obvious the server is alive and requests are landing. The per-line cost is

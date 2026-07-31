@@ -42,7 +42,6 @@ import Cardano.Api
 import Cardano.Sieve.Node.Decode (selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
-  , StoredOutput (soDatumHash, soReferenceScriptHash)
   , applyBlock
   , buildIndexesOn
   , closeDatabase
@@ -61,9 +60,10 @@ import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.Maybe (isJust)
 import Data.Word (Word16)
+import GHC.Clock (getMonotonicTime)
 import Network.TypedProtocol.Core (Nat (Succ, Zero))
+import Numeric (showFFloat)
 
 -- | Follow a local node's chain forever, starting at @since@ (genesis by
 -- default): sieve each block's outputs against the selectors and persist the
@@ -82,7 +82,7 @@ fetch socketPath networkId dbPath batchSize selectors since =
     networkId
     dbPath
     batchSize
-    (\dbHandle -> followingClient dbHandle selectors since)
+    (\dbHandle progress -> followingClient dbHandle progress selectors since)
 
 -- | As 'fetch', but index only from @since@ up to and including @untilSlot@,
 -- then stop. For bounded backfills and benchmark runs.
@@ -101,23 +101,43 @@ fetchBounded socketPath networkId dbPath batchSize selectors since untilSlot =
     networkId
     dbPath
     batchSize
-    (\dbHandle -> boundedClient dbHandle selectors since untilSlot)
+    (\dbHandle progress -> boundedClient dbHandle progress selectors since untilSlot)
 
 -- | Open the database, connect to the local node, and drive the given
 -- pipelined ChainSync client, flushing the database on exit. The bounded and
 -- following entry points differ only in which client they hand to this.
+--
+-- Brackets the run with progress reporting: a line up front so it is obvious the
+-- sync started, a heartbeat every 'heartbeatSeconds' while it runs, and a closing
+-- summary once the client finishes (which a bounded run does and a following one
+-- does not).
 runSync
   :: SocketPath
   -> NetworkId
   -> FilePath
   -> Int
-  -> (DbHandle -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ())
+  -> ( DbHandle
+       -> IORef Progress
+       -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
+     )
   -> IO ()
 runSync socketPath networkId dbPath batchSize mkClient =
   bracket
     (openDatabase dbPath batchSize)
     closeDatabase
-    (\dbHandle -> connectToLocalNode connectInfo (protocols dbHandle))
+    ( \dbHandle -> do
+        progress <- newProgress
+        putStrLn
+          ( "sync starting  db="
+              <> dbPath
+              <> "  batch-size="
+              <> show batchSize
+              <> "  (progress every "
+              <> showFFloat (Just 0) heartbeatSeconds "s)"
+          )
+        connectToLocalNode connectInfo (protocols dbHandle progress)
+        summarise progress
+    )
  where
   connectInfo :: LocalNodeConnectInfo
   connectInfo =
@@ -133,45 +153,140 @@ runSync socketPath networkId dbPath batchSize mkClient =
       , localNodeSocketPath = socketPath
       }
 
-  protocols :: DbHandle -> LocalNodeClientProtocolsInMode
-  protocols dbHandle =
+  protocols :: DbHandle -> IORef Progress -> LocalNodeClientProtocolsInMode
+  protocols dbHandle progress =
     LocalNodeClientProtocols
-      { localChainSyncClient = LocalChainSyncClientPipelined (mkClient dbHandle)
+      { localChainSyncClient = LocalChainSyncClientPipelined (mkClient dbHandle progress)
       , localTxSubmissionClient = Nothing
       , localStateQueryClient = Nothing
       , localTxMonitoringClient = Nothing
       }
 
+-- | Rolling counters behind the periodic sync heartbeat.
+--
+-- A bulk sync processes millions of blocks, so a line per block is unreadable
+-- and costs real throughput in the hot loop (it is why the benchmark used to
+-- discard sieve's output wholesale). Instead every roll-forward folds its work
+-- into these counters — cheap, no I/O — and a line is emitted only once
+-- 'heartbeatSeconds' have passed.
+data Progress = Progress
+  { pgStartedAt :: !Double
+  -- ^ Monotonic seconds when the sync began; the basis for @elapsed@.
+  , pgReportedAt :: !Double
+  -- ^ Monotonic seconds when the last line was emitted. Also the left edge of
+  -- the window the reported block rate is computed over.
+  , pgBlocks :: !Int
+  -- ^ Blocks rolled forward since the start.
+  , pgOutputs :: !Int
+  -- ^ Matched outputs written since the start.
+  , pgSpends :: !Int
+  -- ^ Spends recorded since the start.
+  , pgBlocksAtReport :: !Int
+  -- ^ 'pgBlocks' as of the last emitted line, so the rate is the /recent/ rate
+  -- rather than a start-to-now average that hides a slowdown.
+  }
+
+-- | Emit at most one progress line per this many seconds.
+heartbeatSeconds :: Double
+heartbeatSeconds = 5
+
+newProgress :: IO (IORef Progress)
+newProgress = do
+  now <- getMonotonicTime
+  newIORef (Progress now now 0 0 0 0)
+
+-- | Fold one block's work into the counters, emitting a progress line if the
+-- heartbeat interval has elapsed. One clock read per block on the common path.
+--
+-- @target@ is the slot the sync is heading for, when known — @--until@ for a
+-- bounded run, the server's tip for a following one — and drives the percentage.
+tick :: IORef Progress -> SlotNo -> Maybe SlotNo -> Int -> Int -> IO ()
+tick ref slotNo target outputs spends = do
+  now <- getMonotonicTime
+  pg <- readIORef ref
+  let folded =
+        pg
+          { pgBlocks = pgBlocks pg + 1
+          , pgOutputs = pgOutputs pg + outputs
+          , pgSpends = pgSpends pg + spends
+          }
+  if now - pgReportedAt folded < heartbeatSeconds
+    then writeIORef ref folded
+    else do
+      writeIORef
+        ref
+        folded{pgReportedAt = now, pgBlocksAtReport = pgBlocks folded}
+      putStrLn (progressLine folded now slotNo target)
+
+-- | The heartbeat line, e.g.
+--
+-- > syncing  slot=1284213/3999989  32.1%  1843 blk/s  blocks=61204  outputs=418337  spends=205118  elapsed=35s
+progressLine :: Progress -> Double -> SlotNo -> Maybe SlotNo -> String
+progressLine pg now slotNo target =
+  "syncing  slot="
+    <> show (unSlotNo slotNo)
+    <> maybe "" (\t -> "/" <> show (unSlotNo t) <> percent t) target
+    <> "  "
+    <> show (round rate :: Int)
+    <> " blk/s  blocks="
+    <> show (pgBlocks pg)
+    <> "  outputs="
+    <> show (pgOutputs pg)
+    <> "  spends="
+    <> show (pgSpends pg)
+    <> "  elapsed="
+    <> showFFloat (Just 0) (now - pgStartedAt pg) "s"
+ where
+  -- Guard the divisor: two blocks can share a clock reading.
+  window = max 1e-6 (now - pgReportedAt pg)
+  rate = fromIntegral (pgBlocks pg - pgBlocksAtReport pg) / window :: Double
+  percent t
+    | unSlotNo t == 0 = ""
+    | otherwise =
+        "  "
+          <> showFFloat
+            (Just 1)
+            (100 * fromIntegral (unSlotNo slotNo) / fromIntegral (unSlotNo t) :: Double)
+            "%"
+
+-- | The closing line when a bounded sync finishes.
+summarise :: IORef Progress -> IO ()
+summarise ref = do
+  now <- getMonotonicTime
+  pg <- readIORef ref
+  let secs = max 1e-6 (now - pgStartedAt pg)
+  putStrLn
+    ( "sync done  blocks="
+        <> show (pgBlocks pg)
+        <> "  outputs="
+        <> show (pgOutputs pg)
+        <> "  spends="
+        <> show (pgSpends pg)
+        <> "  elapsed="
+        <> showFFloat (Just 1) secs "s"
+        <> "  avg="
+        <> show (round (fromIntegral (pgBlocks pg) / secs) :: Int)
+        <> " blk/s"
+    )
+
 -- | Sieve one block's outputs against the selectors, persist the matches, and
 -- record spends of any tracked outputs the block's transactions consumed;
--- print a one-line summary. Returns the block's header — the bounded client
--- needs its slot to detect the stop point.
-sieveBlock :: DbHandle -> [Selector] -> BlockInMode -> IO BlockHeader
-sieveBlock dbHandle selectors blockInMode@(BlockInMode _ block) = do
+-- fold the work into the progress counters. Returns the block's header — the
+-- bounded client needs its slot to detect the stop point.
+sieveBlock
+  :: DbHandle -> IORef Progress -> [Selector] -> Maybe SlotNo -> BlockInMode -> IO BlockHeader
+sieveBlock dbHandle progress selectors target blockInMode@(BlockInMode _ block) = do
   let header = getBlockHeader block
       BlockHeader slotNo hash _blockNo = header
       selected = selectedStored selectors blockInMode
       spent = spentInputs blockInMode
-      datums = length (filter (isJust . soDatumHash) selected)
-      scripts = length (filter (isJust . soReferenceScriptHash) selected)
   applyBlock
     dbHandle
     (fromIntegral (unSlotNo slotNo))
     (serialiseToRawBytes hash)
     selected
     spent
-  putStrLn
-    ( "roll-forward  slot="
-        <> show (unSlotNo slotNo)
-        <> "  outputs="
-        <> show (length selected)
-        <> "  datums="
-        <> show datums
-        <> "  scripts="
-        <> show scripts
-        <> "  spent="
-        <> show (length spent)
-    )
+  tick progress slotNo target (length selected) (length spent)
   pure header
 
 -- | Whether the deferred query indexes have been built yet. The follower builds
@@ -185,10 +300,11 @@ data IndexState = IndexesPending | IndexesBuilt
 -- the configurable start point.
 followingClient
   :: DbHandle
+  -> IORef Progress
   -> [Selector]
   -> ChainPoint
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-followingClient dbHandle selectors since =
+followingClient dbHandle progress selectors since =
   CSP.ChainSyncClientPipelined $ do
     built <- newIORef IndexesPending
     pure (clientIntersect built)
@@ -224,7 +340,8 @@ followingClient dbHandle selectors since =
   clientNext built n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
-          BlockHeader _ _ blockNo <- sieveBlock dbHandle selectors blockInMode
+          BlockHeader _ _ blockNo <-
+            sieveBlock dbHandle progress selectors (chainTipSlot serverTip) blockInMode
           let tip = fromChainTip serverTip
           -- On first catching the node's tip, build the deferred query indexes
           -- once: bulk catch-up ran index-free, and from here tip updates are
@@ -254,11 +371,12 @@ followingClient dbHandle selectors since =
 -- intended use.
 boundedClient
   :: DbHandle
+  -> IORef Progress
   -> [Selector]
   -> ChainPoint
   -> SlotNo
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-boundedClient dbHandle selectors since untilSlot =
+boundedClient dbHandle progress selectors since untilSlot =
   CSP.ChainSyncClientPipelined (pure clientIntersect)
  where
   maxInFlight :: Word16
@@ -313,7 +431,7 @@ boundedClient dbHandle selectors since untilSlot =
               if slotNo > untilSlot
                 then pure (clientIdle True Origin (fromChainTip serverTip) n)
                 else do
-                  _ <- sieveBlock dbHandle selectors blockInMode
+                  _ <- sieveBlock dbHandle progress selectors (Just untilSlot) blockInMode
                   pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->
           if draining
@@ -328,6 +446,14 @@ fromChainTip :: ChainTip -> WithOrigin BlockNo
 fromChainTip = \case
   ChainTipAtGenesis -> Origin
   ChainTip _slotNo _hash blockNo -> At blockNo
+
+-- | The server tip's /slot/, for the progress percentage. Distinct from
+-- 'fromChainTip', which keeps the block number: progress compares slot to slot,
+-- and the two are not interchangeable on a chain with empty slots.
+chainTipSlot :: ChainTip -> Maybe SlotNo
+chainTipSlot = \case
+  ChainTipAtGenesis -> Nothing
+  ChainTip slotNo _hash _blockNo -> Just slotNo
 
 -- | The slot of a rollback point, or 'Nothing' for a rollback to genesis.
 chainPointSlot :: ChainPoint -> Maybe Int64
