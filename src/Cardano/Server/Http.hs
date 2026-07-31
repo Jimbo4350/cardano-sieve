@@ -194,6 +194,21 @@ data Refinements = Refinements
   , rfOutputIndex :: Maybe Word64
   }
 
+-- | The semi-join both the policy\/asset PATTERN and the @?policy_id@ post-filter
+-- need: does a @policies@ row exist for this output under this policy (and, when
+-- @extra@ adds it, this asset name)?
+--
+-- One definition for both callers so they cannot drift — they were previously two
+-- copies of the same subquery, and only one of them had been written as a
+-- semi-join. The policy hash is resolved to its @policy_ids@ surrogate by a scalar
+-- subquery, keeping a single-value equality on the leading index column.
+policiesExists :: Query -> Query
+policiesExists extra =
+  "EXISTS (SELECT 1 FROM policies p WHERE p.output_reference = u.output_reference \
+  \AND p.policy_num = (SELECT policy_num FROM policy_ids WHERE policy_id = ?)"
+    <> extra
+    <> ")"
+
 -- | Every extra @AND@ a request's filters contribute, with their parameters.
 --
 -- Returns 'Left' on a combination kupo rejects, so an impossible request fails
@@ -243,15 +258,9 @@ refinementsFor
       (Just p, mName) -> do
         pid <- hex "policy_id" 28 p
         name <- traverse (hexAny "asset_name") mName
-        -- EXISTS rather than a join: this narrows rows the pattern already chose, and
-        -- must not multiply them when an output holds several matching assets.
         Right
           [
-            ( "EXISTS (SELECT 1 FROM policies pf \
-              \WHERE pf.output_reference = u.output_reference \
-              \AND pf.policy_num = (SELECT policy_num FROM policy_ids WHERE policy_id = ?)"
-                <> maybe "" (const " AND pf.asset_name = ?") name
-                <> ")"
+            ( policiesExists (maybe "" (const " AND p.asset_name = ?") name)
             , SQLBlob pid : maybe [] ((: []) . SQLBlob) name
             )
           ]
@@ -585,17 +594,26 @@ planFor status = \case
 
   onBase cond params = Plan baseTable (cond <> statusFilter) "u.created_slot" params
 
-  -- The policy hash is resolved to its small policy_ids surrogate by a scalar
-  -- subquery, which keeps a single-value equality on the leading column of
-  -- policiesByPolicyId / policiesByAssetId.
+  -- EXISTS, never a JOIN. @policies@ holds one row per (output, policy, asset), so
+  -- joining it emits an output once per MATCHING ASSET: an output holding six
+  -- assets of a policy came back six times, 14,780 rows where kupo returns 2,464.
+  -- A semi-join asks only whether such a row exists.
+  --
+  -- Measured on the hottest policy at 4M, all three candidates return the correct
+  -- 2,464, but EXISTS yields its FIRST row in 0.00 s with no auxiliary structure;
+  -- GROUP BY needs 0.70 s because it must materialise every row before emitting
+  -- one; DISTINCT accumulates a seen-set b-tree that grows with the result.
+  --
+  -- The cost is that the sort moves to the base table's @created_slot@. On the
+  -- @?unspent@ path @unspentByCreatedSlot@ covers it, so there is still no sort. On
+  -- a spent-inclusive query the base is @outputs@, which is primary-key-only by
+  -- design, so that one does sort — consistent with historical queries there being
+  -- best-effort scans anyway.
   viaPolicies extra params =
     Plan
-      (baseTable <> " JOIN policies p ON p.output_reference = u.output_reference")
-      ( "p.policy_num = (SELECT policy_num FROM policy_ids WHERE policy_id = ?)"
-          <> extra
-          <> statusFilter
-      )
-      "p.created_slot"
+      baseTable
+      (policiesExists extra <> statusFilter)
+      "u.created_slot"
       params
 
 -- | Encode an output reference the way the schema stores it: 32 transaction-id

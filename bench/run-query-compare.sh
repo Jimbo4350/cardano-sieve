@@ -97,7 +97,12 @@ prep_sieve_db() {
 }
 
 # --- is each server up? -----------------------------------------------------
-sieve_up() { curl -sf -o /dev/null --max-time 3 "$SIEVE_URL/matches/00?unspent" 2>/dev/null; }
+# Probe with a VALID pattern that matches nothing: an output reference whose
+# transaction id is all zeroes. "00" used to serve as the probe, but an
+# unparseable pattern is now a 400 rather than an empty list, so -sf treated a
+# live server as down. A wildcard would work but streams the entire live set.
+SIEVE_PROBE="/matches/0@$(printf '0%.0s' $(seq 64))"
+sieve_up() { curl -sf -o /dev/null --max-time 5 "$SIEVE_URL$SIEVE_PROBE" 2>/dev/null; }
 # kupo's /health is Prometheus text unless you ask for JSON.
 kupo_slot() { curl -sf -H 'Accept: application/json' --max-time 3 "$KUPO_URL/health" 2>/dev/null | jq -r '.most_recent_checkpoint // 0' 2>/dev/null || echo 0; }
 # Ready = kupo has reached the slot sieve reached. Both stop at the last block
@@ -162,15 +167,54 @@ EOF
 }
 
 # --- measurement ------------------------------------------------------------
-timings() { local i; for ((i = 0; i < N; i++)); do curl -s -o /dev/null --fail --max-time 30 -w '%{time_total}\n' "$1" 2>/dev/null || true; done | awk 'NF { printf "%.3f\n", $1 * 1000 }'; }
-stats() {
-  sort -n | awk '
+# Both servers now STREAM every match, so total time is dominated by transferring
+# the body on any query with a lot of results — which would report bandwidth, not
+# query speed. So capture both:
+#   ttfb  time to first byte: how fast the server starts answering
+#   total time to last byte: ttfb plus serialising and shipping the whole result
+# On a small result they coincide; on a large one they are the interesting pair.
+timings() {
+  local i
+  for ((i = 0; i < ${N:-20}; i++)); do
+    curl -s -o /dev/null --fail --max-time 300 \
+      -w '%{time_starttransfer} %{time_total}\n' "$1" 2>/dev/null || true
+  done
+}
+stats() { # $1 = which column (1=ttfb, 2=total)
+  awk -v col="$1" 'NF >= 2 { print $col * 1000 }' | sort -n | awk '
     { a[NR] = $1 }
     function pct(p,   i) { i = int((p / 100) * NR + 0.999999); if (i < 1) i = 1; if (i > NR) i = NR; return a[i] }
-    END { if (NR == 0) { print "no successful requests"; exit }
-          printf "p50=%.1f  p95=%.1f  p99=%.1f  max=%.1f (ms)  n=%d\n", pct(50), pct(95), pct(99), a[NR], NR }'
+    END { if (NR == 0) { printf "%-38s", "no successful requests"; exit }
+          printf "p50=%8.1f  p95=%8.1f  p99=%8.1f", pct(50), pct(95), pct(99) }'
 }
-warm() { local i; for ((i = 0; i < WARMUP; i++)); do curl -s -o /dev/null --max-time 30 "$1" 2>/dev/null || true; done; }
+warm() { local i; for ((i = 0; i < WARMUP; i++)); do curl -s -o /dev/null --max-time 300 "$1" 2>/dev/null || true; done; }
+
+# Race one query shape on both servers, reporting ttfb and total side by side.
+#
+# Iterations scale DOWN with result size. Both servers stream every match, so a hot
+# key ships hundreds of megabytes per request; N=30 against the live set would move
+# ~10 GB per server and take half an hour to say what five samples already say.
+# Small results keep the full N, where per-request noise actually needs averaging
+# out. The chosen N is printed with each case so a number is never read as more
+# precise than it is.
+race() { # $1 = label  $2 = path  $3 = note
+  local sraw kraw sc kc n
+  sc=$(curl -sf --max-time 600 "$SIEVE_URL$2" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
+  kc=$(curl -sf --max-time 600 "$KUPO_URL$2" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
+  case "$sc" in
+    ''|'?') n=3 ;;
+    *) if [ "$sc" -gt 20000 ]; then n=3; elif [ "$sc" -gt 2000 ]; then n=8; else n=$N; fi ;;
+  esac
+  printf '\n%s  (%s)\n' "$1" "$3"
+  printf '  rows: sieve=%s kupo=%s%s   [n=%s]\n' "$sc" "$kc" \
+    "$([ "$sc" = "$kc" ] && echo '' || echo '  <- DIFFER, times below are not comparable')" "$n"
+  warm "$SIEVE_URL$2"; warm "$KUPO_URL$2"
+  sraw=$(N=$n timings "$SIEVE_URL$2"); kraw=$(N=$n timings "$KUPO_URL$2")
+  printf '  %-5s ttfb  %s\n' "sieve" "$(printf '%s\n' "$sraw" | stats 1)"
+  printf '  %-5s ttfb  %s\n' "kupo" "$(printf '%s\n' "$kraw" | stats 1)"
+  printf '  %-5s total %s\n' "sieve" "$(printf '%s\n' "$sraw" | stats 2)"
+  printf '  %-5s total %s\n' "kupo" "$(printf '%s\n' "$kraw" | stats 2)"
+}
 
 # --- run --------------------------------------------------------------------
 [ -n "${PREP:-}" ] && prep_sieve_db
@@ -225,29 +269,42 @@ if [ -f "$KUPO_SQLITE" ] && ! sqlite3 "$KUPO_SQLITE" "SELECT name FROM sqlite_ma
   log "WARNING: kupo has no address index (bounded sync never hit real tip) — kupo numbers are unfairly slow."
 fi
 
-# Case: a realistic address, as base16 (both servers accept base16). We pick the
-# busiest address with <= 100 UTxOs: sieve's endpoint returns one page (LIMIT
-# 100) while kupo returns ALL matches, so a bigger address would return different
-# sizes and be incomparable (and huge). Aligning sieve's pagination with kupo is
-# a follow-up; until then, <=100 keeps the two result sets identical.
-ADDR=$(sqlite3 "$SIEVE_DB" "SELECT hex(address) FROM unspent GROUP BY address HAVING count(*) <= 100 ORDER BY count(*) DESC LIMIT 1")
-CARD=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM unspent WHERE address = X'$ADDR'")
-Q="/matches/$ADDR?unspent"
-log "case: unspent by address ${ADDR:0:16}…  ($CARD utxos; N=$N, warmup=$WARMUP)"
+# Cases. Sieve caps results at pageLimit (100) while kupo streams every match, so
+# only keys with <= 100 matches compare like with like — a hotter key would put
+# sieve's 100 rows against all of kupo's and the times would measure different work.
+# The race() helper reports "rows: sieve=N kupo=M <- DIFFER" when that happens, so a
+# mismatch is visible rather than silently skewing a number.
+#
+# The hot-key cases below are deliberately kept and WILL report DIFFER while the cap
+# is in place: their ttfb figures are still meaningful (sieve answers a hot key in
+# ~1 ms against kupo's 170-660 ms) and they are the cases to watch when the cap is
+# eventually lifted.
+#
+# Addresses are base16 (both servers accept it); policy and asset use the pattern
+# grammar, which both also share.
+# <= 100 so sieve's cap does not truncate: this is the one fully comparable case.
+SMALL_ADDR=$(sqlite3 "$SIEVE_DB" "SELECT hex(address) FROM unspent GROUP BY address HAVING count(*) <= 100 ORDER BY count(*) DESC LIMIT 1")
+BIG_ADDR=$(sqlite3 "$SIEVE_DB" "SELECT hex(address) FROM unspent GROUP BY address ORDER BY count(*) DESC LIMIT 1")
+POL=$(sqlite3 "$SIEVE_DB" "SELECT lower(hex(d.policy_id)) FROM policies p JOIN policy_ids d USING(policy_num) GROUP BY p.policy_num ORDER BY count(*) DESC LIMIT 1")
+read -r APOL ANAME <<<"$(sqlite3 "$SIEVE_DB" -separator ' ' "SELECT lower(hex(d.policy_id)), lower(hex(p.asset_name)) FROM policies p JOIN policy_ids d USING(policy_num) WHERE length(p.asset_name) > 0 GROUP BY p.policy_num, p.asset_name ORDER BY count(*) DESC LIMIT 1")"
 
-# Sanity: both should return a similar number of rows.
-sc=$(curl -sf --max-time 30 "$SIEVE_URL$Q" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
-kc=$(curl -sf --max-time 30 "$KUPO_URL$Q"  2>/dev/null | jq 'length' 2>/dev/null || echo '?')
-log "result rows: sieve=$sc  kupo=$kc  $([ "$sc" = "$kc" ] || echo '(DIFFER — check encoding/parity)')"
+n_of() { sqlite3 "$SIEVE_DB" "$1" 2>/dev/null || echo '?'; }
+log "cases: N=$N per case, warmup=$WARMUP"
 
-warm "$SIEVE_URL$Q"; warm "$KUPO_URL$Q"
-printf '\n%-6s %s\n' "sieve" "$(timings "$SIEVE_URL$Q" | stats)"
-printf '%-6s %s\n'   "kupo"  "$(timings "$KUPO_URL$Q"  | stats)"
+race "address, comparable" "/matches/$SMALL_ADDR?unspent" \
+  "$(n_of "SELECT count(*)||' utxos' FROM unspent WHERE address = X'$SMALL_ADDR'")"
+race "address, hottest (capped)" "/matches/$BIG_ADDR?unspent" \
+  "$(n_of "SELECT count(*)||' utxos' FROM unspent WHERE address = X'$BIG_ADDR'")"
+race "policy, hottest (capped)" "/matches/$POL.*?unspent" \
+  "$(n_of "SELECT count(*)||' policy rows over full history' FROM policies WHERE policy_num=(SELECT policy_num FROM policy_ids WHERE policy_id=X'${POL^^}')")"
+race "asset, hottest (capped)" "/matches/$APOL.$ANAME?unspent" "one specific asset"
+race "wildcard, unspent (capped)" "/matches/*?unspent" \
+  "$(n_of "SELECT count(*)||' rows' FROM unspent")"
 
-# Dump the actual results so the response SHAPES can be compared directly (this is
-# how you see what sieve still needs to return to match kupo).
-curl -s --max-time 30 "$SIEVE_URL$Q" >/tmp/qcmp-sieve.json 2>/dev/null || true
-curl -s --max-time 30 "$KUPO_URL$Q"  >/tmp/qcmp-kupo.json  2>/dev/null || true
-printf '\nsample match (first row) — full JSON in /tmp/qcmp-sieve.json and /tmp/qcmp-kupo.json:\n'
-echo "  sieve:"; jq -c '.[0]' /tmp/qcmp-sieve.json 2>/dev/null | sed 's/^/    /'
-echo "  kupo :"; jq -c '.[0]' /tmp/qcmp-kupo.json  2>/dev/null | sed 's/^/    /'
+# Dump one full row from each so the response SHAPES can be compared directly.
+# Uses the small-address case: a hot key would write hundreds of megabytes to /tmp.
+curl -s --max-time 60 "$SIEVE_URL/matches/$SMALL_ADDR?unspent" >/tmp/qcmp-sieve.json 2>/dev/null || true
+curl -s --max-time 60 "$KUPO_URL/matches/$SMALL_ADDR?unspent"  >/tmp/qcmp-kupo.json  2>/dev/null || true
+printf '\nsample match (first row) — full JSON in /tmp/qcmp-{sieve,kupo}.json:\n'
+echo "  sieve:"; jq -S '.[0]' /tmp/qcmp-sieve.json 2>/dev/null | sed 's/^/    /'
+echo "  kupo :"; jq -S '.[0]' /tmp/qcmp-kupo.json  2>/dev/null | sed 's/^/    /'
