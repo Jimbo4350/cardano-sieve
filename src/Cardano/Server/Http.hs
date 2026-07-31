@@ -6,8 +6,13 @@
 
 -- | Read query API (servant + warp) over the synced SQLite database.
 --
--- One endpoint, @GET \/matches\/{pattern}?unspent@, covering every dimension the
--- indexer can match on. The pattern is parsed by
+-- Three endpoints:
+--
+--   * @GET \/matches\/{pattern}@ — every dimension the indexer can match on
+--   * @GET \/datums\/{hash}@ — a datum preimage, @{datum}@
+--   * @GET \/scripts\/{hash}@ — a script preimage, @{script, language}@
+--
+-- @\/matches@ covers every dimension. The pattern is parsed by
 -- 'Cardano.Sieve.Selector.selectorFromText' — the same grammar @--select@ uses at
 -- ingest — and 'planFor' maps the resulting 'Selector' onto the index that serves
 -- it, so query syntax and ingest syntax cannot drift:
@@ -16,9 +21,11 @@
 --   * a bech32\/base58\/base16 address     * @*\@{txid}@ — a whole transaction
 --   * @{policy}.{name}@ \/ @{policy}.*@    * @{index}\@{txid}@ — one output
 --
--- Kupo-compatible query parameters: @?unspent@, @?spent@, @?created_after@,
--- @?created_before@, @?order=most_recent_first|oldest_first@. As in kupo, passing
--- neither status flag returns both spent and unspent matches.
+-- Kupo-compatible query parameters: @?unspent@, @?spent@, @?resolve_hashes@,
+-- @?created_after@, @?created_before@,
+-- @?order=most_recent_first|oldest_first@. As in kupo, passing neither status flag
+-- returns both spent and unspent matches. @?resolve_hashes@ inlines the datum and
+-- script bodies into each row instead of leaving only their hashes.
 --
 -- Which table answers a request is decided by 'planFor': @?unspent@ reads the
 -- indexed live set, anything spent-inclusive reads full history. Policy and asset
@@ -28,9 +35,14 @@
 -- pinned rows of every kind (datum by hash, inline datum, no datum, spent,
 -- reference script).
 --
--- Known gaps against kupo: results are capped at 'pageLimit' where kupo streams
--- every match; @spent_at.redeemer@ is always null because the write path does not
--- populate that column yet; and within one slot the result order differs, since
+-- Known gaps against kupo (audited against its OpenAPI spec,
+-- @kupo\/docs\/api\/nightly.yaml@): the @\/patterns@, @\/checkpoints@, @\/metadata@,
+-- @\/health@ and @\/metrics@ endpoints are absent, as is @DELETE
+-- \/matches\/{pattern}@; of @\/matches@\'s thirteen documented parameters we
+-- implement six (missing @spent_after@, @spent_before@, and the @policy_id@ \/
+-- @asset_name@ \/ @transaction_id@ \/ @output_index@ post-filters); results are
+-- capped at 'pageLimit' where kupo streams every match; and within one slot the
+-- result order differs, since
 -- matching kupo\'s @(created_slot, transaction_index, output_index)@ exactly would
 -- cost the index-covered sort. A fresh read connection is opened per request; a
 -- connection pool is a later refinement.
@@ -58,7 +70,7 @@ import Cardano.Sieve.Value (decodeValue)
 import Control.Exception (SomeException, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value (Null), object, (.=))
+import Data.Aeson (Value (Null, String), object, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -72,7 +84,7 @@ import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text, pack)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Database.SQLite.Simple
   ( Connection
   , Only (Only)
@@ -90,7 +102,8 @@ import System.Exit (die)
 import System.Posix.Files (fileExist)
 
 import Servant
-  ( CaptureAll
+  ( Capture
+  , CaptureAll
   , Get
   , Handler
   , JSON
@@ -101,16 +114,29 @@ import Servant
   , err400
   , serve
   , throwError
+  , (:<|>) ((:<|>))
   , (:>)
   )
 import Web.HttpApiData (FromHttpApiData (parseUrlPiece))
 
--- | The query API: one endpoint, every dimension.
-type API =
+-- | The query API.
+type API = MatchesAPI :<|> PreimageAPI
+
+-- | Preimage lookups by hash: the bodies behind the hashes a match reports.
+--
+-- Both return @null@ rather than a 404 for an unknown hash, as kupo does — a
+-- referenced datum whose body has not been seen on chain is a normal state, not an
+-- error.
+type PreimageAPI =
+  "datums" :> Capture "datum-hash" Text :> Get '[JSON] Value
+    :<|> "scripts" :> Capture "script-hash" Text :> Get '[JSON] Value
+
+type MatchesAPI =
   "matches"
     :> CaptureAll "pattern" Text
     :> QueryFlag "unspent"
     :> QueryFlag "spent"
+    :> QueryFlag "resolve_hashes"
     :> QueryParam "created_after" Int64
     :> QueryParam "created_before" Int64
     :> QueryParam "order" Order
@@ -229,7 +255,54 @@ logRequests app req respond = do
     pure sent
 
 server :: FilePath -> Server API
-server = matchesByPattern
+server dbPath =
+  matchesByPattern dbPath
+    :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
+
+-- | @GET \/datums\/{hash}@ — the datum body behind a hash, or @null@.
+--
+-- Shape is kupo's: @{"datum": "<hex>"}@.
+datumByHash :: FilePath -> Text -> Handler Value
+datumByHash dbPath h =
+  preimage dbPath h "SELECT datum FROM binary_data WHERE datum_hash = ?" $ \body ->
+    object ["datum" .= hexText body]
+
+-- | @GET \/scripts\/{hash}@ — the script body behind a hash, or @null@.
+--
+-- Shape is kupo's: @{"script": "<hex>", "language": "native"|"plutus:v1"|…}@. The
+-- stored blob is the hash preimage, which carries the language discriminator as
+-- its leading byte, so the byte is split back off here: @language@ names it and
+-- @script@ is the raw script without it. kupo documents the same split — "raw
+-- scripts aren't exact pre-image of their hash digest".
+scriptByHash :: FilePath -> Text -> Handler Value
+scriptByHash dbPath h =
+  preimage dbPath h "SELECT script FROM scripts WHERE script_hash = ?" $ \body ->
+    case BS.uncons body of
+      Nothing -> Null
+      Just (tag, raw) ->
+        object ["script" .= hexText raw, "language" .= scriptLanguage tag]
+
+-- | The language a stored script's discriminator byte names. Values confirmed
+-- against both kupo's table and its OpenAPI enum.
+scriptLanguage :: Word8 -> Value
+scriptLanguage = \case
+  0 -> "native"
+  1 -> "plutus:v1"
+  2 -> "plutus:v2"
+  3 -> "plutus:v3"
+  n -> String ("unknown:" <> pack (show n))
+
+-- | Look one preimage up by its hex hash. A malformed hash and an absent row are
+-- both @null@: neither is a client error worth a 400, and kupo answers @null@ too.
+preimage :: FilePath -> Text -> Query -> (ByteString -> Value) -> Handler Value
+preimage dbPath h sql render =
+  case Base16.decode (encodeUtf8 h) of
+    Left _ -> pure Null
+    Right raw -> liftIO $ withConnection dbPath $ \conn -> do
+      rows <- query conn sql (Only raw)
+      pure $ case rows of
+        Only body : _ -> render body
+        [] -> Null
 
 -- | How many matches one request returns. Kupo streams every match; we page, so
 -- a hot key cannot turn one request into a multi-hundred-megabyte response.
@@ -248,11 +321,12 @@ matchesByPattern
   -> [Text]
   -> Bool
   -> Bool
+  -> Bool
   -> Maybe Int64
   -> Maybe Int64
   -> Maybe Order
   -> Handler [Value]
-matchesByPattern dbPath segments unspentFlag spentFlag createdAfter createdBefore order = do
+matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes createdAfter createdBefore order = do
   -- The pattern is captured as PATH SEGMENTS and rejoined, because the
   -- payment/delegation form embeds a '/' and so spans two segments. kupo does the
   -- same (it matches on @"matches" : args@).
@@ -267,7 +341,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag createdAfter createdBefor
   let desc = fromMaybe MostRecentFirst order == MostRecentFirst
   liftIO $ withConnection dbPath $ \conn -> do
     rows <- query conn (planSql plan desc) (planParams plan <> slotParams)
-    pure (map rowToJson rows)
+    pure (map (rowToJson resolveHashes) rows)
  where
   slotBounds =
     [(">=", v) | Just v <- [createdAfter]] <> [("<=", v) | Just v <- [createdBefore]]
@@ -280,11 +354,23 @@ matchesByPattern dbPath segments unspentFlag spentFlag createdAfter createdBefor
     "SELECT u.output_reference, u.transaction_index, u.address, u.value, u.datum_hash, \
     \u.datum_type, u.reference_script_hash, u.created_slot, bc.header_hash, \
     \s.spent_slot, bs.header_hash, s.spending_transaction_id, \
-    \s.spending_input_index, s.redeemer FROM "
+    \s.spending_input_index, s.redeemer, "
+      <> (if resolveHashes then "bd.datum, sc.script" else "NULL, NULL")
+      <> " FROM "
       <> planFrom plan
       <> " LEFT JOIN blocks bc ON bc.slot_no = u.created_slot \
          \LEFT JOIN spends s ON s.output_reference = u.output_reference \
-         \LEFT JOIN blocks bs ON bs.slot_no = s.spent_slot WHERE "
+         \LEFT JOIN blocks bs ON bs.slot_no = s.spent_slot"
+      -- Only joined when asked for: both are primary-key probes, but resolving on
+      -- every match would ship a datum body per row (and one popular datum is
+      -- referenced by 2,480 outputs, so a large page would repeat it).
+      <> ( if resolveHashes
+             then
+               " LEFT JOIN binary_data bd ON bd.datum_hash = u.datum_hash \
+               \LEFT JOIN scripts sc ON sc.script_hash = u.reference_script_hash"
+             else ""
+         )
+      <> " WHERE "
       <> planWhere plan
       <> foldMap (\(op, _) -> " AND " <> planSlotCol plan <> " " <> Query op <> " ?") slotBounds
       <> " ORDER BY "
@@ -393,7 +479,8 @@ encodeOutputRef (TxIn txid (TxIx ix)) =
 
 -- | One row as JSON, mirroring kupo's match shape field for field.
 rowToJson
-  :: ( ByteString
+  :: Bool
+  -> ( ByteString
      , Int64
      , ByteString
      , ByteString
@@ -403,11 +490,19 @@ rowToJson
      , Int64
      , Maybe ByteString
      )
-    :. (Maybe Int64, Maybe ByteString, Maybe ByteString, Maybe Int64, Maybe ByteString)
+    :. ( Maybe Int64
+       , Maybe ByteString
+       , Maybe ByteString
+       , Maybe Int64
+       , Maybe ByteString
+       , Maybe ByteString
+       , Maybe ByteString
+       )
   -> Value
 rowToJson
+  resolved
   ( (oref, txIx, addr, val, mDatum, mDatumType, mScript, slot, mHeader)
-      :. (mSpentSlot, mSpentHeader, mSpendTx, mInputIx, mRedeemer)
+      :. (mSpentSlot, mSpentHeader, mSpendTx, mInputIx, mRedeemer, mDatumBody, mScriptBody)
     ) =
     object
       ( [ "transaction_id" .= hexText (BS.take 32 oref)
@@ -424,6 +519,13 @@ rowToJson
           -- rather than emitting null, and a null would read as "no datum" to a
           -- client that checks for the field's presence.
           <> ["datum_type" .= t | Just t <- [datumTypeText =<< mDatumType]]
+          -- ?resolve_hashes inlines the bodies. Emitted whenever resolving was
+          -- asked for, null when the body is not stored, so a client can tell
+          -- "not resolved" from "resolved, nothing there".
+          <> [ "datum" .= (hexText <$> mDatumBody) | resolved
+             ]
+          <> [ "script" .= (scriptBodyJson =<< mScriptBody) | resolved
+             ]
       )
    where
     -- Present only for a spent output. 'redeemer' is always null for now: the
@@ -438,6 +540,13 @@ rowToJson
           , "input_index" .= mInputIx
           , "redeemer" .= (hexText <$> mRedeemer)
           ]
+
+-- | A stored script blob as @{script, language}@, splitting off the leading
+-- discriminator byte — the same shape 'scriptByHash' returns.
+scriptBodyJson :: ByteString -> Maybe Value
+scriptBodyJson body = case BS.uncons body of
+  Nothing -> Nothing
+  Just (tag, raw) -> Just (object ["script" .= hexText raw, "language" .= scriptLanguage tag])
 
 -- | Render the stored datum-type flag the way kupo does. Anything other than the
 -- two known encodings yields 'Nothing' rather than a guess, so a future third
