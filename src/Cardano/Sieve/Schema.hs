@@ -14,8 +14,9 @@
 --
 -- supported by @blocks@ (durable slot → header-hash, for @created_at@ /
 -- @spent_at@ in results), the deduplicated @binary_data@ and @scripts@ preimage
--- stores, @policies@ (the policy/asset index, over full history), and the
--- @patterns@ / @checkpoints@ bookkeeping tables.
+-- stores, @policies@ (the policy/asset index, over full history) with its
+-- @policy_ids@ interning dictionary, and the @patterns@ / @checkpoints@
+-- bookkeeping tables.
 --
 -- There is no migration engine yet: tables are created with @CREATE TABLE IF NOT
 -- EXISTS@ and schema changes are handled by wipe-and-resync during development
@@ -114,31 +115,68 @@ tables =
     \( script_hash BLOB NOT NULL PRIMARY KEY \
     \, script      BLOB NOT NULL \
     \)"
+  , -- Interning dictionary for minting policy ids: one row per distinct policy,
+    -- mapping the 28-byte hash to a small integer surrogate. @policies@ stores
+    -- the surrogate, not the hash.
+    --
+    -- Why: the policy hash is the single largest contributor to on-disk size.
+    -- Measured on a preview sync to slot 4,000,000: 2,996,523 @policies@ rows
+    -- carrying only 1,613 distinct policy ids, and the hash is written four
+    -- times per row (the table, the primary-key index, and both secondary
+    -- indexes below) — 28 bytes each time. Substituting a 2-byte integer in all
+    -- four places reclaims ~300 MB of a 1.8 GB database, ~37% of what @policies@
+    -- and its indexes occupy. See [[sieve-policies-table-dominates-footprint]].
+    --
+    -- Only the POLICY is interned, not the (policy_id, asset_name) pair, even
+    -- though interning the pair would save a further ~120 MB. @policy_num@
+    -- substitutes positionally for @policy_id@, so it stays the leading column
+    -- of both indexes and every query keeps its single-value equality. A pair
+    -- surrogate is not decomposable into a policy, so SelectPolicyId would
+    -- degrade to @asset_id IN (…)@ — N disjoint index ranges whose concatenation
+    -- is not slot-ordered, forcing a materialise-and-sort of every matching row
+    -- (measured: the hottest policy's 1.2M rows take 2.3 s versus sub-ms today).
+    --
+    -- Append-only and never rolled back per-slot: a rollback deletes @policies@
+    -- rows but leaves the dictionary, so surrogates stay stable and the writer's
+    -- in-memory cache stays valid ("Cardano.Sieve.Node.Insert"). Orphaned
+    -- dictionary entries are harmless — there are at most a few thousand.
+    "CREATE TABLE IF NOT EXISTS policy_ids \
+    \( policy_num INTEGER NOT NULL PRIMARY KEY \
+    \, policy_id  BLOB    NOT NULL UNIQUE \
+    \)"
   , -- Policy/asset index backing SelectPolicyId / SelectAssetId, over the /full/
     -- history (append-only, never deleted) so spent-inclusive policy/asset
     -- queries stay indexed. Unspent-by-policy/asset joins these hits to @unspent@
-    -- by primary key. One row per (output, policy_id, asset_name) — an output can
+    -- by primary key. One row per (output, policy_num, asset_name) — an output can
     -- hold several assets under one policy, so asset_name is part of the key.
     -- @created_slot@ is denormalised from the output so the newest-first sort is
     -- covered by the composite indexes below, without joining @unspent@ to sort.
+    --
+    -- @policy_num@ is the @policy_ids@ surrogate for the policy hash; queries
+    -- resolve the hash to it with a single seek before touching this table.
+    -- There is deliberately no FOREIGN KEY on it: the writer always inserts the
+    -- dictionary row first, so the reference holds by construction, and
+    -- @foreign_keys=ON@ would add a per-asset-row check to the tier-1 sync path
+    -- for a constraint nothing can violate.
     --
     -- KNOWN HOT SPOT / redesign escalation (if we need to change this table):
     -- even with the composite indexes this table is full-history, so a query for
     -- a hot policy still walks spent entries. If the kupo comparison shows we
     -- lose here, give the UNSPENT policy/asset path its own live-set table,
     -- mirroring outputs-vs-unspent:
-    --   unspent_policies(output_reference, policy_id, asset_name, created_slot),
+    --   unspent_policies(output_reference, policy_num, asset_name, created_slot),
     --   insert-on-create / delete-on-spend like @unspent@, indexed
-    --   @(policy_id, created_slot)@ and @(policy_id, asset_name, created_slot)@ —
-    --   no spent entries to skip. Consistent with the "index the small live set"
-    --   philosophy, but it adds ingest write work (a tier-1 fast-sync cost), so
-    --   build it only once measured against kupo. See [[sieve-query-index-tuning]].
+    --   @(policy_num, created_slot)@ and @(policy_num, asset_name, created_slot)@
+    --   — no spent entries to skip. Consistent with the "index the small live
+    --   set" philosophy, but it adds ingest write work (a tier-1 fast-sync cost),
+    --   so build it only once measured against kupo.
+    --   See [[sieve-query-index-tuning]].
     "CREATE TABLE IF NOT EXISTS policies \
     \( output_reference BLOB    NOT NULL \
-    \, policy_id        BLOB    NOT NULL \
+    \, policy_num       INTEGER NOT NULL \
     \, asset_name       BLOB    NOT NULL \
     \, created_slot     INTEGER NOT NULL \
-    \, PRIMARY KEY (output_reference, policy_id, asset_name) \
+    \, PRIMARY KEY (output_reference, policy_num, asset_name) \
     \, FOREIGN KEY (output_reference) REFERENCES outputs(output_reference) \
     \)"
   ]
@@ -168,7 +206,7 @@ indexes =
   , "CREATE INDEX IF NOT EXISTS unspentByPaymentAndDelegation ON unspent(payment_credential, delegation_credential, created_slot)"
   , "CREATE INDEX IF NOT EXISTS unspentByTransactionId        ON unspent(transaction_id, created_slot)"
   , "CREATE INDEX IF NOT EXISTS unspentByCreatedSlot          ON unspent(created_slot)"
-  , "CREATE INDEX IF NOT EXISTS policiesByPolicyId            ON policies(policy_id, created_slot)"
-  , "CREATE INDEX IF NOT EXISTS policiesByAssetId             ON policies(policy_id, asset_name, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS policiesByPolicyId            ON policies(policy_num, created_slot)"
+  , "CREATE INDEX IF NOT EXISTS policiesByAssetId             ON policies(policy_num, asset_name, created_slot)"
   , "CREATE INDEX IF NOT EXISTS spendsBySlot                  ON spends(spent_slot)"
   ]

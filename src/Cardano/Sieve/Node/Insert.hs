@@ -1,10 +1,12 @@
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Persistence layer: write matched outputs into the SQLite schema.
 --
 -- 'openDatabase' installs the schema ('Cardano.Sieve.Schema.createSchema') and
 -- 'writeSelected' persists the outputs that survived the sieve into @blocks@,
--- @outputs@, @unspent@ and @policies@. It uses 'sqlite-simple' — the same
+-- @outputs@, @unspent@ and @policies@ (interning policy hashes through
+-- @policy_ids@ as it goes). It uses 'sqlite-simple' — the same
 -- library kupo uses — so throughput/memory comparisons stay apples to apples.
 --
 -- This module is deliberately SQLite-only: it knows nothing about
@@ -41,8 +43,10 @@ import Cardano.Sieve.Schema (createSchema, installDeferredIndexes)
 import Control.Exception (bracket, onException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Database.SQLite.Simple
   ( Connection
@@ -51,6 +55,7 @@ import Database.SQLite.Simple
   , execute
   , execute_
   , open
+  , query
   , query_
   , (:.) ((:.))
   )
@@ -99,6 +104,12 @@ data DbHandle = DbHandle
   -- ^ Outputs written into the open transaction but not yet committed; climbs
   -- to 'dbBatchSize', then a COMMIT resets it to 0 (also the open-transaction
   -- flag: 0 = no transaction open).
+  , dbPolicyNums :: IORef (Map ByteString Int64)
+  -- ^ Write-through cache of the @policy_ids@ dictionary: policy hash →
+  -- surrogate. Bounded by the number of distinct policies the chain has ever
+  -- minted under (1,613 on preview to slot 4,000,000), so after a brief warm-up
+  -- every asset row resolves its surrogate from memory and the ingest path pays
+  -- no extra SQLite round trip. Populated lazily by 'policyNumOf'.
   }
 
 -- | Open the database, prepare it (pragmas + schema) and return a batched
@@ -111,7 +122,8 @@ openDatabase path batchSize = do
   -- leak the handle (the caller only gets to 'closeDatabase' a 'DbHandle' we return).
   prepare conn `onException` close conn
   pending <- newIORef 0
-  pure (DbHandle conn (max 1 batchSize) pending)
+  policyNums <- newIORef Map.empty
+  pure (DbHandle conn (max 1 batchSize) pending policyNums)
 
 -- | Install the deferred secondary indexes on an already-open handle, committing
 -- the open batch first. Fired once on reaching the chain tip — bulk catch-up
@@ -169,25 +181,35 @@ prepare conn = do
 -- foreign key.
 applyBlock :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> [SpentInput] -> IO ()
 applyBlock _ _ _ [] [] = pure ()
-applyBlock (DbHandle conn batchSize pending) slot headerHash created spent = do
-  n <- readIORef pending
-  when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
-  unless (null created) $
-    execute
-      conn
-      "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
-      (slot, headerHash)
-  mapM_ (insertOutput conn slot) created
-  mapM_ (recordSpend conn slot) spent
-  let n' = n + length created + length spent
-  if n' >= batchSize
-    then execute_ conn "COMMIT" >> writeIORef pending 0
-    else writeIORef pending n'
+applyBlock
+  DbHandle
+    { dbConn = conn
+    , dbBatchSize = batchSize
+    , dbUncommittedRows = pending
+    , dbPolicyNums = policyNums
+    }
+  slot
+  headerHash
+  created
+  spent = do
+    n <- readIORef pending
+    when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
+    unless (null created) $
+      execute
+        conn
+        "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
+        (slot, headerHash)
+    mapM_ (insertOutput conn policyNums slot) created
+    mapM_ (recordSpend conn slot) spent
+    let n' = n + length created + length spent
+    if n' >= batchSize
+      then execute_ conn "COMMIT" >> writeIORef pending 0
+      else writeIORef pending n'
 
 -- | Write one matched output. @outputs@ is inserted before @policies@ so the
 -- foreign key is satisfied within the transaction.
-insertOutput :: Connection -> Int64 -> StoredOutput -> IO ()
-insertOutput conn slot o = do
+insertOutput :: Connection -> IORef (Map ByteString Int64) -> Int64 -> StoredOutput -> IO ()
+insertOutput conn policyNums slot o = do
   execute
     conn
     "INSERT OR IGNORE INTO outputs \
@@ -204,14 +226,35 @@ insertOutput conn slot o = do
         :. (soValue o, soDatumHash o, soReferenceScriptHash o, slot)
     )
   mapM_
-    ( \(pid, name) ->
+    ( \(pid, name) -> do
+        num <- policyNumOf conn policyNums pid
         execute
           conn
-          "INSERT OR IGNORE INTO policies (output_reference, policy_id, asset_name, created_slot) \
+          "INSERT OR IGNORE INTO policies (output_reference, policy_num, asset_name, created_slot) \
           \VALUES (?, ?, ?, ?)"
-          (soOutputRef o, pid, name, slot)
+          (soOutputRef o, num, name, slot)
     )
     (soAssets o)
+
+-- | Resolve a policy hash to its @policy_ids@ surrogate, inserting the
+-- dictionary row the first time that policy is seen.
+--
+-- Memoised in 'dbPolicyNums', so the two SQLite statements run once per
+-- /distinct/ policy for the life of the handle rather than once per asset row —
+-- the difference between a few thousand round trips and a few million. The
+-- dictionary write joins the caller's open transaction, so a policy's surrogate
+-- and the @policies@ rows referencing it commit together.
+policyNumOf :: Connection -> IORef (Map ByteString Int64) -> ByteString -> IO Int64
+policyNumOf conn cache pid = do
+  cached <- Map.lookup pid <$> readIORef cache
+  case cached of
+    Just num -> pure num
+    Nothing -> do
+      execute conn "INSERT OR IGNORE INTO policy_ids (policy_id) VALUES (?)" (Only pid)
+      rows <- query conn "SELECT policy_num FROM policy_ids WHERE policy_id = ?" (Only pid)
+      case rows of
+        Only num : _ -> num <$ modifyIORef' cache (Map.insert pid num)
+        [] -> error "policyNumOf: policy_ids row absent immediately after INSERT OR IGNORE"
 
 -- | Record one spend. Appends to @spends@ only when the consumed output is one
 -- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
@@ -233,7 +276,7 @@ recordSpend conn slot si = do
 
 -- | Commit the currently open (partial) batch, if any.
 flush :: DbHandle -> IO ()
-flush (DbHandle conn _ pending) = do
+flush DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
   n <- readIORef pending
   when (n > 0) $ execute_ conn "COMMIT" >> writeIORef pending 0
 
@@ -244,8 +287,13 @@ flush (DbHandle conn _ pending) = do
 -- @policies@ is deleted before @outputs@ so the foreign key does not block the
 -- @outputs@ delete. Restoring @unspent@ rows for outputs whose spend is rolled
 -- back is deferred along with the @spends@ write path.
+--
+-- @policy_ids@ is deliberately /not/ pruned. It is a pure interning dictionary
+-- with no slot column, keeping it append-only means surrogates never change and
+-- the 'dbPolicyNums' cache never needs invalidating, and the orphans a rollback
+-- leaves behind are bounded by the number of distinct policies ever seen.
 rollbackAbove :: DbHandle -> Maybe Int64 -> IO ()
-rollbackAbove db@(DbHandle conn _ _) mSlot = do
+rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
   flush db
   case mSlot of
     Nothing ->
