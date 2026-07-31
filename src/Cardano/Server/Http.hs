@@ -21,11 +21,17 @@
 --   * a bech32\/base58\/base16 address     * @*\@{txid}@ — a whole transaction
 --   * @{policy}.{name}@ \/ @{policy}.*@    * @{index}\@{txid}@ — one output
 --
--- Kupo-compatible query parameters: @?unspent@, @?spent@, @?resolve_hashes@,
--- @?created_after@, @?created_before@,
--- @?order=most_recent_first|oldest_first@. As in kupo, passing neither status flag
--- returns both spent and unspent matches. @?resolve_hashes@ inlines the datum and
--- script bodies into each row instead of leaving only their hashes.
+-- All thirteen of kupo\'s documented @\/matches@ parameters: @?unspent@, @?spent@,
+-- @?resolve_hashes@, @?order@, @?created_after@, @?created_before@,
+-- @?spent_after@, @?spent_before@, @?policy_id@, @?asset_name@,
+-- @?transaction_id@, @?output_index@, plus the pattern itself. Passing neither
+-- status flag returns both spent and unspent, as in kupo. Bare @\/matches@ with no
+-- pattern is the wildcard.
+--
+-- The parameters are not all independent, and the invalid combinations are 400s
+-- rather than silently-empty results: at most one lower and one upper slot bound
+-- ('SlotBounds'), and @asset_name@ / @output_index@ each require their partner
+-- ('Refinements').
 --
 -- Which table answers a request is decided by 'planFor': @?unspent@ reads the
 -- indexed live set, anything spent-inclusive reads full history. Policy and asset
@@ -38,11 +44,8 @@
 -- Known gaps against kupo (audited against its OpenAPI spec,
 -- @kupo\/docs\/api\/nightly.yaml@): the @\/patterns@, @\/checkpoints@, @\/metadata@,
 -- @\/health@ and @\/metrics@ endpoints are absent, as is @DELETE
--- \/matches\/{pattern}@; of @\/matches@\'s thirteen documented parameters we
--- implement six (missing @spent_after@, @spent_before@, and the @policy_id@ \/
--- @asset_name@ \/ @transaction_id@ \/ @output_index@ post-filters); results are
--- capped at 'pageLimit' where kupo streams every match; and within one slot the
--- result order differs, since
+-- \/matches\/{pattern}@; results are capped at 'pageLimit' where kupo streams every
+-- match; and within one slot the result order differs, since
 -- matching kupo\'s @(created_slot, transaction_index, output_index)@ exactly would
 -- cost the index-covered sort. A fresh read connection is opened per request; a
 -- connection pool is a later refinement.
@@ -139,6 +142,12 @@ type MatchesAPI =
     :> QueryFlag "resolve_hashes"
     :> QueryParam "created_after" Int64
     :> QueryParam "created_before" Int64
+    :> QueryParam "spent_after" Int64
+    :> QueryParam "spent_before" Int64
+    :> QueryParam "policy_id" Text
+    :> QueryParam "asset_name" Text
+    :> QueryParam "transaction_id" Text
+    :> QueryParam "output_index" Word64
     :> QueryParam "order" Order
     :> Get '[JSON] [Value]
 
@@ -156,6 +165,115 @@ instance FromHttpApiData Order where
     "oldest_first" -> Right OldestFirst
     other ->
       Left ("invalid order " <> other <> ": expected most_recent_first or oldest_first")
+
+-- | The four slot-bound parameters, as they arrive.
+--
+-- Grouped rather than passed as four loose 'Maybe's because they are not
+-- independent: kupo allows at most ONE lower bound and ONE upper bound, so
+-- @created_after@ together with @spent_after@ is a contradiction, not a
+-- conjunction. Keeping them in one value is what lets 'slotBoundsFor' state that
+-- rule once.
+data SlotBounds = SlotBounds
+  { sbCreatedAfter :: Maybe Int64
+  , sbCreatedBefore :: Maybe Int64
+  , sbSpentAfter :: Maybe Int64
+  , sbSpentBefore :: Maybe Int64
+  }
+
+-- | The post-filter parameters: they narrow whatever the pattern already selected
+-- rather than choosing which index answers the query.
+--
+-- Grouped for the same reason as 'SlotBounds' — two of the four are only
+-- meaningful in a pair. kupo's spec: @asset_name@ "can't be used alone and must be
+-- provided alongside a @policy_id@", likewise @output_index@ with
+-- @transaction_id@.
+data Refinements = Refinements
+  { rfPolicyId :: Maybe Text
+  , rfAssetName :: Maybe Text
+  , rfTransactionId :: Maybe Text
+  , rfOutputIndex :: Maybe Word64
+  }
+
+-- | Every extra @AND@ a request's filters contribute, with their parameters.
+--
+-- Returns 'Left' on a combination kupo rejects, so an impossible request fails
+-- loudly instead of quietly matching nothing.
+filtersFor :: Query -> SlotBounds -> Refinements -> Either Text [(Query, [SQLData])]
+filtersFor createdCol bounds refine = do
+  slots <- slotBoundsFor createdCol bounds
+  refinements <- refinementsFor refine
+  pure (slots <> refinements)
+
+-- | At most one lower and one upper bound, each on whichever slot it names.
+slotBoundsFor :: Query -> SlotBounds -> Either Text [(Query, [SQLData])]
+slotBoundsFor
+  createdCol
+  SlotBounds
+    { sbCreatedAfter = cAfter
+    , sbCreatedBefore = cBefore
+    , sbSpentAfter = sAfter
+    , sbSpentBefore = sBefore
+    } = do
+    lower <- one "lower" "created_after" "spent_after" (">=") cAfter sAfter
+    upper <- one "upper" "created_before" "spent_before" ("<=") cBefore sBefore
+    pure (lower <> upper)
+   where
+    -- The created bound filters the creation slot, which for a policy/asset query is
+    -- the copy on `policies` — the same column the ORDER BY uses, so the composite
+    -- index still serves both. The spent bound filters the joined spends row.
+    one which cName sName op c sp = case (c, sp) of
+      (Just _, Just _) ->
+        Left (cName <> " and " <> sName <> " are both " <> which <> " bounds; use one")
+      (Just v, Nothing) -> Right [(createdCol <> " " <> op <> " ?", [SQLInteger v])]
+      (Nothing, Just v) -> Right [("s.spent_slot " <> op <> " ?", [SQLInteger v])]
+      (Nothing, Nothing) -> Right []
+
+-- | The asset and output-reference post-filters.
+refinementsFor :: Refinements -> Either Text [(Query, [SQLData])]
+refinementsFor
+  Refinements
+    { rfPolicyId = pol
+    , rfAssetName = asset
+    , rfTransactionId = tx
+    , rfOutputIndex = ix
+    } = do
+    assetFilter <- case (pol, asset) of
+      (Nothing, Just _) -> Left "asset_name must be given alongside policy_id"
+      (Nothing, Nothing) -> Right []
+      (Just p, mName) -> do
+        pid <- hex "policy_id" 28 p
+        name <- traverse (hexAny "asset_name") mName
+        -- EXISTS rather than a join: this narrows rows the pattern already chose, and
+        -- must not multiply them when an output holds several matching assets.
+        Right
+          [
+            ( "EXISTS (SELECT 1 FROM policies pf \
+              \WHERE pf.output_reference = u.output_reference \
+              \AND pf.policy_num = (SELECT policy_num FROM policy_ids WHERE policy_id = ?)"
+                <> maybe "" (const " AND pf.asset_name = ?") name
+                <> ")"
+            , SQLBlob pid : maybe [] ((: []) . SQLBlob) name
+            )
+          ]
+    outputFilter <- case (tx, ix) of
+      (Nothing, Just _) -> Left "output_index must be given alongside transaction_id"
+      (Nothing, Nothing) -> Right []
+      (Just t, mIx) -> do
+        txid <- hex "transaction_id" 32 t
+        Right $ case mIx of
+          -- Both given identifies exactly one output, so compare the whole reference.
+          Just i -> [("u.output_reference = ?", [SQLBlob (txid <> beWord64 i)])]
+          Nothing -> [("u.transaction_id = ?", [SQLBlob txid])]
+    pure (assetFilter <> outputFilter)
+   where
+    hex what n t = case Base16.decode (encodeUtf8 t) of
+      Right b | BS.length b == n -> Right b
+      Right b ->
+        Left (what <> " must be " <> pack (show n) <> " bytes, got " <> pack (show (BS.length b)))
+      Left _ -> Left (what <> " is not base16: " <> t)
+    hexAny what t = case Base16.decode (encodeUtf8 t) of
+      Right b -> Right b
+      Left _ -> Left (what <> " is not base16: " <> t)
 
 -- | Which side of the spend boundary a request wants.
 --
@@ -256,8 +374,19 @@ logRequests app req respond = do
 
 server :: FilePath -> Server API
 server dbPath =
-  matchesByPattern dbPath
-    :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
+  matches :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
+ where
+  -- Servant delivers the eight filter parameters positionally; group them into the
+  -- two records here so nothing downstream handles eight loose Maybes in a row.
+  matches segs unspent spent resolve cAfter cBefore sAfter sBefore pol asset tx ix =
+    matchesByPattern
+      dbPath
+      segs
+      unspent
+      spent
+      resolve
+      (SlotBounds cAfter cBefore sAfter sBefore)
+      (Refinements pol asset tx ix)
 
 -- | @GET \/datums\/{hash}@ — the datum body behind a hash, or @null@.
 --
@@ -322,35 +451,35 @@ matchesByPattern
   -> Bool
   -> Bool
   -> Bool
-  -> Maybe Int64
-  -> Maybe Int64
+  -> SlotBounds
+  -> Refinements
   -> Maybe Order
   -> Handler [Value]
-matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes createdAfter createdBefore order = do
+matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refine order = do
   -- The pattern is captured as PATH SEGMENTS and rejoined, because the
   -- payment/delegation form embeds a '/' and so spans two segments. kupo does the
-  -- same (it matches on @"matches" : args@).
-  let pat = T.intercalate "/" segments
-  when (null segments) $
-    badRequest "no pattern given: try /matches/*"
+  -- same (it matches on @"matches" : args@). No segments at all is the bare
+  -- /matches route, which kupo treats as the wildcard.
+  let pat = if null segments then "*" else T.intercalate "/" segments
   status <- either badRequest pure (statusFromFlags unspentFlag spentFlag)
   selector <- case selectorFromText pat of
     Left err -> badRequest ("invalid pattern: " <> pack (show err))
     Right s -> pure s
   plan <- either badRequest pure (planFor status selector)
+  filters <- either badRequest pure (filtersFor (planSlotCol plan) bounds refine)
   let desc = fromMaybe MostRecentFirst order == MostRecentFirst
   liftIO $ withConnection dbPath $ \conn -> do
-    rows <- query conn (planSql plan desc) (planParams plan <> slotParams)
+    rows <-
+      query
+        conn
+        (planSql plan filters desc)
+        (planParams plan <> concatMap snd filters)
     pure (map (rowToJson resolveHashes) rows)
  where
-  slotBounds =
-    [(">=", v) | Just v <- [createdAfter]] <> [("<=", v) | Just v <- [createdBefore]]
-  slotParams = [SQLInteger v | (_, v) <- slotBounds]
-
   -- One row shape for every status, so a single 'rowToJson' serves them all. The
   -- spends join is a primary-key probe that yields nothing on the @unspent@ base
   -- (those rows are deleted when spent), which at 'pageLimit' rows is immaterial.
-  planSql plan desc =
+  planSql plan filters desc =
     "SELECT u.output_reference, u.transaction_index, u.address, u.value, u.datum_hash, \
     \u.datum_type, u.reference_script_hash, u.created_slot, bc.header_hash, \
     \s.spent_slot, bs.header_hash, s.spending_transaction_id, \
@@ -372,7 +501,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes createdAfte
          )
       <> " WHERE "
       <> planWhere plan
-      <> foldMap (\(op, _) -> " AND " <> planSlotCol plan <> " " <> Query op <> " ?") slotBounds
+      <> foldMap (\(cond, _) -> " AND " <> cond) filters
       <> " ORDER BY "
       <> planSlotCol plan
       <> (if desc then " DESC" else " ASC")
@@ -474,8 +603,12 @@ planFor status = \case
 -- @Cardano.Sieve.Node.Decode.encodeOutputRef@.
 encodeOutputRef :: TxIn -> ByteString
 encodeOutputRef (TxIn txid (TxIx ix)) =
-  serialiseToRawBytes txid
-    <> LBS.toStrict (toLazyByteString (word64BE (fromIntegral ix)))
+  serialiseToRawBytes txid <> beWord64 (fromIntegral ix)
+
+-- | An output index as the schema stores it: big-endian, fixed width, so byte
+-- order matches numeric order and a reference can be compared or ranged as bytes.
+beWord64 :: Word64 -> ByteString
+beWord64 = LBS.toStrict . toLazyByteString . word64BE
 
 -- | One row as JSON, mirroring kupo's match shape field for field.
 rowToJson
