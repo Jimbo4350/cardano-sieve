@@ -29,7 +29,7 @@ import Cardano.Api
 
 import Cardano.Server.Http (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
-import Cardano.Sieve.Node.Insert (installIndexes)
+import Cardano.Sieve.Node.Insert (RedeemerCapture (CaptureRedeemers, SkipRedeemers), installIndexes)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap)
   , Selector (SelectAll)
@@ -88,6 +88,10 @@ data Options = Options
   , untilSlot :: Maybe SlotNo
   -- ^ Slot to stop indexing at, inclusive (@--until@); 'Nothing' follows the
   -- chain indefinitely.
+  , withRedeemers :: Bool
+  -- ^ @--with-redeemers@: also capture the redeemer that authorised each spend.
+  -- Off by default because redeemers are the heavy bytes on the spend path, while
+  -- the rest of a spend record is cheap and always stored.
   , buildIndexes :: Bool
   -- ^ @--build-indexes@: instead of syncing, install the deferred query indexes
   -- on @--database@ and exit. Run once after the initial sync.
@@ -123,6 +127,7 @@ sieve = do
               (networkId opts)
               (databasePath opts)
               (batchSize opts)
+              (redeemerCapture opts)
               (configuredSelectors opts)
               (sincePoint opts)
           Just u ->
@@ -131,6 +136,7 @@ sieve = do
               (networkId opts)
               (databasePath opts)
               (batchSize opts)
+              (redeemerCapture opts)
               (configuredSelectors opts)
               (sincePoint opts)
               u
@@ -140,6 +146,8 @@ sieve = do
   configuredSelectors o = case selectors o of
     [] -> [SelectAll IncludeBootstrap]
     xs -> xs
+
+  redeemerCapture o = if withRedeemers o then CaptureRedeemers else SkipRedeemers
 
 optionsInfo :: ParserInfo Options
 optionsInfo =
@@ -160,6 +168,7 @@ optionsParser =
     <*> pSelectors
     <*> pSince
     <*> pUntil
+    <*> pWithRedeemers
     <*> pBuildIndexes
     <*> pServe
  where
@@ -240,6 +249,14 @@ optionsParser =
         )
 
   pBuildIndexes :: Parser Bool
+  pWithRedeemers =
+    switch
+      ( long "with-redeemers"
+          <> help
+            "Also store the redeemer that authorised each spend (opt-in: redeemers are \
+            \the heavy bytes on the spend path)"
+      )
+
   pBuildIndexes =
     switch
       ( long "build-indexes"

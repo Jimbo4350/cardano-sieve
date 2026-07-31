@@ -39,9 +39,10 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Sieve.Node.Decode (selectedStored, spentInputs)
+import Cardano.Sieve.Node.Decode (preimagesInBlock, selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
+  , RedeemerCapture
   , applyBlock
   , buildIndexesOn
   , closeDatabase
@@ -73,16 +74,17 @@ fetch
   -> NetworkId
   -> FilePath
   -> Int
+  -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> IO ()
-fetch socketPath networkId dbPath batchSize selectors since =
+fetch socketPath networkId dbPath batchSize capture selectors since =
   runSync
     socketPath
     networkId
     dbPath
     batchSize
-    (\dbHandle progress -> followingClient dbHandle progress selectors since)
+    (\dbHandle progress -> followingClient dbHandle progress capture selectors since)
 
 -- | As 'fetch', but index only from @since@ up to and including @untilSlot@,
 -- then stop. For bounded backfills and benchmark runs.
@@ -91,17 +93,18 @@ fetchBounded
   -> NetworkId
   -> FilePath
   -> Int
+  -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> SlotNo
   -> IO ()
-fetchBounded socketPath networkId dbPath batchSize selectors since untilSlot =
+fetchBounded socketPath networkId dbPath batchSize capture selectors since untilSlot =
   runSync
     socketPath
     networkId
     dbPath
     batchSize
-    (\dbHandle progress -> boundedClient dbHandle progress selectors since untilSlot)
+    (\dbHandle progress -> boundedClient dbHandle progress capture selectors since untilSlot)
 
 -- | Open the database, connect to the local node, and drive the given
 -- pipelined ChainSync client, flushing the database on exit. The bounded and
@@ -274,18 +277,25 @@ summarise ref = do
 -- fold the work into the progress counters. Returns the block's header — the
 -- bounded client needs its slot to detect the stop point.
 sieveBlock
-  :: DbHandle -> IORef Progress -> [Selector] -> Maybe SlotNo -> BlockInMode -> IO BlockHeader
-sieveBlock dbHandle progress selectors target blockInMode@(BlockInMode _ block) = do
+  :: DbHandle
+  -> IORef Progress
+  -> RedeemerCapture
+  -> [Selector]
+  -> Maybe SlotNo
+  -> BlockInMode
+  -> IO BlockHeader
+sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _ block) = do
   let header = getBlockHeader block
       BlockHeader slotNo hash _blockNo = header
       selected = selectedStored selectors blockInMode
-      spent = spentInputs blockInMode
+      spent = spentInputs capture blockInMode
   applyBlock
     dbHandle
     (fromIntegral (unSlotNo slotNo))
     (serialiseToRawBytes hash)
     selected
     spent
+    (preimagesInBlock blockInMode)
   tick progress slotNo target (length selected) (length spent)
   pure header
 
@@ -301,10 +311,11 @@ data IndexState = IndexesPending | IndexesBuilt
 followingClient
   :: DbHandle
   -> IORef Progress
+  -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-followingClient dbHandle progress selectors since =
+followingClient dbHandle progress capture selectors since =
   CSP.ChainSyncClientPipelined $ do
     built <- newIORef IndexesPending
     pure (clientIntersect built)
@@ -341,7 +352,7 @@ followingClient dbHandle progress selectors since =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
           BlockHeader _ _ blockNo <-
-            sieveBlock dbHandle progress selectors (chainTipSlot serverTip) blockInMode
+            sieveBlock dbHandle progress capture selectors (chainTipSlot serverTip) blockInMode
           let tip = fromChainTip serverTip
           -- On first catching the node's tip, build the deferred query indexes
           -- once: bulk catch-up ran index-free, and from here tip updates are
@@ -372,11 +383,12 @@ followingClient dbHandle progress selectors since =
 boundedClient
   :: DbHandle
   -> IORef Progress
+  -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> SlotNo
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-boundedClient dbHandle progress selectors since untilSlot =
+boundedClient dbHandle progress capture selectors since untilSlot =
   CSP.ChainSyncClientPipelined (pure clientIntersect)
  where
   maxInFlight :: Word16
@@ -431,7 +443,7 @@ boundedClient dbHandle progress selectors since untilSlot =
               if slotNo > untilSlot
                 then pure (clientIdle True Origin (fromChainTip serverTip) n)
                 else do
-                  _ <- sieveBlock dbHandle progress selectors (Just untilSlot) blockInMode
+                  _ <- sieveBlock dbHandle progress capture selectors (Just untilSlot) blockInMode
                   pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->
           if draining

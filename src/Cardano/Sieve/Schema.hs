@@ -60,12 +60,30 @@ tables =
     \)"
   , -- Append-only full history: every matched output ever created. Never
     -- mutated. The header hash for created_slot is obtained by joining @blocks@.
+    --
+    -- Carries the same columns as @unspent@ (bar the generated ones) so every
+    -- match dimension is answerable over full history, not just over the live set.
+    -- The credential columns are the reason: without them a spent-inclusive query
+    -- by payment or delegation credential is not merely slow, it is impossible,
+    -- because there is nothing to compare against. They are stored rather than
+    -- derived from @address@ because extracting a credential depends on the
+    -- address type (Byron has none; Shelley base, enterprise and pointer
+    -- addresses differ in shape), and a @substr@ over raw bytes would silently
+    -- invent credentials for the shapes that have none.
+    --
+    -- Still deliberately primary-key-only: the columns make historical queries
+    -- POSSIBLE, the absence of indexes keeps them best-effort scans, and appending
+    -- to history stays cheap. See 'indexes'.
     "CREATE TABLE IF NOT EXISTS outputs \
     \( output_reference BLOB    NOT NULL PRIMARY KEY \
     \, transaction_id   BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
+    \, transaction_index INTEGER NOT NULL \
     \, address          BLOB    NOT NULL \
+    \, payment_credential    BLOB \
+    \, delegation_credential BLOB \
     \, value            BLOB    NOT NULL \
     \, datum_hash       BLOB \
+    \, datum_type       INTEGER \
     \, reference_script_hash BLOB \
     \, created_slot     INTEGER NOT NULL \
     \)"
@@ -75,11 +93,13 @@ tables =
     "CREATE TABLE IF NOT EXISTS unspent \
     \( output_reference      BLOB    NOT NULL PRIMARY KEY \
     \, transaction_id        BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
+    \, transaction_index     INTEGER NOT NULL \
     \, address               BLOB    NOT NULL \
     \, payment_credential    BLOB \
     \, delegation_credential BLOB \
     \, value                 BLOB    NOT NULL \
     \, datum_hash            BLOB \
+    \, datum_type            INTEGER \
     \, reference_script_hash BLOB \
     \, created_slot          INTEGER NOT NULL \
     \)"

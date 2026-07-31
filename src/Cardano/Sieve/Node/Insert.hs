@@ -1,4 +1,5 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Persistence layer: write matched outputs into the SQLite schema.
@@ -27,8 +28,11 @@
 -- write-path cut.
 module Cardano.Sieve.Node.Insert
   ( DbHandle
+  , DatumType (..)
+  , RedeemerCapture (..)
   , StoredOutput (..)
   , SpentInput (..)
+  , Preimages (..)
   , openDatabase
   , closeDatabase
   , applyBlock
@@ -51,6 +55,7 @@ import Data.Text (Text)
 import Database.SQLite.Simple
   ( Connection
   , Only (Only)
+  , Query
   , close
   , execute
   , execute_
@@ -60,12 +65,31 @@ import Database.SQLite.Simple
   , (:.) ((:.))
   )
 
+-- | How an output supplied its datum: written out in full on the output itself,
+-- or referenced only by hash. Kupo reports this as @datum_type@, and it is the
+-- one thing a datum hash alone cannot tell you — with @DatumByHash@ the body may
+-- not exist anywhere yet, whereas @DatumInline@ guarantees it was on chain with
+-- the output.
+data DatumType = DatumInline | DatumByHash
+  deriving (Eq, Show)
+
+-- | 'DatumType' as the schema stores it. Kept next to the type so the mapping is
+-- in one place; 0 and 1 rather than text to keep the column narrow.
+datumTypeToInt :: DatumType -> Int64
+datumTypeToInt = \case
+  DatumByHash -> 0
+  DatumInline -> 1
+
 -- | One matched output, with every field already serialised to the bytes the
 -- schema stores. Produced by "Cardano.Sieve.Node.Filter"; consumed here.
 data StoredOutput = StoredOutput
   { soOutputRef :: ByteString
   -- ^ Encoded output reference (transaction id ++ big-endian output index).
   -- The schema derives @transaction_id@ from this, so it is not stored again.
+  , soTransactionIndex :: Int64
+  -- ^ Position of the producing transaction within its block. Stored because
+  -- kupo reports it, and because kupo's result ordering is
+  -- @(created_slot, transaction_index, output_index)@ — nothing else recovers it.
   , soAddress :: ByteString
   -- ^ Raw bytes of the output's address.
   , soPayCred :: Maybe ByteString
@@ -76,6 +100,9 @@ data StoredOutput = StoredOutput
   -- ^ Serialised value (see "Cardano.Sieve.Node.Filter" for the encoding).
   , soDatumHash :: Maybe ByteString
   -- ^ Datum hash, if the output carries a datum (hash or inline).
+  , soDatumType :: Maybe DatumType
+  -- ^ Which of the two, when there is a datum at all. 'Nothing' exactly when
+  -- 'soDatumHash' is 'Nothing'.
   , soReferenceScriptHash :: Maybe ByteString
   -- ^ Reference-script hash, if the output carries one.
   , soAssets :: [(ByteString, ByteString)]
@@ -92,8 +119,42 @@ data SpentInput = SpentInput
   , siSpendingTxId :: ByteString
   -- ^ Raw id of the transaction doing the spending.
   , siInputIndex :: Int64
-  -- ^ Index of this input within the spending transaction.
+  -- ^ Index of this input within the spending transaction, in the ledger's
+  -- (sorted) input order.
+  , siRedeemer :: Maybe ByteString
+  -- ^ The redeemer that authorised this spend, when there is one and capture is
+  -- enabled. 'Nothing' both for a non-script spend and when capture is off, which
+  -- the schema cannot distinguish — see 'RedeemerCapture'.
   }
+
+-- | Whether to pull spend redeemers out of the witness set and store them.
+--
+-- Opt-in because redeemers are the heavy bytes on the spend path, and everything
+-- else about a spend (which transaction, which slot, which input) is cheap and
+-- always recorded. This is the switch the storage design called for.
+data RedeemerCapture = CaptureRedeemers | SkipRedeemers
+  deriving (Eq, Show)
+
+-- | Datum and script /preimages/ from one block: the bodies behind the hashes
+-- stored on output rows, for the deduplicated @binary_data@ and @scripts@ tables.
+-- Produced by "Cardano.Sieve.Node.Decode"; written by 'applyBlock'.
+--
+-- Block-scoped rather than output-scoped because that is where the data lives: a
+-- datum referenced by hash from an output is supplied in the /witness set/ of a
+-- transaction, and that is frequently a later transaction than the one that
+-- created the output.
+data Preimages = Preimages
+  { pmDatums :: [(ByteString, ByteString)]
+  -- ^ (datum hash, datum bytes).
+  , pmScripts :: [(ByteString, ByteString)]
+  -- ^ (script hash, script bytes).
+  }
+
+instance Semigroup Preimages where
+  a <> b = Preimages (pmDatums a <> pmDatums b) (pmScripts a <> pmScripts b)
+
+instance Monoid Preimages where
+  mempty = Preimages [] []
 
 -- | A handle to the SQLite database; output writes are batched.
 data DbHandle = DbHandle
@@ -179,8 +240,9 @@ prepare conn = do
 -- accumulated. Inserts are @INSERT OR IGNORE@ — idempotent across re-syncs, and
 -- avoiding the @INSERT OR REPLACE@ delete that would trip the @policies@
 -- foreign key.
-applyBlock :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> [SpentInput] -> IO ()
-applyBlock _ _ _ [] [] = pure ()
+applyBlock
+  :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> [SpentInput] -> Preimages -> IO ()
+applyBlock _ _ _ [] [] _ = pure ()
 applyBlock
   DbHandle
     { dbConn = conn
@@ -191,7 +253,8 @@ applyBlock
   slot
   headerHash
   created
-  spent = do
+  spent
+  preimages = do
     n <- readIORef pending
     when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
     unless (null created) $
@@ -201,6 +264,20 @@ applyBlock
         (slot, headerHash)
     mapM_ (insertOutput conn policyNums slot) created
     mapM_ (recordSpend conn slot) spent
+    -- Preimages are gathered from the WHOLE block, so gate them on the block
+    -- being relevant to the configured selectors — otherwise a narrow selector
+    -- drags in every datum and script on the chain. kupo does the same, and says
+    -- why: "a best-effort at not storing all the garbage of the world".
+    --
+    -- kupo's gate is "produced a tracked output OR spent a tracked input"; ours is
+    -- the first half only. Detecting the second would cost a lookup per input on
+    -- the sync hot path, and under a wildcard selector (how the benchmark runs)
+    -- any block with transactions produces tracked outputs, so the two coincide.
+    -- Under a narrow selector ours stores strictly less, which is the safe
+    -- direction. Verified by comparing the resulting row counts against kupo.
+    unless (null created) $ do
+      mapM_ (insertPreimage conn "binary_data" "datum_hash" "datum") (pmDatums preimages)
+      mapM_ (insertPreimage conn "scripts" "script_hash" "script") (pmScripts preimages)
     let n' = n + length created + length spent
     if n' >= batchSize
       then execute_ conn "COMMIT" >> writeIORef pending 0
@@ -213,17 +290,32 @@ insertOutput conn policyNums slot o = do
   execute
     conn
     "INSERT OR IGNORE INTO outputs \
-    \(output_reference, address, value, datum_hash, reference_script_hash, created_slot) \
-    \VALUES (?, ?, ?, ?, ?, ?)"
-    ((soOutputRef o, soAddress o, soValue o, soDatumHash o) :. (soReferenceScriptHash o, slot))
+    \(output_reference, transaction_index, address, payment_credential, \
+    \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
+    \created_slot) \
+    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ( (soOutputRef o, soTransactionIndex o, soAddress o, soPayCred o, soDelegCred o)
+        :. ( soValue o
+           , soDatumHash o
+           , datumTypeToInt <$> soDatumType o
+           , soReferenceScriptHash o
+           , slot
+           )
+    )
   execute
     conn
     "INSERT OR IGNORE INTO unspent \
-    \(output_reference, address, payment_credential, delegation_credential, \
-    \value, datum_hash, reference_script_hash, created_slot) \
-    \VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ( (soOutputRef o, soAddress o, soPayCred o, soDelegCred o)
-        :. (soValue o, soDatumHash o, soReferenceScriptHash o, slot)
+    \(output_reference, transaction_index, address, payment_credential, \
+    \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
+    \created_slot) \
+    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ( (soOutputRef o, soTransactionIndex o, soAddress o, soPayCred o, soDelegCred o)
+        :. ( soValue o
+           , soDatumHash o
+           , datumTypeToInt <$> soDatumType o
+           , soReferenceScriptHash o
+           , slot
+           )
     )
   mapM_
     ( \(pid, name) -> do
@@ -256,19 +348,35 @@ policyNumOf conn cache pid = do
         Only num : _ -> num <$ modifyIORef' cache (Map.insert pid num)
         [] -> error "policyNumOf: policy_ids row absent immediately after INSERT OR IGNORE"
 
+-- | Store one preimage, keyed by its hash. @INSERT OR IGNORE@ does the dedup: the
+-- same datum or script recurs across many transactions, and the hash is the
+-- primary key, so repeats cost a failed index probe rather than a row.
+--
+-- The table and column names are supplied by the caller rather than duplicating
+-- this function per table; they are compile-time literals here, never user input.
+insertPreimage :: Connection -> Query -> Query -> Query -> (ByteString, ByteString) -> IO ()
+insertPreimage conn table hashCol bodyCol (h, body) =
+  execute
+    conn
+    ("INSERT OR IGNORE INTO " <> table <> " (" <> hashCol <> ", " <> bodyCol <> ") VALUES (?, ?)")
+    (h, body)
+
 -- | Record one spend. Appends to @spends@ only when the consumed output is one
 -- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
--- @unspent@ set. The redeemer is not captured yet (left NULL). Untracked inputs
--- no-op on both statements.
+-- @unspent@ set. The redeemer is whatever the decode stage captured — NULL unless
+-- 'CaptureRedeemers' was asked for. Untracked inputs no-op on both statements.
 recordSpend :: Connection -> Int64 -> SpentInput -> IO ()
 recordSpend conn slot si = do
   execute
     conn
     "INSERT OR IGNORE INTO spends \
-    \(output_reference, spending_transaction_id, spending_input_index, spent_slot) \
-    \SELECT ?, ?, ?, ? \
+    \(output_reference, spending_transaction_id, spending_input_index, spent_slot, \
+    \redeemer) \
+    \SELECT ?, ?, ?, ?, ? \
     \WHERE EXISTS (SELECT 1 FROM outputs WHERE output_reference = ?)"
-    (siConsumed si, siSpendingTxId si, siInputIndex si, slot, siConsumed si)
+    ( (siConsumed si, siSpendingTxId si, siInputIndex si)
+        :. (slot, siRedeemer si, siConsumed si)
+    )
   execute
     conn
     "DELETE FROM unspent WHERE output_reference = ?"

@@ -27,6 +27,7 @@ library
   exposed-modules: Cardano.Sieve
                    Cardano.Server.Http
                    Cardano.Sieve.Selector
+                   Cardano.Sieve.Value
                    Cardano.Sieve.Schema
                    Cardano.Sieve.Node.Decode
                    Cardano.Sieve.Node.Fetch
@@ -37,10 +38,12 @@ library
     , base16-bytestring        ^>=1.0
     , bech32                    ^>=1.1
     , bytestring               ^>=0.12
+    , cborg                    ^>=0.2
     , cardano-api              >=11.2
     , cardano-ledger-alonzo
     , cardano-ledger-babbage
     , containers               ^>=0.7
+    , http-api-data            ^>=0.6
     , cardano-slotting         ^>=0.2
     , microlens                ^>=0.4
     , optparse-applicative     ^>=0.19
