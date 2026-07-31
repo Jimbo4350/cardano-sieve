@@ -130,10 +130,15 @@ CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 # ---- one sieve run: it exits at --until, so time(1) captures it directly ----
 run_sieve() { # $1 = run index -> "elapsed_s max_rss_kb db_bytes cpu_time_s"
   local db="$WORK/sieve-$1.sqlite3" tf="$WORK/sieve-$1.time"
+  local sl="$WORK/sieve-$1.synclog"
+  # Progress goes to a file rather than the terminal: it is one heartbeat line
+  # every 5 s, so the write is immaterial to the measurement, but it keeps this
+  # run's stdout clean and gives a timed run something to watch.
+  #   tail -f "$sl"
   "$TIME_BIN" -v -o "$tf" \
     "$SIEVE_BIN" \
       --socket-path "$NODE_SOCKET" --testnet-magic "$TESTNET_MAGIC" \
-      --database "$db" --since origin --until "$UNTIL_SLOT" >/dev/null 2>&1
+      --database "$db" --since origin --until "$UNTIL_SLOT" >"$sl" 2>&1
   echo "$(elapsed_s "$tf") $(max_rss_kb "$tf") $(db_bytes "$db") $(cpu_time_s "$tf")"
 }
 

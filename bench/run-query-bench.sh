@@ -226,38 +226,51 @@ header "One specific unspent output (txid#index)." \
        "SELECT $COLS FROM unspent WHERE output_reference = X'$oref'" "1"
 measure "" "" "SELECT $COLS FROM unspent WHERE output_reference = X'$oref'"
 
-# policy_id joins the policies index back to unspent. policies now carries
-# created_slot, so ORDER BY p.created_slot lets the composite cover the sort.
-pol=$(sqlite3 "$SIEVE_DB" "SELECT hex(policy_id) FROM policies GROUP BY policy_id ORDER BY count(*) DESC LIMIT 1" 2>/dev/null || true)
+# policy_id joins the policies index back to unspent. policies stores the small
+# policy_ids surrogate rather than the 28-byte hash, so the query resolves the
+# hash to its policy_num through one seek on policy_ids(policy_id) first — a
+# single-value scalar subquery, which keeps the equality on the leading index
+# column. policies carries created_slot, so ORDER BY p.created_slot lets the
+# composite cover the sort.
+POLNUM="SELECT policy_num FROM policy_ids WHERE policy_id"
+pol=$(sqlite3 "$SIEVE_DB" "SELECT hex(d.policy_id) FROM policies p \
+JOIN policy_ids d ON d.policy_num = p.policy_num \
+GROUP BY p.policy_num ORDER BY count(*) DESC LIMIT 1" 2>/dev/null || true)
 hr "unspent by policy_id (join policies)"
 if [ -n "$pol" ]; then
   polq="SELECT u.output_reference, u.address, u.value, u.datum_hash, u.reference_script_hash, u.created_slot \
 FROM unspent u JOIN policies p ON p.output_reference = u.output_reference \
-WHERE p.policy_id = X'$pol' ORDER BY p.created_slot DESC LIMIT $PAGE"
-  polm=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM policies WHERE policy_id = X'$pol'")
+WHERE p.policy_num = ($POLNUM = X'$pol') ORDER BY p.created_slot DESC LIMIT $PAGE"
+  polm=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM policies WHERE policy_num = ($POLNUM = X'$pol')")
   header "All unspent UTxOs holding any asset of one policy, newest first (via the policies join)." \
-         "Does policies(policy_id, created_slot) remove the sort and speed up the hot-policy join?" \
+         "Does policies(policy_num, created_slot) remove the sort and speed up the hot-policy join?" \
          "GET /matches/{policy_id}.*?unspent" "$polq" "$polm"
-  measure "policiesByPolicyId" "CREATE INDEX policiesByPolicyId ON policies(policy_id, created_slot)" "$polq"
+  measure "policiesByPolicyId" "CREATE INDEX policiesByPolicyId ON policies(policy_num, created_slot)" "$polq"
 else
   printf '   (no policies rows in range; skipped)\n'
 fi
 
-# asset_id joins on BOTH policy_id and asset_name (asset_name now stored). The
-# two hex values are packed with a '|' and split back out; asset_name may be
-# empty (X'') — a valid, common case.
-pa=$(sqlite3 "$SIEVE_DB" "SELECT hex(policy_id) || '|' || hex(asset_name) FROM policies GROUP BY policy_id, asset_name ORDER BY count(*) DESC LIMIT 1" 2>/dev/null || true)
+# asset_id joins on BOTH the policy surrogate and asset_name. Only the POLICY is
+# interned, so asset_name stays inline and this keeps a two-column equality on the
+# composite index's leading columns. (Interning the (policy, name) PAIR instead
+# would collapse this to one integer, but then the policy-only case above becomes
+# `policy_num IN (…)` — N disjoint ranges, no covered sort, materialise-and-sort.)
+# The policy hash and asset name are packed with a '|' and split back out;
+# asset_name may be empty (X'') — a valid, common case.
+pa=$(sqlite3 "$SIEVE_DB" "SELECT hex(d.policy_id) || '|' || hex(p.asset_name) FROM policies p \
+JOIN policy_ids d ON d.policy_num = p.policy_num \
+GROUP BY p.policy_num, p.asset_name ORDER BY count(*) DESC LIMIT 1" 2>/dev/null || true)
 hr "unspent by asset_id (policy + asset name)"
 if [ -n "$pa" ]; then
   apol=${pa%%|*}; aname=${pa##*|}
   aq="SELECT u.output_reference, u.address, u.value, u.datum_hash, u.reference_script_hash, u.created_slot \
 FROM unspent u JOIN policies p ON p.output_reference = u.output_reference \
-WHERE p.policy_id = X'$apol' AND p.asset_name = X'$aname' ORDER BY p.created_slot DESC LIMIT $PAGE"
-  am=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM policies WHERE policy_id = X'$apol' AND asset_name = X'$aname'")
+WHERE p.policy_num = ($POLNUM = X'$apol') AND p.asset_name = X'$aname' ORDER BY p.created_slot DESC LIMIT $PAGE"
+  am=$(sqlite3 "$SIEVE_DB" "SELECT count(*) FROM policies WHERE policy_num = ($POLNUM = X'$apol') AND asset_name = X'$aname'")
   header "All unspent UTxOs holding one specific native asset (policy + asset name), newest first." \
-         "Does the composite policies(policy_id, asset_name, created_slot) serve it in one indexed seek?" \
+         "Does the composite policies(policy_num, asset_name, created_slot) serve it in one indexed seek?" \
          "GET /matches/{policy_id}.{asset_name}?unspent" "$aq" "$am"
-  measure "policiesByAssetId" "CREATE INDEX policiesByAssetId ON policies(policy_id, asset_name, created_slot)" "$aq"
+  measure "policiesByAssetId" "CREATE INDEX policiesByAssetId ON policies(policy_num, asset_name, created_slot)" "$aq"
 else
   printf '   (no policies rows in range; skipped)\n'
 fi
