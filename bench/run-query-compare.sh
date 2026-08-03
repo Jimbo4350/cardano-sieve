@@ -91,7 +91,7 @@ prep_sieve_db() {
   fi
   sieve_db_indexed || {
     log "PREP=1: building sieve query indexes ..."
-    "$SIEVE_BIN" --socket-path /tmp/unused.sock --testnet-magic "$TESTNET_MAGIC" \
+    "$SIEVE_BIN" \
       --database "$SIEVE_DB" --build-indexes >/dev/null
   }
 }
@@ -134,7 +134,7 @@ EOF
     cat <<EOF
 
   ── step $step: build the sieve query indexes (seconds) ──
-  '$SIEVE_BIN' --socket-path /tmp/unused.sock --testnet-magic $TESTNET_MAGIC \\
+  '$SIEVE_BIN' \\
     --database '$SIEVE_DB' --build-indexes
 EOF
   esac
@@ -158,7 +158,7 @@ EOF
     cat <<EOF
 
   ── step $step: the sieve query server, in its OWN terminal (leave it running) ──
-  '$SIEVE_BIN' --socket-path /tmp/unused.sock --testnet-magic $TESTNET_MAGIC \\
+  '$SIEVE_BIN' \\
     --database '$SIEVE_DB' --serve $SIEVE_PORT
 EOF
   esac

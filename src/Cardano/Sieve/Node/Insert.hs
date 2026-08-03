@@ -39,6 +39,7 @@ module Cardano.Sieve.Node.Insert
   , rollbackAbove
   , buildIndexesOn
   , installIndexes
+  , busyTimeoutMs
   )
 where
 
@@ -176,6 +177,12 @@ data DbHandle = DbHandle
 -- | Open the database, prepare it (pragmas + schema) and return a batched
 -- 'DbHandle'. Pair every 'openDatabase' with 'closeDatabase' — via
 -- 'Control.Exception.finally' — so the final partial batch is always committed.
+-- | How long a connection waits for a contended lock before giving up, in
+-- milliseconds. Shared by the writer here and the query server's readers so the
+-- two agree.
+busyTimeoutMs :: Query
+busyTimeoutMs = "5000"
+
 openDatabase :: FilePath -> Int -> IO DbHandle
 openDatabase path batchSize = do
   conn <- open path
@@ -223,6 +230,16 @@ prepare conn = do
     [ "PRAGMA journal_mode=WAL"
     , "PRAGMA synchronous=NORMAL"
     ]
+  -- Wait for a contended lock instead of failing on it. SQLite's default is 0 ms
+  -- — return SQLITE_BUSY immediately — which is fine while the writer has the
+  -- file to itself but not once a query server shares the process
+  -- (@--serve@ alongside @--socket-path@): WAL keeps ordinary reads clear of the
+  -- writer, yet the brief exclusive moments still collide, and with no timeout
+  -- the loser errors rather than waiting a few milliseconds.
+  --
+  -- Read back separately from the pragmas above because it answers with an
+  -- INTEGER where @journal_mode@ answers with TEXT.
+  () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
   execute_ conn "PRAGMA foreign_keys=ON"
   createSchema conn
 

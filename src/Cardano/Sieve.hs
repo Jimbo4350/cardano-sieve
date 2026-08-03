@@ -29,7 +29,12 @@ import Cardano.Api
 
 import Cardano.Server.Http (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
-import Cardano.Sieve.Node.Insert (RedeemerCapture (CaptureRedeemers, SkipRedeemers), installIndexes)
+import Cardano.Sieve.Node.Insert
+  ( RedeemerCapture (CaptureRedeemers, SkipRedeemers)
+  , closeDatabase
+  , installIndexes
+  , openDatabase
+  )
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap)
   , Selector (SelectAll)
@@ -39,7 +44,8 @@ import Cardano.Slotting.Slot (SlotNo (SlotNo))
 
 import Control.Applicative (many, optional)
 import Control.Concurrent (myThreadId)
-import Control.Exception (AsyncException (UserInterrupt), throwTo)
+import Control.Concurrent.Async (race_)
+import Control.Exception (AsyncException (UserInterrupt), bracket, throwTo)
 import Data.Bifunctor (first)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -65,38 +71,94 @@ import Options.Applicative
   , value
   , (<**>)
   )
+import System.Exit (die)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
 import System.Posix.Signals (Handler (CatchOnce), installHandler, sigTERM)
 import Text.Read (readMaybe)
 
--- | Command-line options for the @cardano-sieve@ executable.
-data Options = Options
-  { socketPath :: SocketPath
+-- | What the process was asked to do.
+--
+-- The three are mutually exclusive and need /different/ inputs, which is what a
+-- flat record of options could not express. Encoding the choice as
+-- @servePort :: Maybe Int@ plus a @buildIndexes :: Bool@ guard made every mode
+-- carry every field, so the modes that never open a node connection still had to
+-- be handed one: @bench\/run-query-compare.sh@ passed @--socket-path
+-- \/tmp\/unused.sock@ to @--build-indexes@ purely to satisfy the parser, and
+-- @--serve@ demanded a @--testnet-magic@ it ignores.
+--
+-- Note that the two 'Maybe's that remain are genuine absences, not modes hiding
+-- in a missing value the way @servePort@ was: 'syUntil' absent means no upper
+-- bound, and the port on 'Sync' absent means index without also serving.
+data Command
+  = -- | Follow the chain and index it into @--database@, optionally serving the
+    -- read query API from the same process on the given port.
+    --
+    -- __Serving while syncing is only as fresh as the last commit.__ Batches
+    -- currently commit on a row count ('syBatchSize'), so at the tip — where
+    -- blocks carry few matched rows — an open transaction can sit unflushed
+    -- indefinitely and queries answer from stale data with no indication.
+    -- ADR-020 Decision 2 (flush on idle, using @CollectResponse@'s non-blocking
+    -- peek) is what makes this sound; until it lands, prefer a port here only
+    -- for a bounded @--until@ run, where the final commit happens on exit.
+    Sync SyncOptions (Maybe Int)
+  | -- | Install the deferred query indexes on @--database@ and exit. Run once
+    -- after an initial sync that never reached the tip (a @--until@ run does not
+    -- build them).
+    BuildIndexes
+  | -- | Serve the read query API on this port against an existing @--database@,
+    -- without connecting to a node.
+    --
+    -- Deliberately carries no socket path: it needs none today, and
+    -- @GET \/metadata\/{slot-no}@ should add one to this constructor explicitly
+    -- when it lands rather than inherit one by accident.
+    Serve Int
+
+-- | The inputs only the indexing path needs.
+data SyncOptions = SyncOptions
+  { syNode :: SocketPath
   -- ^ Node-to-client socket of the local node to follow.
-  , networkId :: NetworkId
+  , syNetwork :: NetworkId
   -- ^ Network of that node (its testnet magic).
-  , databasePath :: FilePath
-  -- ^ SQLite file to write block headers into.
-  , batchSize :: Int
-  -- ^ Commit to SQLite every this many headers.
-  , selectors :: [Selector]
-  -- ^ Selectors to sieve outputs against (from repeatable @--select@); an empty
-  -- list means match every output.
-  , sincePoint :: ChainPoint
+  , syBatchSize :: Int
+  -- ^ Commit to SQLite every this many written rows.
+  , sySelectors :: [Selector]
+  -- ^ Selectors to sieve outputs against; never empty (an omitted @--select@
+  -- becomes the wildcard).
+  , sySince :: ChainPoint
   -- ^ Chain point to start indexing from (@--since@); 'ChainPointAtGenesis' when
   -- omitted.
-  , untilSlot :: Maybe SlotNo
+  , syUntil :: Maybe SlotNo
   -- ^ Slot to stop indexing at, inclusive (@--until@); 'Nothing' follows the
   -- chain indefinitely.
-  , withRedeemers :: Bool
-  -- ^ @--with-redeemers@: also capture the redeemer that authorised each spend.
-  -- Off by default because redeemers are the heavy bytes on the spend path, while
-  -- the rest of a spend record is cheap and always stored.
-  , buildIndexes :: Bool
-  -- ^ @--build-indexes@: instead of syncing, install the deferred query indexes
-  -- on @--database@ and exit. Run once after the initial sync.
-  , servePort :: Maybe Int
-  -- ^ @--serve PORT@: instead of syncing, serve the read query API on this port.
+  , syRedeemers :: RedeemerCapture
+  -- ^ Whether to also capture the redeemer that authorised each spend.
+  }
+
+-- | A validated invocation: the database every mode reads or writes, and what to
+-- do with it.
+data Invocation = Invocation
+  { invDatabase :: FilePath
+  , invCommand :: Command
+  }
+
+-- | The command line as parsed, before it is checked for coherence.
+--
+-- Kept flat and permissive on purpose: the node options stay 'Maybe' so that
+-- @--serve@ and @--build-indexes@ still /accept/ a @--socket-path@ and
+-- @--testnet-magic@ (existing scripts pass them) while no longer /requiring/
+-- them. 'invocationOf' is where this becomes a 'Command', and where a sync
+-- missing a node option is rejected.
+data RawOptions = RawOptions
+  { rawSocketPath :: Maybe SocketPath
+  , rawNetworkId :: Maybe NetworkId
+  , rawDatabasePath :: FilePath
+  , rawBatchSize :: Int
+  , rawSelectors :: [Selector]
+  , rawSincePoint :: ChainPoint
+  , rawUntilSlot :: Maybe SlotNo
+  , rawWithRedeemers :: Bool
+  , rawBuildIndexes :: Bool
+  , rawServePort :: Maybe Int
   }
 
 -- | Parse options and stream the chain, writing each header to SQLite and
@@ -115,52 +177,106 @@ sieve = do
   -- main thread so the database is flushed and closed cleanly.
   mainThread <- myThreadId
   _ <- installHandler sigTERM (CatchOnce (throwTo mainThread UserInterrupt)) Nothing
-  opts <- execParser optionsInfo
-  case servePort opts of
-    Just p -> runServer (databasePath opts) p
-    Nothing
-      | buildIndexes opts -> installIndexes (databasePath opts)
-      | otherwise -> case untilSlot opts of
-          Nothing ->
-            fetch
-              (socketPath opts)
-              (networkId opts)
-              (databasePath opts)
-              (batchSize opts)
-              (redeemerCapture opts)
-              (configuredSelectors opts)
-              (sincePoint opts)
-          Just u ->
-            fetchBounded
-              (socketPath opts)
-              (networkId opts)
-              (databasePath opts)
-              (batchSize opts)
-              (redeemerCapture opts)
-              (configuredSelectors opts)
-              (sincePoint opts)
-              u
+  raw <- execParser optionsInfo
+  Invocation{invDatabase = db, invCommand = cmd} <-
+    either (die . ("cardano-sieve: " <>)) pure (invocationOf raw)
+  case cmd of
+    BuildIndexes -> installIndexes db
+    Serve port -> runServer db port
+    Sync sync Nothing -> runSyncCommand db sync
+    Sync sync (Just port) -> do
+      -- Create the schema before starting either side. The server refuses to
+      -- start against a missing database — a deliberate guard against a mistyped
+      -- --database — but here the sync is what would create it, so on a fresh
+      -- database the two race and the server always wins and dies. Doing it up
+      -- front removes the race rather than weakening the guard; it is
+      -- CREATE TABLE IF NOT EXISTS throughout, so an existing database is
+      -- untouched.
+      bracket (openDatabase db (syBatchSize sync)) closeDatabase (const (pure ()))
+      -- 'race_' rather than a bare fork so whichever finishes or dies first takes
+      -- the other with it: a bounded sync reaching --until should end the
+      -- process, and a crashed server should not leave a headless indexer behind.
+      race_ (runSyncCommand db sync) (runServer db port)
  where
-  -- Default to matching every output when no --select is given, so the full
-  -- decode → sieve → write path is still exercised out of the box.
-  configuredSelectors o = case selectors o of
-    [] -> [SelectAll IncludeBootstrap]
-    xs -> xs
+  runSyncCommand
+    db
+    SyncOptions
+      { syNode = node
+      , syNetwork = network
+      , syBatchSize = batch
+      , sySelectors = selectors
+      , sySince = since
+      , syUntil = until_
+      , syRedeemers = capture
+      } =
+      case until_ of
+        Nothing -> fetch node network db batch capture selectors since
+        Just u -> fetchBounded node network db batch capture selectors since u
 
-  redeemerCapture o = if withRedeemers o then CaptureRedeemers else SkipRedeemers
+-- | Check a parsed command line for coherence and resolve it into the mode it
+-- names. The parser accepts each option in isolation; this is where the
+-- combinations are judged.
+--
+-- @--serve@ alongside the node options means index and serve together;
+-- @--serve@ without them means serve an already-synced database. That is why the
+-- node options are optional in 'RawOptions' rather than required: which mode a
+-- @--serve@ names depends on whether they are present.
+invocationOf :: RawOptions -> Either String Invocation
+invocationOf raw =
+  Invocation (rawDatabasePath raw) <$> command
+ where
+  command
+    | rawBuildIndexes raw =
+        if rawServePort raw /= Nothing
+          then
+            Left "--build-indexes and --serve do nothing together: it exits as soon as the indexes are built"
+          else Right BuildIndexes
+    -- A --serve with no node to follow serves whatever is already on disk. The
+    -- other node options are ignored rather than rejected: scripts pass them
+    -- uniformly across invocations, and refusing would break that for no gain.
+    | Just port <- rawServePort raw
+    , Nothing <- rawSocketPath raw =
+        Right (Serve port)
+    | otherwise = Sync <$> syncOptions <*> pure (rawServePort raw)
 
-optionsInfo :: ParserInfo Options
+  syncOptions = do
+    node <- required "--socket-path" (rawSocketPath raw)
+    network <- required "--testnet-magic" (rawNetworkId raw)
+    pure
+      SyncOptions
+        { syNode = node
+        , syNetwork = network
+        , syBatchSize = rawBatchSize raw
+        , -- Match every output when no --select is given, so the full
+          -- decode → sieve → write path is still exercised out of the box.
+          sySelectors = case rawSelectors raw of
+            [] -> [SelectAll IncludeBootstrap]
+            xs -> xs
+        , sySince = rawSincePoint raw
+        , syUntil = rawUntilSlot raw
+        , syRedeemers = if rawWithRedeemers raw then CaptureRedeemers else SkipRedeemers
+        }
+
+  required flag =
+    maybe
+      (Left (flag <> " is required to sync (omit it, with --serve, to serve an existing database)"))
+      Right
+
+optionsInfo :: ParserInfo RawOptions
 optionsInfo =
   info
     (optionsParser <**> helper)
     ( fullDesc
-        <> progDesc "Follow a local node's chain and print each block number"
+        <> progDesc
+          "Follow a local node's chain, sieve each block's outputs against the \
+          \configured selectors, and index the matches into SQLite — optionally \
+          \serving the read query API from the same process"
         <> header "cardano-sieve - pattern-filtered chain index"
     )
 
-optionsParser :: Parser Options
+optionsParser :: Parser RawOptions
 optionsParser =
-  Options
+  RawOptions
     <$> pSocketPath
     <*> pNetworkId
     <*> pDatabasePath
@@ -172,24 +288,29 @@ optionsParser =
     <*> pBuildIndexes
     <*> pServe
  where
-  pSocketPath :: Parser SocketPath
+  -- Optional, not required: only a sync needs a node. 'invocationOf' demands it
+  -- for the modes that actually connect, and its presence alongside --serve is
+  -- what distinguishes "index and serve" from "serve an existing database".
+  pSocketPath :: Parser (Maybe SocketPath)
   pSocketPath =
-    File
-      <$> strOption
-        ( long "socket-path"
-            <> metavar "FILEPATH"
-            <> help "Path to the local node's node-to-client socket"
-        )
+    optional $
+      File
+        <$> strOption
+          ( long "socket-path"
+              <> metavar "FILEPATH"
+              <> help "Path to the local node's node-to-client socket (required to sync)"
+          )
 
-  pNetworkId :: Parser NetworkId
+  pNetworkId :: Parser (Maybe NetworkId)
   pNetworkId =
-    Testnet . NetworkMagic
-      <$> option
-        auto
-        ( long "testnet-magic"
-            <> metavar "MAGIC"
-            <> help "Testnet network magic (e.g. 42)"
-        )
+    optional $
+      Testnet . NetworkMagic
+        <$> option
+          auto
+          ( long "testnet-magic"
+              <> metavar "MAGIC"
+              <> help "Testnet network magic, e.g. 42 (required to sync)"
+          )
 
   pDatabasePath :: Parser FilePath
   pDatabasePath =
@@ -248,7 +369,7 @@ optionsParser =
             <> help "Stop indexing after this slot, inclusive (default: follow the chain)"
         )
 
-  pBuildIndexes :: Parser Bool
+  pWithRedeemers :: Parser Bool
   pWithRedeemers =
     switch
       ( long "with-redeemers"
@@ -257,6 +378,7 @@ optionsParser =
             \the heavy bytes on the spend path)"
       )
 
+  pBuildIndexes :: Parser Bool
   pBuildIndexes =
     switch
       ( long "build-indexes"
@@ -270,7 +392,9 @@ optionsParser =
         auto
         ( long "serve"
             <> metavar "PORT"
-            <> help "Serve the read query API on this port (reads --database; does not sync)"
+            <> help
+              "Serve the read query API on this port. With --socket-path it indexes and \
+              \serves together; without, it serves an existing --database and does not sync"
         )
 
 -- | Parse a @--since@ argument: @origin@, or @SLOT.HEADERHASH@ — a decimal slot

@@ -63,6 +63,7 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
+import Cardano.Sieve.Node.Insert (busyTimeoutMs)
 import Cardano.Sieve.Selector
   ( Selector (..)
   , credentialHashToBytes
@@ -332,7 +333,7 @@ describeDatabase dbPath = do
   unless exists $
     die (dbPath <> ": no such database — sync one first, or check --database")
   probed <-
-    try (withConnection dbPath probe) :: IO (Either SomeException (Int, Maybe Int64, Bool))
+    try (withReadConnection dbPath probe) :: IO (Either SomeException (Int, Maybe Int64, Bool))
   case probed of
     Left err ->
       die (dbPath <> ": not a readable cardano-sieve database — " <> show err)
@@ -361,6 +362,24 @@ describeDatabase dbPath = do
         conn
         "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='unspentByAddress'"
     pure (headOr 0 rows, headOr Nothing tips, headOr (0 :: Int) idxs > 0)
+
+-- | Open a read connection, matching the writer's lock-wait policy.
+--
+-- A plain 'withConnection' inherits SQLite's default @busy_timeout@ of 0 ms —
+-- return @SQLITE_BUSY@ rather than wait. That is invisible while the server has
+-- the database to itself, and breaks the moment an indexer shares the process
+-- (@--serve@ alongside @--socket-path@): WAL keeps ordinary reads clear of the
+-- writer, but the brief exclusive moments still collide and, with no timeout, the
+-- reader errors instead of waiting a few milliseconds. Observed directly — a
+-- fresh sync-and-serve failed with @ErrorBusy … database is locked@ on the
+-- startup probe.
+--
+-- A connection is still opened per request; pooling is a separate refinement.
+withReadConnection :: FilePath -> (Connection -> IO a) -> IO a
+withReadConnection dbPath act =
+  withConnection dbPath $ \conn -> do
+    () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
+    act conn
 
 -- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
 -- obvious the server is alive and requests are landing. The per-line cost is
@@ -436,7 +455,7 @@ preimage :: FilePath -> Text -> Query -> (ByteString -> Value) -> Handler Value
 preimage dbPath h sql render =
   case Base16.decode (encodeUtf8 h) of
     Left _ -> pure Null
-    Right raw -> liftIO $ withConnection dbPath $ \conn -> do
+    Right raw -> liftIO $ withReadConnection dbPath $ \conn -> do
       rows <- query conn sql (Only raw)
       pure $ case rows of
         Only body : _ -> render body
@@ -477,7 +496,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
   plan <- either badRequest pure (planFor status selector)
   filters <- either badRequest pure (filtersFor (planSlotCol plan) bounds refine)
   let desc = fromMaybe MostRecentFirst order == MostRecentFirst
-  liftIO $ withConnection dbPath $ \conn -> do
+  liftIO $ withReadConnection dbPath $ \conn -> do
     rows <-
       query
         conn
