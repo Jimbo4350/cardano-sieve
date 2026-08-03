@@ -407,6 +407,30 @@ data BoundedPhase
 -- collect.\" Passing 'Nothing' means \"block until it arrives\"; passing 'Just'
 -- means \"if it has not arrived, do this instead\".
 --
+-- == This is how the indexer knows it is at the tip
+--
+-- __There is no timer, no clock, no distance-to-tip calculation and no second
+-- thread anywhere in this.__ An empty pipeline /is/ the at-the-tip signal, and it
+-- costs nothing to observe because the driver has to answer \"has the response
+-- arrived?\" on every collect regardless — we are only supplying what to do with
+-- the \"no\" answer, which was previously thrown away as 'Nothing'.
+--
+-- That matters because the obvious alternatives are all worse, and ADR-020
+-- Decision 2 rejected them by name:
+--
+--   * __A row-count cap alone__ \"leaves a near-empty batch open for minutes at
+--     the tip (stale, unqueryable data)\" — blocks arrive every ~20s carrying a
+--     handful of rows, so a 50,000-row cap is never reached and the transaction
+--     stays open indefinitely.
+--   * __A timer__ \"reintroduces a thread and a tunable\" — something has to wake
+--     up and fire it, and someone has to pick the interval, and the interval is
+--     wrong in both directions (too eager during bulk sync, too lazy at the tip).
+--   * __A mailbox drain__ needs exactly the queue and thread ADR-020 removed.
+--
+-- Flush-on-idle needs none of that: bulk sync and tip-following get different
+-- behaviour out of the same rule, with no mode switch between them and no
+-- constant to tune. Both regimes fall out below.
+--
 -- == What an empty pipeline implies
 --
 -- Nothing buffered, with requests outstanding, means the node has given us
