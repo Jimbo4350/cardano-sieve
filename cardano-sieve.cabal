@@ -52,6 +52,7 @@ library
     , servant-server
     , sqlite-simple            ^>=0.4
     , text                     ^>=2.1
+    , time                     ^>=1.12
     , typed-protocols          ^>=1.2
     , unix                     ^>=2.8
     , wai
