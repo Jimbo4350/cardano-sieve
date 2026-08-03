@@ -362,9 +362,17 @@ data BoundedPhase
 -- — is not handled distinctly below: the @_@ branch treats it as @Pipeline@. That
 -- works, but ignores an explicit \"you are at the tip\" signal from the protocol.
 
--- | Take delivery of one pipelined response; if it has not arrived yet, commit
--- whatever has accumulated rather than sit on it. ADR-020 Decision 2, the /idle
--- flush/.
+-- | Build the \"collect one pipelined response\" instruction, spelling out /two/
+-- alternatives for the driver to choose between:
+--
+--   * the response is already here — process it, the ordinary path;
+--   * it is not here — COMMIT the rows written so far, instead of blocking with
+--     them left uncommitted.
+--
+-- This function does not collect anything and does not commit anything. It
+-- returns a value describing both alternatives; the driver runs one of them
+-- later. That indirection is the whole of ADR-020 Decision 2, the /idle flush/,
+-- and it is the part most likely to be misread — so:
 --
 -- == Two separate decisions, and the one that matters is not ours
 --
