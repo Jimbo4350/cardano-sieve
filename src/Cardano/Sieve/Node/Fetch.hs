@@ -1,3 +1,6 @@
+-- DataKinds: 'collectFlushingWhenIdle' names the pipeline depth it returns at,
+-- @(S n)@, promoting typed-protocols' 'N' constructor to the type level.
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
@@ -46,6 +49,7 @@ import Cardano.Sieve.Node.Insert
   , applyBlock
   , buildIndexesOn
   , closeDatabase
+  , flushBatch
   , openDatabase
   , rollbackAbove
   )
@@ -63,7 +67,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.Word (Word16)
 import GHC.Clock (getMonotonicTime)
-import Network.TypedProtocol.Core (Nat (Succ, Zero))
+import Network.TypedProtocol.Core (N (S), Nat (Succ, Zero))
 import Numeric (showFFloat)
 
 -- | Follow a local node's chain forever, starting at @since@ (genesis by
@@ -304,6 +308,20 @@ sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _
 -- better than a bare 'Bool' at the roll-forward guard.
 data IndexState = IndexesPending | IndexesBuilt
 
+-- | Which half of its life the bounded client is in.
+--
+-- Not a 'Bool', for the same reason 'IndexState' is not: @clientNext True predN@
+-- says nothing at the call site, and the flag has to be threaded through two
+-- mutually recursive functions where every pass is a chance to invert it.
+--
+-- The two phases are genuinely different state machines rather than a toggle:
+-- 'Indexing' consults 'pipelineDecisionMax' and writes what it receives;
+-- 'Draining' issues no new requests and discards what arrives. The distinction
+-- exists because @SendMsgDone@ is only legal with nothing in flight, so on
+-- reaching @--until@ the client must keep collecting until the pipeline empties
+-- before it may finish.
+data BoundedPhase = Indexing | Draining
+
 -- | A pipelined ChainSync client that finds its intersection at @since@ and
 -- then streams the chain forever, sieving each roll-forward and rewinding on
 -- rollback. This is the original follow-the-tip behaviour, generalised only by
@@ -341,7 +359,7 @@ followingClient dbHandle progress capture selectors since =
   clientIdle built clientTip serverTip n =
     case pipelineDecisionMax maxInFlight n clientTip serverTip of
       Collect -> case n of
-        Succ predN -> CSP.CollectResponse Nothing (clientNext built predN)
+        Succ predN -> collectFlushingWhenIdle dbHandle (clientNext built predN)
       _ ->
         CSP.SendMsgRequestNextPipelined
           (pure ())
@@ -398,41 +416,43 @@ boundedClient dbHandle progress capture selectors since untilSlot =
     CSP.SendMsgFindIntersect [since] $
       CSP.ClientPipelinedStIntersect
         { CSP.recvMsgIntersectFound = \_point serverTip ->
-            pure (clientIdle False Origin (fromChainTip serverTip) Zero)
+            pure (clientIdle Indexing Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             fail ("--since point not on the node's chain: " <> show since)
         }
 
-  -- The 'Bool' is whether we have reached the bound and are draining: no new
-  -- requests are issued, outstanding responses are collected, and once none
-  -- remain we are done.
   clientIdle
-    :: Bool
+    :: BoundedPhase
     -> WithOrigin BlockNo
     -> WithOrigin BlockNo
     -> Nat n
     -> CSP.ClientPipelinedStIdle n BlockInMode ChainPoint ChainTip IO ()
-  clientIdle draining clientTip serverTip n
-    | draining =
+  clientIdle phase clientTip serverTip n =
+    case phase of
+      Draining ->
         case n of
           Zero -> CSP.SendMsgDone ()
-          Succ predN -> CSP.CollectResponse Nothing (clientNext True predN)
-    | otherwise =
+          -- No idle flush while draining: these responses are past the bound and
+          -- discarded, and 'runSync''s bracket commits what is pending on the way
+          -- out.
+          Succ predN -> CSP.CollectResponse Nothing (clientNext Draining predN)
+      Indexing ->
         case pipelineDecisionMax maxInFlight n clientTip serverTip of
           Collect -> case n of
-            Succ predN -> CSP.CollectResponse Nothing (clientNext False predN)
+            Succ predN -> collectFlushingWhenIdle dbHandle (clientNext Indexing predN)
           _ ->
             CSP.SendMsgRequestNextPipelined
               (pure ())
-              (clientIdle False clientTip serverTip (Succ n))
+              (clientIdle Indexing clientTip serverTip (Succ n))
 
-  clientNext :: Bool -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
-  clientNext draining n =
+  clientNext
+    :: BoundedPhase -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  clientNext phase n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip ->
-          if draining
-            then pure (clientIdle True Origin (fromChainTip serverTip) n)
-            else do
+          case phase of
+            Draining -> pure (clientIdle Draining Origin (fromChainTip serverTip) n)
+            Indexing -> do
               -- Peek the slot BEFORE indexing: a block past the bound must not
               -- be written. --until is inclusive (kupo's <= semantics), so index
               -- iff slot <= untilSlot; the first block beyond the bound flips us
@@ -441,17 +461,49 @@ boundedClient dbHandle progress capture selectors since untilSlot =
               let BlockHeader slotNo _ blockNo =
                     case blockInMode of BlockInMode _ block -> getBlockHeader block
               if slotNo > untilSlot
-                then pure (clientIdle True Origin (fromChainTip serverTip) n)
+                then pure (clientIdle Draining Origin (fromChainTip serverTip) n)
                 else do
                   _ <- sieveBlock dbHandle progress capture selectors (Just untilSlot) blockInMode
-                  pure (clientIdle (slotNo >= untilSlot) (At blockNo) (fromChainTip serverTip) n)
+                  let next = if slotNo >= untilSlot then Draining else Indexing
+                  pure (clientIdle next (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->
-          if draining
-            then pure (clientIdle True Origin (fromChainTip serverTip) n)
-            else do
+          case phase of
+            Draining -> pure (clientIdle Draining Origin (fromChainTip serverTip) n)
+            Indexing -> do
               rollbackAbove dbHandle (chainPointSlot point)
-              pure (clientIdle False Origin (fromChainTip serverTip) n)
+              pure (clientIdle Indexing Origin (fromChainTip serverTip) n)
       }
+
+-- | Collect a pipelined response, committing whatever has accumulated first if
+-- none has arrived yet — ADR-020 Decision 2, the /idle flush/.
+--
+-- 'CSP.CollectResponse' takes an optional continuation for the case where no
+-- response is waiting. typed-protocols documents it as the choice that makes the
+-- collect non-blocking: \"Since presenting the first choice is optional, this
+-- allows expressing both a blocking collect and a non-blocking collect.\" So
+-- reaching it means the pipeline has drained — we have caught up with what the
+-- node has to give — and that is exactly when a partial batch should be committed
+-- rather than left open.
+--
+-- This is what makes the write behaviour self-tuning, with no timer, no extra
+-- thread and no distance-to-tip test. During bulk sync the pipeline is never
+-- empty, so this never fires and batches fill to 'dbBatchSize' as before; at the
+-- tip it drains between blocks, so every block commits and a query sees the chain
+-- as of the last block. The alternatives were considered and rejected in the ADR:
+-- a count cap alone \"leaves a near-empty batch open for minutes at the tip
+-- (stale, unqueryable data)\", and \"a timer reintroduces a thread and a tunable\".
+--
+-- The inner collect is deliberately the blocking one. Flushing and then returning
+-- to another /non-blocking/ collect would spin, re-entering this on every pass to
+-- flush an already-empty batch.
+collectFlushingWhenIdle
+  :: DbHandle
+  -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  -> CSP.ClientPipelinedStIdle (S n) BlockInMode ChainPoint ChainTip IO ()
+collectFlushingWhenIdle dbHandle next =
+  CSP.CollectResponse
+    (Just (flushBatch dbHandle >> pure (CSP.CollectResponse Nothing next)))
+    next
 
 -- | The server tip as a 'WithOrigin' block number, for 'pipelineDecisionMax'.
 fromChainTip :: ChainTip -> WithOrigin BlockNo

@@ -40,6 +40,7 @@ module Cardano.Sieve.Node.Insert
   , buildIndexesOn
   , installIndexes
   , busyTimeoutMs
+  , flushBatch
   )
 where
 
@@ -197,7 +198,7 @@ openDatabase path batchSize = do
 -- the open batch first. Fired once on reaching the chain tip — bulk catch-up
 -- runs index-free to keep writes cheap (see "Cardano.Sieve.Schema").
 buildIndexesOn :: DbHandle -> IO ()
-buildIndexesOn db = flush db >> installDeferredIndexes (dbConn db)
+buildIndexesOn db = flushBatch db >> installDeferredIndexes (dbConn db)
 
 -- | Open an existing database, install the deferred query indexes, and close.
 -- The @--build-indexes@ one-shot, for databases that never reach live tip (e.g.
@@ -208,7 +209,7 @@ installIndexes path = bracket (openDatabase path 1) closeDatabase buildIndexesOn
 -- | Commit the final partial batch (if any) and close the connection.
 closeDatabase :: DbHandle -> IO ()
 closeDatabase db = do
-  flush db
+  flushBatch db
   close (dbConn db)
 
 -- | Ready a freshly-opened connection for batched writes: set the session
@@ -399,9 +400,11 @@ recordSpend conn slot si = do
     "DELETE FROM unspent WHERE output_reference = ?"
     (Only (siConsumed si))
 
--- | Commit the currently open (partial) batch, if any.
-flush :: DbHandle -> IO ()
-flush DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
+-- | Commit the currently open (partial) batch, if any. A no-op when nothing is
+-- pending, so it is cheap to call speculatively — which is what the idle flush in
+-- "Cardano.Sieve.Node.Fetch" does on every empty pipeline.
+flushBatch :: DbHandle -> IO ()
+flushBatch DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
   n <- readIORef pending
   when (n > 0) $ execute_ conn "COMMIT" >> writeIORef pending 0
 
@@ -426,7 +429,7 @@ flush DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
 -- leaves behind are bounded by the number of distinct policies ever seen.
 rollbackAbove :: DbHandle -> Maybe Int64 -> IO ()
 rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
-  flush db
+  flushBatch db
   case mSlot of
     Nothing ->
       mapM_
