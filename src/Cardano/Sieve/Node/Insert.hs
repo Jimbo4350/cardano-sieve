@@ -393,8 +393,15 @@ flush DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
 -- open batch first so the deletes see a consistent database.
 --
 -- @policies@ is deleted before @outputs@ so the foreign key does not block the
--- @outputs@ delete. Restoring @unspent@ rows for outputs whose spend is rolled
--- back is deferred along with the @spends@ write path.
+-- @outputs@ delete.
+--
+-- Undoing a spend has to return its output to @unspent@, or the invariant the
+-- three-table split rests on — an output is in @unspent@ exactly when it has no
+-- @spends@ row — breaks silently and permanently: the output stays in @outputs@
+-- with no spend recorded, yet no @?unspent@ query can ever see it again. kupo
+-- keeps one @inputs@ table with a nullable @spent_at@, so for it this is a single
+-- @UPDATE inputs SET spent_at = NULL WHERE spent_at > ?@; our split needs a
+-- re-insert from @outputs@.
 --
 -- @policy_ids@ is deliberately /not/ pruned. It is a pure interning dictionary
 -- with no slot column, keeping it append-only means surrogates never change and
@@ -414,6 +421,32 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
         , "DELETE FROM blocks"
         ]
     Just slot -> do
+      -- Restore first: the @spends@ rows about to be deleted are what identifies
+      -- which outputs to bring back, so this cannot run after them.
+      --
+      -- The @created_slot <= ?@ guard is what makes the result independent of
+      -- statement order rather than reliant on it. Without it, an output created
+      -- AND spent above the rollback point — which must disappear entirely —
+      -- would be reinstated here and then survive if this ran after the
+      -- @unspent@ delete. kupo orders the equivalent pair the same way
+      -- (@rollbackQryUpdateInputs@ before @rollbackQryDeleteInputs@).
+      --
+      -- @spends(spent_slot)@ is indexed, and rollbacks only occur near the tip,
+      -- by which point the deferred indexes are built — so the subquery is a
+      -- range scan, not a table scan.
+      execute
+        conn
+        "INSERT OR IGNORE INTO unspent \
+        \(output_reference, transaction_index, address, payment_credential, \
+        \delegation_credential, value, datum_hash, datum_type, \
+        \reference_script_hash, created_slot) \
+        \SELECT output_reference, transaction_index, address, payment_credential, \
+        \delegation_credential, value, datum_hash, datum_type, \
+        \reference_script_hash, created_slot \
+        \FROM outputs \
+        \WHERE created_slot <= ? \
+        \AND output_reference IN (SELECT output_reference FROM spends WHERE spent_slot > ?)"
+        (slot, slot)
       execute conn "DELETE FROM policies WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM unspent WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM spends WHERE spent_slot > ?" (Only slot)

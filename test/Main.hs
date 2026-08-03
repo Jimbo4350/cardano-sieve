@@ -40,6 +40,14 @@ import Cardano.Api
   , toAddressAny
   )
 
+import Cardano.Sieve.Node.Insert
+  ( SpentInput (..)
+  , StoredOutput (..)
+  , applyBlock
+  , closeDatabase
+  , openDatabase
+  , rollbackAbove
+  )
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
   , CredentialHash
@@ -54,12 +62,17 @@ import Cardano.Sieve.Selector
   , selectorToText
   )
 
+import Control.Exception (bracket, bracket_)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Database.SQLite.Simple (Connection, Only (Only), Query, query_, withConnection)
 import GHC.Exts (fromList)
+import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
+import System.FilePath ((</>))
 
 import Test.Gen.Cardano.Api.Typed
   ( genAddressByron
@@ -89,7 +102,136 @@ tests =
     , parserTests
     , parserPropertyTests
     , matcherPropertyTests
+    , rollbackTests
     ]
+
+-- ----------------------------------------------------------------------------
+-- Rollback
+-- ----------------------------------------------------------------------------
+
+-- | The invariant the whole @outputs@\/@unspent@\/@spends@ split rests on: an
+-- output is in @unspent@ exactly when it has no @spends@ row. A rollback has to
+-- preserve it, which means undoing a spend must put the output back.
+unspentInvariant :: Query
+unspentInvariant =
+  "SELECT count(*) FROM outputs \
+  \WHERE output_reference NOT IN (SELECT output_reference FROM spends)"
+
+rollbackTests :: TestTree
+rollbackTests =
+  testGroup
+    "rollback"
+    [ testCase "a rolled-back spend returns its output to the unspent set" $
+        withTempDb "spend-rollback" $ \path -> do
+          withDb path $ \db -> do
+            -- Created well below the rollback point, spent above it: the output
+            -- itself survives, its spend does not.
+            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            rollbackAbove db (Just 150)
+          (outs, unspent, spends, expected) <- withConnection path $ \conn ->
+            (,,,)
+              <$> count conn "SELECT count(*) FROM outputs"
+              <*> count conn "SELECT count(*) FROM unspent"
+              <*> count conn "SELECT count(*) FROM spends"
+              <*> count conn unspentInvariant
+          (outs, spends) @?= (1, 0)
+          expected @?= 1
+          unspent @?= expected
+    , testCase "rolling back below an output's creation removes it entirely" $
+        withTempDb "create-rollback" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            rollbackAbove db (Just 50)
+          (outs, unspent, spends) <- withConnection path $ \conn ->
+            (,,)
+              <$> count conn "SELECT count(*) FROM outputs"
+              <*> count conn "SELECT count(*) FROM unspent"
+              <*> count conn "SELECT count(*) FROM spends"
+          (outs, unspent, spends) @?= (0, 0, 0)
+    , -- The ordering trap: this output must vanish, not be restored. Restoring
+      -- unconditionally and then deleting by created_slot happens to work; doing
+      -- it the other way round reinstates a row that should be gone. The
+      -- created_slot guard in rollbackAbove is what removes the dependency on
+      -- which order those two statements are written in.
+      testCase "an output created and spent above the point is removed, not restored" $
+        withTempDb "created-and-spent-above" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db 160 (blockHash 160) [storedOutput outputRef] [] mempty
+            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            rollbackAbove db (Just 150)
+          (outs, unspent, spends, expected) <- withConnection path $ \conn ->
+            (,,,)
+              <$> count conn "SELECT count(*) FROM outputs"
+              <*> count conn "SELECT count(*) FROM unspent"
+              <*> count conn "SELECT count(*) FROM spends"
+              <*> count conn unspentInvariant
+          (outs, unspent, spends) @?= (0, 0, 0)
+          unspent @?= expected
+    , testCase "an unspent output is untouched by a later rollback" $
+        withTempDb "untouched" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            rollbackAbove db (Just 150)
+          (unspent, expected) <- withConnection path $ \conn ->
+            (,)
+              <$> count conn "SELECT count(*) FROM unspent"
+              <*> count conn unspentInvariant
+          unspent @?= expected
+          unspent @?= 1
+    ]
+ where
+  outputRef = BS.replicate 32 2 <> BS.replicate 8 0
+  blockHash n = BS.replicate 32 n
+
+  withDb path = bracket (openDatabase path 1) closeDatabase
+
+-- | Run an action against a fresh sieve database in a temporary file.
+--
+-- A file rather than @:memory:@ so the assertions can reopen it on a separate
+-- connection once the writer has closed and committed — which also means the
+-- test checks what actually reached disk, not just what the open handle thinks.
+withTempDb :: String -> (FilePath -> IO a) -> IO a
+withTempDb label act = do
+  tmp <- getTemporaryDirectory
+  let path = tmp </> ("cardano-sieve-test-" <> label <> ".sqlite")
+      -- WAL mode leaves sidecars behind; clear them too, before and after, so a
+      -- crashed previous run cannot leak state into this one.
+      scrub = mapM_ rmIfPresent [path, path <> "-wal", path <> "-shm"]
+      rmIfPresent p = doesFileExist p >>= \yes -> when yes (removeFile p)
+  bracket_ scrub scrub (act path)
+
+count :: Connection -> Query -> IO Int
+count conn q = do
+  rows <- query_ conn q
+  pure (case rows of Only n : _ -> n; [] -> 0)
+
+-- | A minimal stored output. 'soValue' is opaque to the writer (only 'soAssets'
+-- feeds the policies table), so arbitrary bytes serve.
+storedOutput :: ByteString -> StoredOutput
+storedOutput ref =
+  StoredOutput
+    { soOutputRef = ref
+    , soTransactionIndex = 0
+    , soAddress = BS.replicate 29 1
+    , soPayCred = Just payBytes
+    , soDelegCred = Nothing
+    , soValue = BS.replicate 4 7
+    , soDatumHash = Nothing
+    , soDatumType = Nothing
+    , soReferenceScriptHash = Nothing
+    , soAssets = []
+    }
+
+spentInput :: ByteString -> SpentInput
+spentInput ref =
+  SpentInput
+    { siConsumed = ref
+    , siSpendingTxId = BS.replicate 32 3
+    , siInputIndex = 0
+    , siRedeemer = Nothing
+    }
 
 -- ----------------------------------------------------------------------------
 -- Fixtures

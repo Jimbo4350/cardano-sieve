@@ -80,7 +80,10 @@ test-suite cardano-sieve-test
     , cardano-api:gen >=11.2
     , cardano-sieve
     , containers      ^>=0.7
+    , directory       ^>=1.3
+    , filepath        ^>=1.4
     , hedgehog
+    , sqlite-simple   ^>=0.4
     , tasty           ^>=1.5
     , tasty-hedgehog
     , tasty-hunit     ^>=0.10
