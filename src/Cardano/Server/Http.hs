@@ -195,6 +195,16 @@ data Refinements = Refinements
   , rfOutputIndex :: Maybe Word64
   }
 
+-- | Whether @?resolve_hashes@ was asked for: does a match carry the datum and
+-- script /bodies/ behind its hashes, or just the hashes?
+--
+-- Servant's 'QueryFlag' can only hand us a 'Bool', but it stops there. The flag
+-- decides three separate things — which columns the SELECT projects, whether the
+-- two preimage tables are joined, and what 'rowToJson' emits — and a bare 'Bool'
+-- threaded to all three says nothing at any of them.
+data HashResolution = ResolveHashes | LeaveHashes
+  deriving (Eq, Show)
+
 -- | The semi-join both the policy\/asset PATTERN and the @?policy_id@ post-filter
 -- need: does a @policies@ row exist for this output under this policy (and, when
 -- @extra@ adds it, this asset name)?
@@ -404,15 +414,18 @@ server :: FilePath -> Server API
 server dbPath =
   matches :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
  where
-  -- Servant delivers the eight filter parameters positionally; group them into the
-  -- two records here so nothing downstream handles eight loose Maybes in a row.
+  -- Servant delivers every parameter positionally and untyped — three bare
+  -- 'Bool's and eight loose 'Maybe's in a row — so the boundary is where they get
+  -- names. 'QueryFlag' can only give us 'Bool', but nothing past this line has to
+  -- take one: the flags become 'HashResolution' and (in 'matchesByPattern') a
+  -- 'Status', and the filters become the two records.
   matches segs unspent spent resolve cAfter cBefore sAfter sBefore pol asset tx ix =
     matchesByPattern
       dbPath
       segs
       unspent
       spent
-      resolve
+      (if resolve then ResolveHashes else LeaveHashes)
       (SlotBounds cAfter cBefore sAfter sBefore)
       (Refinements pol asset tx ix)
 
@@ -477,8 +490,11 @@ matchesByPattern
   :: FilePath
   -> [Text]
   -> Bool
+  -- ^ @?unspent@, as servant's 'QueryFlag' delivers it; paired with the next into
+  -- a 'Status' below, since only the /combination/ is meaningful.
   -> Bool
-  -> Bool
+  -- ^ @?spent@.
+  -> HashResolution
   -> SlotBounds
   -> Refinements
   -> Maybe Order
@@ -512,7 +528,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
     \u.datum_type, u.reference_script_hash, u.created_slot, bc.header_hash, \
     \s.spent_slot, bs.header_hash, s.spending_transaction_id, \
     \s.spending_input_index, s.redeemer, "
-      <> (if resolveHashes then "bd.datum, sc.script" else "NULL, NULL")
+      <> (case resolveHashes of ResolveHashes -> "bd.datum, sc.script"; LeaveHashes -> "NULL, NULL")
       <> " FROM "
       <> planFrom plan
       <> " LEFT JOIN blocks bc ON bc.slot_no = u.created_slot \
@@ -521,11 +537,11 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
       -- Only joined when asked for: both are primary-key probes, but resolving on
       -- every match would ship a datum body per row (and one popular datum is
       -- referenced by 2,480 outputs, so a large page would repeat it).
-      <> ( if resolveHashes
-             then
+      <> ( case resolveHashes of
+             ResolveHashes ->
                " LEFT JOIN binary_data bd ON bd.datum_hash = u.datum_hash \
                \LEFT JOIN scripts sc ON sc.script_hash = u.reference_script_hash"
-             else ""
+             LeaveHashes -> ""
          )
       <> " WHERE "
       <> planWhere plan
@@ -649,7 +665,7 @@ beWord64 = LBS.toStrict . toLazyByteString . word64BE
 
 -- | One row as JSON, mirroring kupo's match shape field for field.
 rowToJson
-  :: Bool
+  :: HashResolution
   -> ( ByteString
      , Int64
      , ByteString
@@ -692,9 +708,9 @@ rowToJson
           -- ?resolve_hashes inlines the bodies. Emitted whenever resolving was
           -- asked for, null when the body is not stored, so a client can tell
           -- "not resolved" from "resolved, nothing there".
-          <> [ "datum" .= (hexText <$> mDatumBody) | resolved
+          <> [ "datum" .= (hexText <$> mDatumBody) | resolved == ResolveHashes
              ]
-          <> [ "script" .= (scriptBodyJson =<< mScriptBody) | resolved
+          <> [ "script" .= (scriptBodyJson =<< mScriptBody) | resolved == ResolveHashes
              ]
       )
    where
