@@ -306,6 +306,24 @@ sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _
   tick progress slotNo target (length selected) (length spent)
   pure header
 
+-- | Whether the deferred query indexes have been built yet. The follower builds
+-- them once, the first time it reaches the node's tip; a named state reads
+-- better than a bare 'Bool' at the roll-forward guard.
+data IndexState = IndexesPending | IndexesBuilt
+
+-- | Which half of its life 'boundedClient' is in.
+--
+-- Two phases rather than one, because @SendMsgDone@ is only legal with nothing
+-- in flight: on reaching @--until@ the client is still owed the ~50 responses it
+-- pipelined ahead, and must collect them all before it may finish.
+data BoundedPhase
+  = -- | Before the bound: consult 'pipelineDecisionMax', request more, and write
+    -- what arrives.
+    Indexing
+  | -- | Past the bound: request nothing, discard what arrives, and finish once
+    -- the pipeline is empty.
+    Draining
+
 -- $pipelining
 --
 -- 'pipelineDecisionMax' lives in @ouroboros-network@ and decides, at every step,
@@ -344,23 +362,78 @@ sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _
 -- — is not handled distinctly below: the @_@ branch treats it as @Pipeline@. That
 -- works, but ignores an explicit \"you are at the tip\" signal from the protocol.
 
--- | Whether the deferred query indexes have been built yet. The follower builds
--- them once, the first time it reaches the node's tip; a named state reads
--- better than a bare 'Bool' at the roll-forward guard.
-data IndexState = IndexesPending | IndexesBuilt
-
--- | Which half of its life 'boundedClient' is in.
+-- | Take delivery of one pipelined response; if it has not arrived yet, commit
+-- whatever has accumulated rather than sit on it. ADR-020 Decision 2, the /idle
+-- flush/.
 --
--- Two phases rather than one, because @SendMsgDone@ is only legal with nothing
--- in flight: on reaching @--until@ the client is still owed the ~50 responses it
--- pipelined ahead, and must collect them all before it may finish.
-data BoundedPhase
-  = -- | Before the bound: consult 'pipelineDecisionMax', request more, and write
-    -- what arrives.
-    Indexing
-  | -- | Past the bound: request nothing, discard what arrives, and finish once
-    -- the pipeline is empty.
-    Draining
+-- == Two separate decisions, and the one that matters is not ours
+--
+-- It is easy to read this as \"we flush every time 'pipelineDecisionMax' says
+-- 'Collect'\". It is not. There are two decisions, taken by different parties at
+-- different times:
+--
+--   1. WE decide, via 'pipelineDecisionMax', /that we will take delivery/ of a
+--      response. That is the @Collect@ branch in 'clientIdle'. During bulk sync
+--      it happens once per block (see the note on 'pipelineDecisionMax'), so
+--      this function is CALLED once per block.
+--
+--   2. THE DRIVER then decides /which branch of the value we built here to run/,
+--      by asking a completely different question: has the next response actually
+--      arrived? We never see that question; we only supply both answers up front.
+--
+-- So being called is not flushing. The flush is on the branch taken only when
+-- the answer to (2) is no.
+--
+-- == Which branch runs
+--
+-- @
+-- CollectResponse (Just idleAction) next
+--                       │            │
+--    response NOT here ─┘            └─ response already buffered: the
+--    run idleAction instead of          ordinary path, no flush
+--    blocking
+-- @
+--
+-- typed-protocols states the contract: \"Since presenting the first choice is
+-- optional, this allows expressing both a blocking collect and a non-blocking
+-- collect.\" Passing 'Nothing' means \"block until it arrives\"; passing 'Just'
+-- means \"if it has not arrived, do this instead\".
+--
+-- == What an empty pipeline implies
+--
+-- Nothing buffered, with requests outstanding, means the node has given us
+-- everything it currently has. Two ways to get there:
+--
+--   * __At the tip__ — the common case. We asked for the next block and it does
+--     not exist yet. Outstanding requests sit near 1 rather than 50, because
+--     'pipelineDecisionMax' stops pipelining past the server's tip. Every block
+--     therefore commits on its own, and a query sees the chain as of the last
+--     block instead of the last 'dbBatchSize' boundary.
+--
+--   * __Starved during bulk sync__ — the node failed to deliver even the oldest
+--     of ~50 outstanding requests. Should be rare against a local node serving
+--     from disk. If it is NOT rare, bulk sync degrades towards a commit per
+--     block, which is the expensive end of the batch-size curve (41.7s versus
+--     31.6s over @origin..2,000,000@). This is measured, not assumed — see the
+--     verification task; until then treat the bulk-sync claim as unconfirmed.
+--
+-- 'flushBatch' is a no-op when nothing is pending, so an idle flush with no
+-- written rows costs one 'IORef' read.
+--
+-- == Why the inner collect blocks
+--
+-- After flushing we hand back @CollectResponse Nothing next@ — the /blocking/
+-- form. Returning another non-blocking collect would re-enter this on the next
+-- pass, find the batch already empty, and spin. Flush once, then wait.
+collectFlushingWhenIdle
+  :: DbHandle
+  -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
+  -- ^ What to do with the response when it is (or once it is) here.
+  -> CSP.ClientPipelinedStIdle (S n) BlockInMode ChainPoint ChainTip IO ()
+collectFlushingWhenIdle dbHandle next =
+  CSP.CollectResponse
+    (Just (flushBatch dbHandle >> pure (CSP.CollectResponse Nothing next)))
+    next
 
 -- | A pipelined ChainSync client that finds its intersection at @since@ and
 -- then streams the chain forever, sieving each roll-forward and rewinding on
@@ -513,79 +586,6 @@ boundedClient dbHandle progress capture selectors since untilSlot =
               rollbackAbove dbHandle (chainPointSlot point)
               pure (clientIdle Indexing Origin (fromChainTip serverTip) n)
       }
-
--- | Take delivery of one pipelined response; if it has not arrived yet, commit
--- whatever has accumulated rather than sit on it. ADR-020 Decision 2, the /idle
--- flush/.
---
--- == Two separate decisions, and the one that matters is not ours
---
--- It is easy to read this as \"we flush every time 'pipelineDecisionMax' says
--- 'Collect'\". It is not. There are two decisions, taken by different parties at
--- different times:
---
---   1. WE decide, via 'pipelineDecisionMax', /that we will take delivery/ of a
---      response. That is the @Collect@ branch in 'clientIdle'. During bulk sync
---      it happens once per block (see the note on 'pipelineDecisionMax'), so
---      this function is CALLED once per block.
---
---   2. THE DRIVER then decides /which branch of the value we built here to run/,
---      by asking a completely different question: has the next response actually
---      arrived? We never see that question; we only supply both answers up front.
---
--- So being called is not flushing. The flush is on the branch taken only when
--- the answer to (2) is no.
---
--- == Which branch runs
---
--- @
--- CollectResponse (Just idleAction) next
---                       │            │
---    response NOT here ─┘            └─ response already buffered: the
---    run idleAction instead of          ordinary path, no flush
---    blocking
--- @
---
--- typed-protocols states the contract: \"Since presenting the first choice is
--- optional, this allows expressing both a blocking collect and a non-blocking
--- collect.\" Passing 'Nothing' means \"block until it arrives\"; passing 'Just'
--- means \"if it has not arrived, do this instead\".
---
--- == What an empty pipeline implies
---
--- Nothing buffered, with requests outstanding, means the node has given us
--- everything it currently has. Two ways to get there:
---
---   * __At the tip__ — the common case. We asked for the next block and it does
---     not exist yet. Outstanding requests sit near 1 rather than 50, because
---     'pipelineDecisionMax' stops pipelining past the server's tip. Every block
---     therefore commits on its own, and a query sees the chain as of the last
---     block instead of the last 'dbBatchSize' boundary.
---
---   * __Starved during bulk sync__ — the node failed to deliver even the oldest
---     of ~50 outstanding requests. Should be rare against a local node serving
---     from disk. If it is NOT rare, bulk sync degrades towards a commit per
---     block, which is the expensive end of the batch-size curve (41.7s versus
---     31.6s over @origin..2,000,000@). This is measured, not assumed — see the
---     verification task; until then treat the bulk-sync claim as unconfirmed.
---
--- 'flushBatch' is a no-op when nothing is pending, so an idle flush with no
--- written rows costs one 'IORef' read.
---
--- == Why the inner collect blocks
---
--- After flushing we hand back @CollectResponse Nothing next@ — the /blocking/
--- form. Returning another non-blocking collect would re-enter this on the next
--- pass, find the batch already empty, and spin. Flush once, then wait.
-collectFlushingWhenIdle
-  :: DbHandle
-  -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
-  -- ^ What to do with the response when it is (or once it is) here.
-  -> CSP.ClientPipelinedStIdle (S n) BlockInMode ChainPoint ChainTip IO ()
-collectFlushingWhenIdle dbHandle next =
-  CSP.CollectResponse
-    (Just (flushBatch dbHandle >> pure (CSP.CollectResponse Nothing next)))
-    next
 
 -- | The server tip as a 'WithOrigin' block number, for 'pipelineDecisionMax'.
 fromChainTip :: ChainTip -> WithOrigin BlockNo
