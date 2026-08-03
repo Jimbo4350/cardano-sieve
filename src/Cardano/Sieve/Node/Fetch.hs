@@ -308,19 +308,18 @@ sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _
 -- better than a bare 'Bool' at the roll-forward guard.
 data IndexState = IndexesPending | IndexesBuilt
 
--- | Which half of its life the bounded client is in.
+-- | Which half of its life 'boundedClient' is in.
 --
--- Not a 'Bool', for the same reason 'IndexState' is not: @clientNext True predN@
--- says nothing at the call site, and the flag has to be threaded through two
--- mutually recursive functions where every pass is a chance to invert it.
---
--- The two phases are genuinely different state machines rather than a toggle:
--- 'Indexing' consults 'pipelineDecisionMax' and writes what it receives;
--- 'Draining' issues no new requests and discards what arrives. The distinction
--- exists because @SendMsgDone@ is only legal with nothing in flight, so on
--- reaching @--until@ the client must keep collecting until the pipeline empties
--- before it may finish.
-data BoundedPhase = Indexing | Draining
+-- Two phases rather than one, because @SendMsgDone@ is only legal with nothing
+-- in flight: on reaching @--until@ the client is still owed the ~50 responses it
+-- pipelined ahead, and must collect them all before it may finish.
+data BoundedPhase
+  = -- | Before the bound: consult 'pipelineDecisionMax', request more, and write
+    -- what arrives.
+    Indexing
+  | -- | Past the bound: request nothing, discard what arrives, and finish once
+    -- the pipeline is empty.
+    Draining
 
 -- | A pipelined ChainSync client that finds its intersection at @since@ and
 -- then streams the chain forever, sieving each roll-forward and rewinding on
