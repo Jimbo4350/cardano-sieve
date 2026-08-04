@@ -192,20 +192,35 @@ if [ -n "$BASELINE_REF" ]; then
   printf 'BASE %-17s median %ss  max/min %s  [%s]\n' \
     "$BASELINE_REF" "$base_med" "$base_spread" "${base_times[*]}"
   echo
-  awk -v h="$head_med" -v b="$base_med" -v hs="$head_spread" -v bs="$base_spread" 'BEGIN{
-    d = h - b; p = (b > 0) ? 100*d/b : 0;
-    printf "delta  %+.2fs  (%+.1f%%)\n\n", d, p;
-    # A wide spread means the machine moved under us. Say so instead of dressing
-    # the noise up as a verdict.
-    if (hs > 1.25 || bs > 1.25) {
-      printf "INCONCLUSIVE: samples are too spread (max/min %.2f head, %.2f base).\n", hs, bs;
-      print  "              Something else was using the machine. Check that the node";
-      print  "              has finished its own sync (syncProgress 100.00) and that no";
-      print  "              build is running, then re-run.";
-    }
-    else if (p <= 3)  print "VERDICT: no measurable cost. The peek stays quiet during bulk sync.";
-    else if (p <= 10) print "VERDICT: small but real cost. Worth a second look at how often the peek fires.";
-    else              print "VERDICT: flush-on-idle IS firing during bulk sync. It needs a floor\n         (e.g. only flush on idle when pending rows exceed some minimum).";
+  # Judge the PAIRED difference, not the absolute times.
+  #
+  # This box is shared with a desktop and a cardano-node, so absolute run times
+  # wander — observed medians of 32.5s and 37.4s for the same two binaries
+  # fifteen minutes apart. Gating on absolute spread therefore reports
+  # INCONCLUSIVE forever, which it did. Each round runs both variants
+  # back-to-back, so head_i - base_i cancels whatever the machine was doing at
+  # the time, and it is the scatter of THOSE that says whether the answer is
+  # trustworthy.
+  deltas=()
+  for i in $(seq 0 $((RUNS - 1))); do
+    deltas+=("$(awk -v a="${head_times[$i]}" -v b="${base_times[$i]}" 'BEGIN{printf "%.2f", a-b}')")
+  done
+  delta_med=$(printf '%s\n' "${deltas[@]}" | median)
+  printf 'paired deltas (head - base)  [%s]  median %+.2fs\n\n' "${deltas[*]}" "$delta_med"
+
+  awk -v dm="$delta_med" -v b="$base_med" -v n="$RUNS" \
+    -v ds="$(printf '%s\n' "${deltas[@]}" | tr '\n' ' ')" 'BEGIN{
+    p = (b > 0) ? 100*dm/b : 0;
+    # How many paired rounds favoured each variant. Splitting near half and half
+    # is what "no difference" looks like; a consistent sign is a real effect.
+    split(ds, d, " "); pos = 0; tot = 0;
+    for (i in d) { if (d[i] != "") { tot++; if (d[i] > 0) pos++ } }
+    printf "median paired delta  %+.2fs  (%+.1f%% of base)   %d/%d rounds slower\n\n", dm, p, pos, tot;
+    if (p > 10)      print "VERDICT: flush-on-idle IS firing during bulk sync. It needs a floor\n         (e.g. only flush on idle when pending rows exceed some minimum).";
+    else if (p > 3)  print "VERDICT: small but real cost. Worth a second look at how often the peek fires.";
+    else if (pos == tot || pos == 0)
+                     printf "VERDICT: delta is small (%+.1f%%) but every round agreed in sign.\n         Probably real, probably not worth acting on. Re-run to confirm.\n", p;
+    else             print "VERDICT: no measurable cost. Rounds disagree on sign, so the difference\n         is noise, not the peek firing.";
   }'
 fi
 
