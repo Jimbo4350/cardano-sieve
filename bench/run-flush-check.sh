@@ -144,16 +144,7 @@ one_run() { # $1 = binary, $2 = label; prints wall seconds
 
 median() { sort -n | awk '{a[NR]=$1} END{print (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
 
-measure() { # $1 = binary, $2 = name; prints "median|all"
-  local i t all=()
-  for i in $(seq 1 "$WARMUP"); do
-    t=$(one_run "$1" "$2-warmup-$i"); log "  $2 warmup $i: ${t}s (discarded)"
-  done
-  for i in $(seq 1 "$RUNS"); do
-    t=$(one_run "$1" "$2-$i"); all+=("$t"); log "  $2 run $i: ${t}s"
-  done
-  printf '%s|%s' "$(printf '%s\n' "${all[@]}" | median)" "${all[*]}"
-}
+spread() { sort -n | awk '{a[NR]=$1} END{ printf "%.2f", (a[1] > 0) ? a[NR]/a[1] : 0 }'; }
 
 # ---- run ------------------------------------------------------------------
 
@@ -165,24 +156,54 @@ if [ -n "$BASELINE_REF" ]; then
   base_bin=$(build_at "$BASELINE_REF")
 fi
 
-log "measuring HEAD (flush-on-idle)"
-head_res=$(measure "$head_bin" head)
-head_med=${head_res%%|*}
+# INTERLEAVED, not variant-by-variant. Running all of A then all of B charges any
+# drift in machine conditions to whichever variant happened to be running at the
+# time — which is exactly what went wrong the first time this script produced a
+# number: the node finished its own chain catch-up partway through the baseline
+# block, and three of its five runs landed at 53-63s against 34s for the other
+# two. Alternating spreads that kind of drift across both variants instead.
+head_times=(); base_times=()
+
+for i in $(seq 1 "$WARMUP"); do
+  t=$(one_run "$head_bin" "head-warmup-$i"); log "  warmup $i head: ${t}s (discarded)"
+  if [ -n "$BASELINE_REF" ]; then
+    t=$(one_run "$base_bin" "base-warmup-$i"); log "  warmup $i base: ${t}s (discarded)"
+  fi
+done
+
+for i in $(seq 1 "$RUNS"); do
+  t=$(one_run "$head_bin" "head-$i"); head_times+=("$t"); log "  round $i  head: ${t}s"
+  if [ -n "$BASELINE_REF" ]; then
+    t=$(one_run "$base_bin" "base-$i"); base_times+=("$t"); log "  round $i  base: ${t}s"
+  fi
+done
+
+head_med=$(printf '%s\n' "${head_times[@]}" | median)
+head_spread=$(printf '%s\n' "${head_times[@]}" | spread)
 
 echo
 echo "================ RESULT ================"
-printf 'HEAD (flush-on-idle)   median %ss   [%s]\n' "$head_med" "${head_res#*|}"
+printf 'HEAD (flush-on-idle)   median %ss  max/min %s  [%s]\n' \
+  "$head_med" "$head_spread" "${head_times[*]}"
 
 if [ -n "$BASELINE_REF" ]; then
-  log "measuring baseline $BASELINE_REF (count cap only)"
-  base_res=$(measure "$base_bin" base)
-  base_med=${base_res%%|*}
-  printf 'BASE %-17s median %ss   [%s]\n' "$BASELINE_REF" "$base_med" "${base_res#*|}"
+  base_med=$(printf '%s\n' "${base_times[@]}" | median)
+  base_spread=$(printf '%s\n' "${base_times[@]}" | spread)
+  printf 'BASE %-17s median %ss  max/min %s  [%s]\n' \
+    "$BASELINE_REF" "$base_med" "$base_spread" "${base_times[*]}"
   echo
-  awk -v h="$head_med" -v b="$base_med" 'BEGIN{
+  awk -v h="$head_med" -v b="$base_med" -v hs="$head_spread" -v bs="$base_spread" 'BEGIN{
     d = h - b; p = (b > 0) ? 100*d/b : 0;
     printf "delta  %+.2fs  (%+.1f%%)\n\n", d, p;
-    if (p <= 3)       print "VERDICT: no measurable cost. The peek stays quiet during bulk sync.";
+    # A wide spread means the machine moved under us. Say so instead of dressing
+    # the noise up as a verdict.
+    if (hs > 1.25 || bs > 1.25) {
+      printf "INCONCLUSIVE: samples are too spread (max/min %.2f head, %.2f base).\n", hs, bs;
+      print  "              Something else was using the machine. Check that the node";
+      print  "              has finished its own sync (syncProgress 100.00) and that no";
+      print  "              build is running, then re-run.";
+    }
+    else if (p <= 3)  print "VERDICT: no measurable cost. The peek stays quiet during bulk sync.";
     else if (p <= 10) print "VERDICT: small but real cost. Worth a second look at how often the peek fires.";
     else              print "VERDICT: flush-on-idle IS firing during bulk sync. It needs a floor\n         (e.g. only flush on idle when pending rows exceed some minimum).";
   }'
