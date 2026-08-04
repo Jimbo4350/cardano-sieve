@@ -44,7 +44,10 @@ WORK="${WORK:-$(mktemp -d)}"
 # 907cb3c is the commit immediately before flush-on-idle (a3ea66f).
 BASELINE_REF="${BASELINE_REF-907cb3c}"
 
-log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+# To stderr, not stdout: 'measure' below is consumed by command substitution, so
+# anything log() writes to stdout ends up inside the result string instead of on
+# the terminal. (It did, on the first run — the reported median was a timestamp.)
+log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # ---- preflight ------------------------------------------------------------
 
@@ -93,10 +96,26 @@ build_at() { # $1 = git ref or "HEAD"; prints a binary path
     # Untracked but required: without it the source-repository-package pin does
     # not resolve and the worktree will not build.
     [ -f "$REPO_ROOT/cabal.project.local" ] && cp "$REPO_ROOT/cabal.project.local" "$dir/"
-    ( cd "$dir" && cabal build exe:cardano-sieve -j4 >/dev/null 2>&1 )
-    cp "$(cd "$dir" && cabal list-bin exe:cardano-sieve)" "$out"
+    # The SRP is pinned to a commit that is NOT reachable from the upstream
+    # default branch, so a fresh clone cannot fetch it ("Could not parse object
+    # f202918f..."). The parent tree already holds a clone containing it; reuse
+    # that rather than going to the network.
+    if [ -d "$REPO_ROOT/dist-newstyle/src" ]; then
+      mkdir -p "$dir/dist-newstyle"
+      cp -r "$REPO_ROOT/dist-newstyle/src" "$dir/dist-newstyle/"
+    fi
+    ( cd "$dir" && cabal build exe:cardano-sieve -j4 >"$WORK/build-$ref.log" 2>&1 ) || {
+      echo "FATAL: baseline $ref failed to build; see $WORK/build-$ref.log" >&2
+      tail -20 "$WORK/build-$ref.log" >&2
+      exit 1
+    }
+    local bin
+    bin="$(cd "$dir" && cabal list-bin exe:cardano-sieve 2>/dev/null || true)"
+    [ -x "$bin" ] || { echo "FATAL: no baseline binary for $ref" >&2; exit 1; }
+    cp "$bin" "$out"
     git -C "$REPO_ROOT" worktree remove --force "$dir"
   fi
+  [ -x "$out" ] || { echo "FATAL: no binary built for $ref" >&2; exit 1; }
   echo "$out"
 }
 
@@ -109,8 +128,17 @@ one_run() { # $1 = binary, $2 = label; prints wall seconds
   t0=$(date +%s.%N)
   "$1" --socket-path "$NODE_SOCKET" --testnet-magic "$TESTNET_MAGIC" \
     --database "$db" --since origin --until "$UNTIL_SLOT" \
-    >"$WORK/$2.log" 2>&1
+    >"$WORK/$2.log" 2>&1 || {
+    echo "FATAL: sync failed ($2); see $WORK/$2.log" >&2
+    tail -5 "$WORK/$2.log" >&2
+    exit 1
+  }
   t1=$(date +%s.%N)
+  # A run that indexed nothing is not a fast run, it is a broken one.
+  grep -q "sync done" "$WORK/$2.log" || {
+    echo "FATAL: $2 produced no 'sync done' line; see $WORK/$2.log" >&2
+    exit 1
+  }
   echo "$t1 $t0" | awk '{printf "%.2f", $1-$2}'
 }
 
