@@ -183,13 +183,13 @@ head_spread=$(printf '%s\n' "${head_times[@]}" | spread)
 
 echo
 echo "================ RESULT ================"
-printf 'HEAD (flush-on-idle)   median %ss  max/min %s  [%s]\n' \
+printf 'HEAD  %-19s median %ss  max/min %s  [%s]\n' "$(git -C "$REPO_ROOT" log --format=%h -1)" \
   "$head_med" "$head_spread" "${head_times[*]}"
 
 if [ -n "$BASELINE_REF" ]; then
   base_med=$(printf '%s\n' "${base_times[@]}" | median)
   base_spread=$(printf '%s\n' "${base_times[@]}" | spread)
-  printf 'BASE %-17s median %ss  max/min %s  [%s]\n' \
+  printf 'BASE  %-19s median %ss  max/min %s  [%s]\n' \
     "$BASELINE_REF" "$base_med" "$base_spread" "${base_times[*]}"
   echo
   # Judge the PAIRED difference, not the absolute times.
