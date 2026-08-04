@@ -41,18 +41,29 @@ module Cardano.Sieve.Node.Insert
   , installIndexes
   , busyTimeoutMs
   , flushBatch
+  , reconcileSelectors
+  , SelectorMismatch (..)
+  , StoredSelectorUnparseable (..)
   )
 where
 
 import Cardano.Sieve.Schema (createSchema, installDeferredIndexes)
+import Cardano.Sieve.Selector
+  ( BootstrapFilter (IncludeBootstrap)
+  , Selector (SelectAll)
+  , selectorFromText
+  , selectorToText
+  )
 
-import Control.Exception (bracket, onException)
+import Control.Exception (Exception, bracket, onException, throwIO)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import Data.List (sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Database.SQLite.Simple
   ( Connection
@@ -472,3 +483,102 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
       execute conn "DELETE FROM spends WHERE spent_slot > ?" (Only slot)
       execute conn "DELETE FROM outputs WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM blocks WHERE slot_no > ?" (Only slot)
+
+-- * Selector bookkeeping
+
+-- | The configured selectors do not match the ones this database was built with.
+--
+-- Fatal, deliberately, and in BOTH directions — which is worth spelling out
+-- because only one direction looks dangerous at first glance:
+--
+--   * __Removing__ a selector leaves the database with no /new/ data for it,
+--     while the rows it already produced stay. Queries for it silently miss
+--     recent matches.
+--   * __Adding__ one leaves the database with no /historical/ data for it.
+--     Queries for it silently miss old matches.
+--
+-- Both leave the database incomplete with respect to the patterns it claims to
+-- serve, and neither announces itself at query time — the result is simply
+-- short. kupo refuses both for the same reason, and repairs the add case by
+-- rolling the indexer back to re-index; sieve has no such mechanism, so it
+-- refuses and says what to do instead.
+data SelectorMismatch = SelectorMismatch
+  { smStored :: [Selector]
+  , smConfigured :: [Selector]
+  }
+
+instance Show SelectorMismatch where
+  show (SelectorMismatch stored configured) =
+    unlines
+      ( [ "this database was indexed with different selectors."
+        , ""
+        , "  stored:     " <> render stored
+        , "  configured: " <> render configured
+        , ""
+        , "Indexing on would leave it incomplete for the selectors it claims to"
+        , "serve: a removed selector stops gaining new matches, an added one has"
+        , "no history. Neither shows up at query time — results are just short."
+        , ""
+        , "Either use the stored selectors, or index into a fresh --database."
+        ]
+      )
+   where
+    render = \case
+      [] -> "(none)"
+      xs -> unwords (map show (sort (map selectorToText xs)))
+
+instance Exception SelectorMismatch
+
+-- | A row in @patterns@ that 'selectorFromText' cannot read back.
+--
+-- Only reachable through schema drift or a hand-edited database, since every row
+-- is written by 'selectorToText' and the pair round-trips. Fatal rather than
+-- skipped: a selector we cannot parse is one we cannot honour, and silently
+-- dropping it would turn this check into a way to LOSE a selector.
+newtype StoredSelectorUnparseable = StoredSelectorUnparseable Text
+
+instance Show StoredSelectorUnparseable where
+  show (StoredSelectorUnparseable t) =
+    "patterns table holds a selector this build cannot parse: " <> show t
+
+instance Exception StoredSelectorUnparseable
+
+-- | Reconcile the selectors given on the command line against the ones this
+-- database was indexed with, and return the set to index with.
+--
+-- First run writes the configured set and returns it. Later runs must match it
+-- exactly or throw 'SelectorMismatch'. Passing none adopts what is stored, which
+-- is what lets a restart carry on without repeating every @--select@.
+--
+-- Runs inside the caller's transaction discipline: it commits nothing itself,
+-- and the write it may perform is picked up by the next 'flushBatch'.
+reconcileSelectors :: DbHandle -> [Selector] -> IO [Selector]
+reconcileSelectors DbHandle{dbConn = conn} configured = do
+  rows <- query_ conn "SELECT selector FROM patterns"
+  stored <- traverse parseStored [t | Only t <- rows]
+  case (stored, configured) of
+    -- Nothing stored and nothing asked for: match everything, and record that,
+    -- so the next run adopts it rather than re-deciding. The default lives here
+    -- rather than in the option parser because it is a value that has to be
+    -- PERSISTED, and this is the only place that both chooses and writes it.
+    ([], []) -> defaulted <$ mapM_ insertSelector defaulted
+    ([], _) -> configured <$ mapM_ insertSelector configured
+    -- Asked for nothing, so use what the database was built with. This is what
+    -- makes a bare restart work without repeating every --select.
+    (_, []) -> pure stored
+    _
+      -- Compared on the canonical text, not the ADT: that text is what the table
+      -- actually holds, 'Selector' has no 'Ord', and the codec round-trips, so
+      -- text equality and selector equality are the same question.
+      | Set.fromList (map selectorToText stored)
+          == Set.fromList (map selectorToText configured) ->
+          pure stored
+      | otherwise -> throwIO (SelectorMismatch stored configured)
+ where
+  defaulted = [SelectAll IncludeBootstrap]
+  parseStored t = either (const (throwIO (StoredSelectorUnparseable t))) pure (selectorFromText t)
+  insertSelector s =
+    execute
+      conn
+      "INSERT OR IGNORE INTO patterns (selector) VALUES (?)"
+      (Only (selectorToText s))

@@ -35,11 +35,7 @@ import Cardano.Sieve.Node.Insert
   , installIndexes
   , openDatabase
   )
-import Cardano.Sieve.Selector
-  ( BootstrapFilter (IncludeBootstrap)
-  , Selector (SelectAll)
-  , selectorFromText
-  )
+import Cardano.Sieve.Selector (Selector, selectorFromText)
 import Cardano.Slotting.Slot (SlotNo (SlotNo))
 
 import Control.Applicative (many, optional)
@@ -122,8 +118,9 @@ data SyncOptions = SyncOptions
   , syBatchSize :: Int
   -- ^ Commit to SQLite every this many written rows.
   , sySelectors :: [Selector]
-  -- ^ Selectors to sieve outputs against; never empty (an omitted @--select@
-  -- becomes the wildcard).
+  -- ^ Selectors to sieve outputs against, exactly as given. Empty means none
+  -- were specified, which 'reconcileSelectors' reads as "use the database's
+  -- own", falling back to the wildcard only when it has none either.
   , sySince :: ChainPoint
   -- ^ Chain point to start indexing from (@--since@); 'ChainPointAtGenesis' when
   -- omitted.
@@ -247,11 +244,12 @@ invocationOf raw =
         { syNode = node
         , syNetwork = network
         , syBatchSize = rawBatchSize raw
-        , -- Match every output when no --select is given, so the full
-          -- decode → sieve → write path is still exercised out of the box.
-          sySelectors = case rawSelectors raw of
-            [] -> [SelectAll IncludeBootstrap]
-            xs -> xs
+        , -- Passed through EMPTY when no --select is given, rather than
+          -- defaulted to the wildcard here. Empty has to survive as far as
+          -- 'reconcileSelectors', because there it means "adopt whatever this
+          -- database was built with" — defaulting first turns a plain restart
+          -- into a selector conflict against every non-wildcard database.
+          sySelectors = rawSelectors raw
         , sySince = rawSincePoint raw
         , syUntil = rawUntilSlot raw
         , syRedeemers = if rawWithRedeemers raw then CaptureRedeemers else SkipRedeemers

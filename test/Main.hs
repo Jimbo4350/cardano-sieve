@@ -41,11 +41,13 @@ import Cardano.Api
   )
 
 import Cardano.Sieve.Node.Insert
-  ( SpentInput (..)
+  ( SelectorMismatch
+  , SpentInput (..)
   , StoredOutput (..)
   , applyBlock
   , closeDatabase
   , openDatabase
+  , reconcileSelectors
   , rollbackAbove
   )
 import Cardano.Sieve.Selector
@@ -62,7 +64,7 @@ import Cardano.Sieve.Selector
   , selectorToText
   )
 
-import Control.Exception (bracket, bracket_)
+import Control.Exception (bracket, bracket_, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -87,7 +89,7 @@ import Hedgehog (Gen, Property, failure, forAll, property, success, (===))
 import Hedgehog.Gen qualified as Gen
 import Hedgehog.Range qualified as Range
 import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.HUnit (testCase, (@?=))
+import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Test.Tasty.Hedgehog (testProperty)
 
 main :: IO ()
@@ -103,7 +105,57 @@ tests =
     , parserPropertyTests
     , matcherPropertyTests
     , rollbackTests
+    , selectorPersistenceTests
     ]
+
+-- ----------------------------------------------------------------------------
+-- Selector persistence
+-- ----------------------------------------------------------------------------
+
+-- | What a database was indexed with is part of what it means. Indexing on with
+-- a different set leaves it incomplete for the selectors it claims to serve, in
+-- one direction or the other, and nothing says so at query time.
+selectorPersistenceTests :: TestTree
+selectorPersistenceTests =
+  testGroup
+    "selector reconciliation"
+    [ testCase "an empty database adopts and stores what was configured" $
+        withTempDb "sel-first" $ \path ->
+          withDb path $ \db -> do
+            got <- reconcileSelectors db [payment]
+            got @?= [payment]
+            again <- reconcileSelectors db [payment]
+            again @?= [payment]
+    , testCase "configuring nothing adopts what is stored" $
+        withTempDb "sel-adopt" $ \path ->
+          withDb path $ \db -> do
+            _ <- reconcileSelectors db [payment]
+            got <- reconcileSelectors db []
+            got @?= [payment]
+    , testCase "a different selector is refused" $
+        withTempDb "sel-conflict" $ \path ->
+          withDb path $ \db -> do
+            _ <- reconcileSelectors db [payment]
+            outcome <- try (reconcileSelectors db [SelectAll IncludeBootstrap])
+            case outcome :: Either SelectorMismatch [Selector] of
+              Left _ -> pure ()
+              Right s -> assertFailure ("expected a mismatch, indexed " <> show s)
+    , testCase "order does not count as a difference" $
+        withTempDb "sel-order" $ \path ->
+          withDb path $ \db -> do
+            _ <- reconcileSelectors db [payment, delegation]
+            got <- reconcileSelectors db [delegation, payment]
+            length got @?= 2
+    , testCase "nothing stored and nothing configured means the wildcard" $
+        withTempDb "sel-default" $ \path ->
+          withDb path $ \db -> do
+            got <- reconcileSelectors db []
+            got @?= [SelectAll IncludeBootstrap]
+    ]
+ where
+  payment = SelectPayment (fromMaybe (error "bad hash") (credentialHashFromBytes payBytes))
+  delegation = SelectDelegation (fromMaybe (error "bad hash") (credentialHashFromBytes stakeBytes))
+  withDb path = bracket (openDatabase path 1) closeDatabase
 
 -- ----------------------------------------------------------------------------
 -- Rollback

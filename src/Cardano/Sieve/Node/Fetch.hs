@@ -54,9 +54,10 @@ import Cardano.Sieve.Node.Insert
   , closeDatabase
   , flushBatch
   , openDatabase
+  , reconcileSelectors
   , rollbackAbove
   )
-import Cardano.Sieve.Selector (Selector)
+import Cardano.Sieve.Selector (Selector, selectorToText)
 import Cardano.Slotting.Slot (SlotNo, WithOrigin (At, Origin), unSlotNo)
 import Ouroboros.Network.Protocol.ChainSync.ClientPipelined qualified as CSP
 import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
@@ -69,6 +70,7 @@ import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (intercalate)
+import Data.Text qualified as T
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Time.LocalTime (getCurrentTimeZone, utcToLocalTime)
@@ -95,7 +97,8 @@ fetch socketPath networkId dbPath batchSize capture selectors since =
     networkId
     dbPath
     batchSize
-    (\dbHandle progress -> followingClient dbHandle progress capture selectors since)
+    selectors
+    (\dbHandle progress active -> followingClient dbHandle progress capture active since)
 
 -- | As 'fetch', but index only from @since@ up to and including @untilSlot@,
 -- then stop. For bounded backfills and benchmark runs.
@@ -115,7 +118,8 @@ fetchBounded socketPath networkId dbPath batchSize capture selectors since until
     networkId
     dbPath
     batchSize
-    (\dbHandle progress -> boundedClient dbHandle progress capture selectors since untilSlot)
+    selectors
+    (\dbHandle progress active -> boundedClient dbHandle progress capture active since untilSlot)
 
 -- | Open the database, connect to the local node, and drive the given
 -- pipelined ChainSync client, flushing the database on exit. The bounded and
@@ -130,16 +134,22 @@ runSync
   -> NetworkId
   -> FilePath
   -> Int
+  -> [Selector]
   -> ( DbHandle
        -> IORef Progress
+       -> [Selector]
        -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
      )
   -> IO ()
-runSync socketPath networkId dbPath batchSize mkClient =
+runSync socketPath networkId dbPath batchSize configured mkClient =
   bracket
     (openDatabase dbPath batchSize)
     closeDatabase
     ( \dbHandle -> do
+        -- Before a single block is fetched: refuse to index into a database that
+        -- was built with different selectors, and adopt its stored set when none
+        -- were given. Throws 'SelectorMismatch', which is fatal by design.
+        selectors <- reconcileSelectors dbHandle configured
         progress <- newProgress
         stamped
           ( "sync starting  db "
@@ -150,7 +160,8 @@ runSync socketPath networkId dbPath batchSize mkClient =
               <> duration heartbeatSeconds
               <> ")"
           )
-        connectToLocalNode connectInfo (protocols dbHandle progress)
+        stamped ("indexing selectors: " <> describeSelectors selectors)
+        connectToLocalNode connectInfo (protocols dbHandle progress selectors)
         summarise progress
     )
  where
@@ -168,10 +179,10 @@ runSync socketPath networkId dbPath batchSize mkClient =
       , localNodeSocketPath = socketPath
       }
 
-  protocols :: DbHandle -> IORef Progress -> LocalNodeClientProtocolsInMode
-  protocols dbHandle progress =
+  protocols :: DbHandle -> IORef Progress -> [Selector] -> LocalNodeClientProtocolsInMode
+  protocols dbHandle progress selectors =
     LocalNodeClientProtocols
-      { localChainSyncClient = LocalChainSyncClientPipelined (mkClient dbHandle progress)
+      { localChainSyncClient = LocalChainSyncClientPipelined (mkClient dbHandle progress selectors)
       , localTxSubmissionClient = Nothing
       , localStateQueryClient = Nothing
       , localTxMonitoringClient = Nothing
@@ -335,6 +346,16 @@ stamped msg = do
   now <- getCurrentTime
   tz <- getCurrentTimeZone
   putStrLn (formatTime defaultTimeLocale "%H:%M:%S" (utcToLocalTime tz now) <> "  " <> msg)
+
+-- | The selector set for the startup line.
+--
+-- Worth printing because the set is no longer necessarily the one on the command
+-- line: an invocation with no @--select@ adopts whatever the database was built
+-- with, so this is the only place the actual answer appears.
+describeSelectors :: [Selector] -> String
+describeSelectors = \case
+  [] -> "none (nothing will be indexed)"
+  xs -> intercalate ", " (map (T.unpack . selectorToText) xs)
 
 -- | Seconds as a compact human duration: @45s@, @6m12s@, @2h04m@.
 duration :: Double -> String
