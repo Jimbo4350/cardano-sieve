@@ -180,10 +180,26 @@ data DbHandle = DbHandle
   -- flag: 0 = no transaction open).
   , dbPolicyNums :: IORef (Map ByteString Int64)
   -- ^ Write-through cache of the @policy_ids@ dictionary: policy hash →
-  -- surrogate. Bounded by the number of distinct policies the chain has ever
-  -- minted under (1,613 on preview to slot 4,000,000), so after a brief warm-up
-  -- every asset row resolves its surrogate from memory and the ingest path pays
-  -- no extra SQLite round trip. Populated lazily by 'policyNumOf'.
+  -- surrogate. Populated lazily by 'policyNumOf'.
+  --
+  -- __Worth 16% of bulk sync, measured.__ Deleting it and letting every asset
+  -- row hit @policy_ids@ directly cost +6.04s median on @origin..2,000,000@
+  -- (43.5s against 37.6s, 5 of 5 interleaved rounds slower —
+  -- @bench\/run-flush-check.sh@, 2026-08-04). What it avoids is not a \"round
+  -- trip\" — @sqlite-simple@ is in-process — but SQL /compilation/: @query@ and
+  -- @execute@ parse and plan their statement on every call, and there is one
+  -- @INSERT OR IGNORE@ plus one @SELECT@ per asset row. At ~3,000,000
+  -- @policies@ rows over a 4,000,000-slot sync that is ~6,000,000 statement
+  -- compilations against 1,613 'Map' lookups, because the chain has only ever
+  -- minted under that many distinct policies. The cache is bounded by that
+  -- count, not by the row count.
+  --
+  -- The honest cost of keeping it: application-level memoisation living in a
+  -- handle that otherwise models only the SQLite session, and a constraint
+  -- pushed back into 'rollbackAbove' (@policy_ids@ must stay append-only or
+  -- this goes stale). A held-open prepared statement would fix the layering and
+  -- recover the compilation cost, but not the per-row index probe, so it would
+  -- not recover all 16%.
   }
 
 -- | Open the database, prepare it (pragmas + schema) and return a batched

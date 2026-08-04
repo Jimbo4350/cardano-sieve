@@ -216,11 +216,15 @@ if [ -n "$BASELINE_REF" ]; then
     split(ds, d, " "); pos = 0; tot = 0;
     for (i in d) { if (d[i] != "") { tot++; if (d[i] > 0) pos++ } }
     printf "median paired delta  %+.2fs  (%+.1f%% of base)   %d/%d rounds slower\n\n", dm, p, pos, tot;
-    if (p > 10)      print "VERDICT: flush-on-idle IS firing during bulk sync. It needs a floor\n         (e.g. only flush on idle when pending rows exceed some minimum).";
-    else if (p > 3)  print "VERDICT: small but real cost. Worth a second look at how often the peek fires.";
+    # Deliberately generic. This started as a flush-on-idle check and is now the
+    # A/B harness for any two commits (BASELINE_REF), so it must not name a
+    # cause it cannot know — it reports that HEAD is slower, not why.
+    if (p > 10)      printf "VERDICT: HEAD is %.1f%% SLOWER. That is a real regression, not noise.\n", p;
+    else if (p > 3)  printf "VERDICT: HEAD is %.1f%% slower. Small but likely real.\n", p;
+    else if (p < -10) printf "VERDICT: HEAD is %.1f%% FASTER. A real improvement.\n", -p;
     else if (pos == tot || pos == 0)
-                     printf "VERDICT: delta is small (%+.1f%%) but every round agreed in sign.\n         Probably real, probably not worth acting on. Re-run to confirm.\n", p;
-    else             print "VERDICT: no measurable cost. Rounds disagree on sign, so the difference\n         is noise, not the peek firing.";
+                     printf "VERDICT: delta is small (%+.1f%%) but every round agreed in sign,\n         so it is probably real and probably not worth acting on.\n", p;
+    else             print "VERDICT: no measurable difference. Rounds disagree on sign, so what\n         is left is noise.";
   }'
 fi
 
