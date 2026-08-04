@@ -41,7 +41,9 @@ import Cardano.Api
   , NetworkId
   , SocketPath
   , connectToLocalNode
+  , deserialiseFromRawBytes
   , getBlockHeader
+  , proxyToAsType
   , serialiseToRawBytes
   )
 
@@ -55,10 +57,11 @@ import Cardano.Sieve.Node.Insert
   , flushBatch
   , openDatabase
   , reconcileSelectors
+  , resumePoints
   , rollbackAbove
   )
 import Cardano.Sieve.Selector (Selector, selectorToText)
-import Cardano.Slotting.Slot (SlotNo, WithOrigin (At, Origin), unSlotNo)
+import Cardano.Slotting.Slot (SlotNo (SlotNo), WithOrigin (At, Origin), unSlotNo)
 import Ouroboros.Network.Protocol.ChainSync.ClientPipelined qualified as CSP
 import Ouroboros.Network.Protocol.ChainSync.PipelineDecision
   ( PipelineDecision (Collect)
@@ -70,6 +73,7 @@ import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (intercalate)
+import Data.Proxy (Proxy (Proxy))
 import Data.Text qualified as T
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
@@ -583,17 +587,21 @@ followingClient
 followingClient dbHandle progress capture selectors since =
   CSP.ChainSyncClientPipelined $ do
     built <- newIORef IndexesPending
-    pure (clientIntersect built)
+    points <- startPoints dbHandle since
+    pure (clientIntersect built points)
  where
   maxInFlight :: Word16
   maxInFlight = 50
 
-  clientIntersect built =
-    CSP.SendMsgFindIntersect [since] $
+  clientIntersect built points =
+    CSP.SendMsgFindIntersect points $
       CSP.ClientPipelinedStIntersect
-        { CSP.recvMsgIntersectFound = \_point serverTip ->
+        { CSP.recvMsgIntersectFound = \point serverTip -> do
+            stamped ("resuming from " <> describePoint point)
             pure (clientIdle built Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
+            -- Only reachable for an explicit --since, since the resume ladder
+            -- always ends at genesis, which every chain has.
             fail ("--since point not on the node's chain: " <> show since)
         }
 
@@ -662,15 +670,19 @@ boundedClient
   -> SlotNo
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
 boundedClient dbHandle progress capture selectors since untilSlot =
-  CSP.ChainSyncClientPipelined (pure clientIntersect)
+  CSP.ChainSyncClientPipelined (clientIntersect <$> startPoints dbHandle since)
  where
   maxInFlight :: Word16
   maxInFlight = 50
 
-  clientIntersect =
-    CSP.SendMsgFindIntersect [since] $
+  -- Resumes exactly as 'followingClient' does. A bounded run is the one most
+  -- likely to be repeated with a larger --until, so re-reading the whole range
+  -- each time is the most wasteful place to skip this.
+  clientIntersect points =
+    CSP.SendMsgFindIntersect points $
       CSP.ClientPipelinedStIntersect
-        { CSP.recvMsgIntersectFound = \_point serverTip ->
+        { CSP.recvMsgIntersectFound = \point serverTip -> do
+            stamped ("resuming from " <> describePoint point)
             pure (clientIdle Indexing Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             fail ("--since point not on the node's chain: " <> show since)
@@ -748,3 +760,47 @@ chainPointSlot :: ChainPoint -> Maybe Int64
 chainPointSlot = \case
   ChainPointAtGenesis -> Nothing
   ChainPoint slotNo _hash -> Just (fromIntegral (unSlotNo slotNo))
+
+-- | The points to offer @MsgFindIntersect@ at startup.
+--
+-- An explicit @--since@ is taken literally — asking for a specific point and
+-- silently getting a different one would be worse than failing.
+--
+-- Otherwise this is a resume: offer the stored checkpoints newest-first, then
+-- genesis as the last resort. Before this existed the client always intersected
+-- at genesis, so restarting an indexer without @--since@ re-read the entire
+-- chain to rediscover data it already had.
+--
+-- Genesis is always appended, which is what makes 'recvMsgIntersectNotFound'
+-- unreachable on the resume path: every chain contains it, so the node always
+-- finds something.
+startPoints :: DbHandle -> ChainPoint -> IO [ChainPoint]
+startPoints dbHandle since = case since of
+  ChainPoint{} -> pure [since]
+  ChainPointAtGenesis -> do
+    stored <- resumePoints dbHandle
+    case (stored, traverse toChainPoint stored) of
+      ([], _) -> pure [ChainPointAtGenesis]
+      (newest : _, Just points) -> do
+        stamped
+          ( "resuming: offering "
+              <> show (length points)
+              <> " checkpoint(s), newest slot "
+              <> commas (fst newest)
+          )
+        pure (points <> [ChainPointAtGenesis])
+      -- A header hash the current build cannot read means the row is not one we
+      -- wrote. Start over rather than guess at it.
+      (_, Nothing) -> do
+        stamped "checkpoints unreadable — starting from genesis"
+        pure [ChainPointAtGenesis]
+ where
+  toChainPoint (slot, hash) =
+    ChainPoint (SlotNo (fromIntegral slot))
+      <$> either (const Nothing) Just (deserialiseFromRawBytes (proxyToAsType Proxy) hash)
+
+-- | A chain point for the log line.
+describePoint :: ChainPoint -> String
+describePoint = \case
+  ChainPointAtGenesis -> "genesis"
+  ChainPoint slot _ -> "slot " <> commas (unSlotNo slot)

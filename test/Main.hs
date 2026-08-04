@@ -48,6 +48,7 @@ import Cardano.Sieve.Node.Insert
   , closeDatabase
   , openDatabase
   , reconcileSelectors
+  , resumePoints
   , rollbackAbove
   )
 import Cardano.Sieve.Selector
@@ -106,7 +107,56 @@ tests =
     , matcherPropertyTests
     , rollbackTests
     , selectorPersistenceTests
+    , checkpointTests
     ]
+
+-- ----------------------------------------------------------------------------
+-- Checkpoints
+-- ----------------------------------------------------------------------------
+
+-- | Checkpoints are what a restart intersects on. They must follow rollbacks
+-- exactly: a checkpoint above the rollback point names a block no longer on our
+-- chain, and offering it to the node would resume from a fork.
+checkpointTests :: TestTree
+checkpointTests =
+  testGroup
+    "checkpoints"
+    [ testCase "an applied block leaves a checkpoint" $
+        withTempDb "cp-write" $ \path -> do
+          withDb path $ \db ->
+            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+          n <- withConnection path $ \conn -> count conn "SELECT count(*) FROM checkpoints"
+          n @?= 1
+    , testCase "a rollback drops the checkpoints above it" $
+        withTempDb "cp-rollback" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db 200 (blockHash 200) [storedOutput outputRef2] [] mempty
+            rollbackAbove db (Just 150)
+          (n, top) <- withConnection path $ \conn ->
+            (,)
+              <$> count conn "SELECT count(*) FROM checkpoints"
+              <*> count conn "SELECT COALESCE(max(slot_no), 0) FROM checkpoints"
+          (n, top) @?= (1, 100)
+    , testCase "resume points come back newest first" $
+        withTempDb "cp-order" $ \path -> do
+          withDb path $ \db -> do
+            mapM_
+              (\sl -> applyBlock db sl (blockHash (fromIntegral sl)) [storedOutput outputRef] [] mempty)
+              [100, 200, 300]
+            points <- resumePoints db
+            map fst points @?= [300, 200, 100]
+    , testCase "no checkpoints means no resume points" $
+        withTempDb "cp-empty" $ \path ->
+          withDb path $ \db -> do
+            points <- resumePoints db
+            points @?= []
+    ]
+ where
+  outputRef = BS.replicate 32 2 <> BS.replicate 8 0
+  outputRef2 = BS.replicate 32 4 <> BS.replicate 8 0
+  blockHash n = BS.replicate 32 n
+  withDb path = bracket (openDatabase path 1) closeDatabase
 
 -- ----------------------------------------------------------------------------
 -- Selector persistence

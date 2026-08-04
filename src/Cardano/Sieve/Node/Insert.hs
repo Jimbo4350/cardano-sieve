@@ -42,6 +42,7 @@ module Cardano.Sieve.Node.Insert
   , busyTimeoutMs
   , flushBatch
   , reconcileSelectors
+  , resumePoints
   , SelectorMismatch (..)
   , StoredSelectorUnparseable (..)
   )
@@ -276,6 +277,19 @@ applyBlock
   preimages = do
     n <- readIORef pending
     when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
+    -- Where we are on the chain, for resuming after a restart. Written for every
+    -- APPLIED block rather than every block seen: the empty-block fast path above
+    -- returns before this, so a quiet stretch leaves no checkpoint and a resume
+    -- rewinds to the last block that actually mattered. Correct — replaying
+    -- blocks is idempotent, every insert here is OR IGNORE — and it keeps the
+    -- fast path free.
+    --
+    -- Rides the caller's open transaction, so the checkpoint and the rows it
+    -- vouches for commit together. Never one without the other.
+    execute
+      conn
+      "INSERT OR IGNORE INTO checkpoints (slot_no, header_hash) VALUES (?, ?)"
+      (slot, headerHash)
     unless (null created) $
       execute
         conn
@@ -466,6 +480,7 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
         , "DELETE FROM spends"
         , "DELETE FROM outputs"
         , "DELETE FROM blocks"
+        , "DELETE FROM checkpoints"
         ]
     Just slot -> do
       -- Restore first: the @spends@ rows about to be deleted are what identifies
@@ -499,6 +514,10 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
       execute conn "DELETE FROM spends WHERE spent_slot > ?" (Only slot)
       execute conn "DELETE FROM outputs WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM blocks WHERE slot_no > ?" (Only slot)
+      -- Must go with the rest: a checkpoint above the rollback point names a
+      -- block that is no longer on our chain, and offering it to the node on the
+      -- next restart would resume from a fork.
+      execute conn "DELETE FROM checkpoints WHERE slot_no > ?" (Only slot)
 
 -- * Selector bookkeeping
 
@@ -598,3 +617,46 @@ reconcileSelectors DbHandle{dbConn = conn} configured = do
       conn
       "INSERT OR IGNORE INTO patterns (selector) VALUES (?)"
       (Only (selectorToText s))
+
+-- * Resume
+
+-- | Points to offer the node when resuming, newest first.
+--
+-- @MsgFindIntersect@ takes a LIST and the node replies with the newest point it
+-- recognises, so this is not "where we stopped" but "everywhere we might
+-- plausibly rejoin". One point would be enough only if the node's chain still
+-- contained it; if the node rolled back past it while we were down, a single
+-- point fails to intersect and there is nothing to fall back to but genesis.
+--
+-- The spacing is exponential — newest, then 1, 2, 4, 8 … rows further back —
+-- so a shallow rollback rejoins within a block or two of where we stopped, and
+-- an implausibly deep one still finds something without carrying every
+-- checkpoint over the wire. kupo builds its ladder the same way.
+--
+-- Capped at 'resumePointCount' entries. Genesis is not included; the caller
+-- appends it as the last resort.
+resumePoints :: DbHandle -> IO [(Int64, ByteString)]
+resumePoints DbHandle{dbConn = conn} = do
+  rows <- query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC"
+  pure (withOldest rows (pick 0 1 rows))
+ where
+  -- Take row 0, then step 1, 2, 4, 8 … forward through the descending list.
+  pick _ _ [] = []
+  pick taken step (x : xs)
+    | taken >= resumePointCount = []
+    | otherwise = x : pick (taken + 1) (step * 2) (drop (step - 1) xs)
+
+  -- Always end on the oldest checkpoint we hold. The exponential steps overshoot
+  -- the end of the list, so without this the deepest point on offer is an
+  -- arbitrary one partway back, and anything older falls all the way to genesis
+  -- — re-reading the whole chain to recover from a rollback we had the data to
+  -- survive.
+  withOldest rows picked = case (reverse rows, reverse picked) of
+    (oldest : _, deepest : _) | fst oldest /= fst deepest -> picked <> [oldest]
+    _ -> picked
+
+-- | How many points to offer. Enough to span a deep rollback at exponential
+-- spacing (the 20th reaches ~500,000 checkpoints back) without making the
+-- intersect message large.
+resumePointCount :: Int
+resumePointCount = 20
