@@ -67,16 +67,12 @@ import Database.SQLite.Simple
   ( Connection
   , Only (Only)
   , Query
-  , Statement
   , close
-  , closeStatement
   , execute
   , execute_
-  , nextRow
   , open
-  , openStatement
+  , query
   , query_
-  , withBind
   , (:.) ((:.))
   )
 
@@ -180,25 +176,6 @@ data DbHandle = DbHandle
   -- ^ Outputs written into the open transaction but not yet committed; climbs
   -- to 'dbBatchSize', then a COMMIT resets it to 0 (also the open-transaction
   -- flag: 0 = no transaction open).
-  , dbPolicyInsert :: Statement
-  -- ^ Prepared @INSERT OR IGNORE INTO policy_ids@, held open for the life of
-  -- the handle.
-  , dbPolicySelect :: Statement
-  -- ^ Prepared @SELECT policy_num FROM policy_ids WHERE policy_id = ?@.
-  --
-  -- Both exist because 'query' and 'execute' parse and plan their SQL on EVERY
-  -- call, and 'policyNumOf' runs one of each per asset row — roughly 6,000,000
-  -- statement compilations over a 4,000,000-slot sync. Preparing once and
-  -- rebinding per row skips the compilation while still probing the index,
-  -- which is the part that has to happen.
-  --
-  -- This replaced an in-memory @Map@ of policy hash to surrogate. That was
-  -- faster still (deleting it outright cost 16.1% — 43.5s against 37.6s over
-  -- @origin..2,000,000@, 5 of 5 rounds), but it was application-level
-  -- memoisation inside a handle that models the SQLite session, and it forced
-  -- @policy_ids@ to stay append-only across rollbacks so it could not go stale.
-  -- A compiled statement is session state, so it belongs here, and it carries
-  -- no such constraint.
   }
 
 -- | Open the database, prepare it (pragmas + schema) and return a batched
@@ -217,9 +194,7 @@ openDatabase path batchSize = do
   -- leak the handle (the caller only gets to 'closeDatabase' a 'DbHandle' we return).
   prepare conn `onException` close conn
   pending <- newIORef 0
-  ins <- openStatement conn "INSERT OR IGNORE INTO policy_ids (policy_id) VALUES (?)"
-  sel <- openStatement conn "SELECT policy_num FROM policy_ids WHERE policy_id = ?"
-  pure (DbHandle conn (max 1 batchSize) pending ins sel)
+  pure (DbHandle conn (max 1 batchSize) pending)
 
 -- | Install the deferred secondary indexes on an already-open handle, committing
 -- the open batch first. Fired once on reaching the chain tip — bulk catch-up
@@ -237,9 +212,6 @@ installIndexes path = bracket (openDatabase path 1) closeDatabase buildIndexesOn
 closeDatabase :: DbHandle -> IO ()
 closeDatabase db = do
   flushBatch db
-  -- Before 'close': SQLite refuses to close a connection with live statements.
-  closeStatement (dbPolicyInsert db)
-  closeStatement (dbPolicySelect db)
   close (dbConn db)
 
 -- | Ready a freshly-opened connection for batched writes: set the session
@@ -296,8 +268,6 @@ applyBlock
     { dbConn = conn
     , dbBatchSize = batchSize
     , dbUncommittedRows = pending
-    , dbPolicyInsert = policyIns
-    , dbPolicySelect = policySel
     }
   slot
   headerHash
@@ -311,7 +281,7 @@ applyBlock
         conn
         "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
         (slot, headerHash)
-    mapM_ (insertOutput conn policyIns policySel slot) created
+    mapM_ (insertOutput conn slot) created
     mapM_ (recordSpend conn slot) spent
     -- Preimages are gathered from the WHOLE block, so gate them on the block
     -- being relevant to the configured selectors — otherwise a narrow selector
@@ -334,8 +304,8 @@ applyBlock
 
 -- | Write one matched output. @outputs@ is inserted before @policies@ so the
 -- foreign key is satisfied within the transaction.
-insertOutput :: Connection -> Statement -> Statement -> Int64 -> StoredOutput -> IO ()
-insertOutput conn policyIns policySel slot o = do
+insertOutput :: Connection -> Int64 -> StoredOutput -> IO ()
+insertOutput conn slot o = do
   execute
     conn
     "INSERT OR IGNORE INTO outputs \
@@ -368,7 +338,7 @@ insertOutput conn policyIns policySel slot o = do
     )
   mapM_
     ( \(pid, name) -> do
-        num <- policyNumOf policyIns policySel pid
+        num <- policyNumOf conn pid
         execute
           conn
           "INSERT OR IGNORE INTO policies (output_reference, policy_num, asset_name, created_slot) \
@@ -380,21 +350,48 @@ insertOutput conn policyIns policySel slot o = do
 -- | Resolve a policy hash to its @policy_ids@ surrogate, inserting the
 -- dictionary row the first time that policy is seen.
 --
--- Memoised in 'dbPolicyNums', so the two SQLite statements run once per
--- /distinct/ policy for the life of the handle rather than once per asset row —
--- the difference between a few thousand round trips and a few million. The
--- dictionary write joins the caller's open transaction, so a policy's surrogate
--- and the @policies@ rows referencing it commit together.
-policyNumOf :: Statement -> Statement -> ByteString -> IO Int64
-policyNumOf ins sel pid = do
-  -- 'withBind' binds, runs the body, and resets the statement afterwards, so
-  -- each call leaves both ready for the next row.
-  withBind ins (Only pid) (() <$ (nextRow ins :: IO (Maybe (Only Int64))))
-  withBind sel (Only pid) $ do
-    row <- nextRow sel
-    case row of
-      Just (Only num) -> pure num
-      Nothing -> error "policyNumOf: policy_ids row absent immediately after INSERT OR IGNORE"
+-- Two statements, run once per asset row. The dictionary write joins the
+-- caller's open transaction, so a policy's surrogate and the @policies@ rows
+-- referencing it commit together.
+--
+-- Two because @INSERT OR IGNORE@ reports nothing when it ignores, and
+-- @last_insert_rowid()@ is only meaningful when a row was actually inserted —
+-- which it is not for all but the first sighting of each policy. The number has
+-- to be read back either way.
+--
+-- == Faster spellings exist and were rejected
+--
+-- Measured on @origin..2,000,000@, against this as the 100% mark
+-- (@bench\/run-flush-check.sh@, 2026-08-04):
+--
+-- +---------------------------------------------+---------+
+-- | in-memory @Map@ of hash to surrogate         | -13.9%  |
+-- | the same two statements, prepared once       | -9.8%   |
+-- | one @INSERT … ON CONFLICT … RETURNING@       | +34.4%  |
+-- +---------------------------------------------+---------+
+--
+-- The @Map@ was fastest and is gone deliberately: it was application-level
+-- memoisation living in 'DbHandle' beside a connection and a row counter, and it
+-- forced @policy_ids@ to stay append-only across rollbacks so it could not go
+-- stale. Prepared statements have the same problem in smaller form — they are
+-- one table's access pattern held in a general handle.
+--
+-- The single-statement @RETURNING@ version looks like the obvious win and is by
+-- far the worst. @ON CONFLICT DO NOTHING@ cannot be used, because @RETURNING@
+-- only reports rows the statement acted on, so a repeat policy returns nothing;
+-- the workaround is @DO UPDATE SET policy_id = excluded.policy_id@, which
+-- REWRITES the row every time. That is roughly three million writes to a
+-- 1,613-row table, and no amount of halving the statement count pays for it.
+--
+-- What remains is the slowest and the plainest. That was the call: two ordinary
+-- statements, no cache, nothing about policies in 'DbHandle'.
+policyNumOf :: Connection -> ByteString -> IO Int64
+policyNumOf conn pid = do
+  execute conn "INSERT OR IGNORE INTO policy_ids (policy_id) VALUES (?)" (Only pid)
+  rows <- query conn "SELECT policy_num FROM policy_ids WHERE policy_id = ?" (Only pid)
+  case rows of
+    Only num : _ -> pure num
+    [] -> error "policyNumOf: policy_ids row absent immediately after INSERT OR IGNORE"
 
 -- | Store one preimage, keyed by its hash. @INSERT OR IGNORE@ does the dedup: the
 -- same datum or script recurs across many transactions, and the hash is the

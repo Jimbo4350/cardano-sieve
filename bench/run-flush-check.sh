@@ -183,7 +183,8 @@ head_spread=$(printf '%s\n' "${head_times[@]}" | spread)
 
 echo
 echo "================ RESULT ================"
-printf 'HEAD  %-19s median %ss  max/min %s  [%s]\n' "$(git -C "$REPO_ROOT" log --format=%h -1)" \
+printf 'HEAD  %-19s median %ss  max/min %s  [%s]\n' \
+  "$(git -C "$REPO_ROOT" log --format=%h -1)$(git -C "$REPO_ROOT" diff --quiet HEAD -- src/ || echo '+dirty')" \
   "$head_med" "$head_spread" "${head_times[*]}"
 
 if [ -n "$BASELINE_REF" ]; then
