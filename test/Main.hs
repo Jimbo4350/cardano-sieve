@@ -41,7 +41,10 @@ import Cardano.Api
   )
 
 import Cardano.Sieve.Node.Insert
-  ( SelectorMismatch
+  ( DbHandle
+  , DirtyDatabase
+  , Durability (Durable, UnsafeBulk)
+  , SelectorMismatch
   , SpentInput (..)
   , StoredOutput (..)
   , applyBlock
@@ -72,7 +75,7 @@ import Data.ByteString qualified as BS
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Database.SQLite.Simple (Connection, Only (Only), Query, query_, withConnection)
+import Database.SQLite.Simple (Connection, Only (Only), Query, execute_, query_, withConnection)
 import GHC.Exts (fromList)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import System.FilePath ((</>))
@@ -108,6 +111,49 @@ tests =
     , rollbackTests
     , selectorPersistenceTests
     , checkpointTests
+    , durabilityTests
+    ]
+
+-- ----------------------------------------------------------------------------
+-- Bulk durability flag
+-- ----------------------------------------------------------------------------
+
+-- | Bulk sessions run with SQLite journaling off, so a crash can corrupt the
+-- file undetectably. The only protection is the dirty flag: set for the whole
+-- bulk session, cleared on clean close, refused at open ever after.
+durabilityTests :: TestTree
+durabilityTests =
+  testGroup
+    "bulk durability flag"
+    [ testCase "a bulk session is flagged dirty while open, and clean again after" $
+        withTempDb "dirty-lifecycle" $ \path -> do
+          db <- openDatabase UnsafeBulk path 1
+          flagged <- withConnection path $ \c -> query_ c "PRAGMA user_version"
+          flagged @?= [Only (1 :: Int)]
+          closeDatabase db
+          cleared <- withConnection path $ \c -> query_ c "PRAGMA user_version"
+          cleared @?= [Only (0 :: Int)]
+    , testCase "a durable session never sets the flag" $
+        withTempDb "durable-clean" $ \path -> do
+          db <- openDatabase Durable path 1
+          flagged <- withConnection path $ \c -> query_ c "PRAGMA user_version"
+          flagged @?= [Only (0 :: Int)]
+          closeDatabase db
+    , testCase "a file left dirty is refused, whatever mode asks" $
+        withTempDb "dirty-refused" $ \path -> do
+          -- A crash cannot be staged from inside bracket, so plant its residue:
+          -- the flag a dying bulk session would have left behind.
+          db <- openDatabase UnsafeBulk path 1
+          closeDatabase db
+          withConnection path $ \c -> execute_ c "PRAGMA user_version=1"
+          refusedD <- try (openDatabase Durable path 1)
+          case refusedD :: Either DirtyDatabase DbHandle of
+            Left _ -> pure ()
+            Right db' -> closeDatabase db' >> assertFailure "Durable open accepted a dirty file"
+          refusedB <- try (openDatabase UnsafeBulk path 1)
+          case refusedB :: Either DirtyDatabase DbHandle of
+            Left _ -> pure ()
+            Right db' -> closeDatabase db' >> assertFailure "UnsafeBulk open accepted a dirty file"
     ]
 
 -- ----------------------------------------------------------------------------
@@ -156,7 +202,7 @@ checkpointTests =
   outputRef = BS.replicate 32 2 <> BS.replicate 8 0
   outputRef2 = BS.replicate 32 4 <> BS.replicate 8 0
   blockHash n = BS.replicate 32 n
-  withDb path = bracket (openDatabase path 1) closeDatabase
+  withDb path = bracket (openDatabase Durable path 1) closeDatabase
 
 -- ----------------------------------------------------------------------------
 -- Selector persistence
@@ -205,7 +251,7 @@ selectorPersistenceTests =
  where
   payment = SelectPayment (fromMaybe (error "bad hash") (credentialHashFromBytes payBytes))
   delegation = SelectDelegation (fromMaybe (error "bad hash") (credentialHashFromBytes stakeBytes))
-  withDb path = bracket (openDatabase path 1) closeDatabase
+  withDb path = bracket (openDatabase Durable path 1) closeDatabase
 
 -- ----------------------------------------------------------------------------
 -- Rollback
@@ -287,7 +333,7 @@ rollbackTests =
   outputRef = BS.replicate 32 2 <> BS.replicate 8 0
   blockHash n = BS.replicate 32 n
 
-  withDb path = bracket (openDatabase path 1) closeDatabase
+  withDb path = bracket (openDatabase Durable path 1) closeDatabase
 
 -- | Run an action against a fresh sieve database in a temporary file.
 --

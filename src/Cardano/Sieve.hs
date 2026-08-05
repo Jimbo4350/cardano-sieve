@@ -30,7 +30,8 @@ import Cardano.Api
 import Cardano.Server.Http (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
 import Cardano.Sieve.Node.Insert
-  ( RedeemerCapture (CaptureRedeemers, SkipRedeemers)
+  ( Durability (Durable, UnsafeBulk)
+  , RedeemerCapture (CaptureRedeemers, SkipRedeemers)
   , closeDatabase
   , installIndexes
   , openDatabase
@@ -180,7 +181,10 @@ sieve = do
   case cmd of
     BuildIndexes -> installIndexes db
     Serve port -> runServer db port
-    Sync sync Nothing -> runSyncCommand db sync
+    -- Indexing alone: catch-up runs in bulk mode (journaling off) and the
+    -- session goes durable on reaching the tip. The trade is announced at
+    -- startup and guarded by the dirty flag; see 'Durability'.
+    Sync sync Nothing -> runSyncCommand UnsafeBulk db sync
     Sync sync (Just port) -> do
       -- Create the schema before starting either side. The server refuses to
       -- start against a missing database — a deliberate guard against a mistyped
@@ -189,13 +193,17 @@ sieve = do
       -- front removes the race rather than weakening the guard; it is
       -- CREATE TABLE IF NOT EXISTS throughout, so an existing database is
       -- untouched.
-      bracket (openDatabase db (syBatchSize sync)) closeDatabase (const (pure ()))
+      bracket (openDatabase Durable db (syBatchSize sync)) closeDatabase (const (pure ()))
       -- 'race_' rather than a bare fork so whichever finishes or dies first takes
       -- the other with it: a bounded sync reaching --until should end the
       -- process, and a crashed server should not leave a headless indexer behind.
-      race_ (runSyncCommand db sync) (runServer db port)
+      -- Serving alongside: the readers need WAL to coexist with the writer
+      -- (journal-off would have every query fight the sync for the file), so
+      -- this mode forgoes the bulk-speed trade.
+      race_ (runSyncCommand Durable db sync) (runServer db port)
  where
   runSyncCommand
+    durability
     db
     SyncOptions
       { syNode = node
@@ -207,8 +215,8 @@ sieve = do
       , syRedeemers = capture
       } =
       case until_ of
-        Nothing -> fetch node network db batch capture selectors since
-        Just u -> fetchBounded node network db batch capture selectors since u
+        Nothing -> fetch node network db batch durability capture selectors since
+        Just u -> fetchBounded node network db batch durability capture selectors since u
 
 -- | Check a parsed command line for coherence and resolve it into the mode it
 -- names. The parser accepts each option in isolation; this is where the

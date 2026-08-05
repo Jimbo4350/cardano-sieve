@@ -28,6 +28,8 @@
 -- write-path cut.
 module Cardano.Sieve.Node.Insert
   ( DbHandle
+  , Durability (..)
+  , DirtyDatabase (..)
   , DatumType (..)
   , RedeemerCapture (..)
   , StoredOutput (..)
@@ -181,61 +183,164 @@ data DbHandle = DbHandle
   -- flag: 0 = no transaction open).
   }
 
--- | Open the database, prepare it (pragmas + schema) and return a batched
--- 'DbHandle'. Pair every 'openDatabase' with 'closeDatabase' — via
--- 'Control.Exception.finally' — so the final partial batch is always committed.
 -- | How long a connection waits for a contended lock before giving up, in
 -- milliseconds. Shared by the writer here and the query server's readers so the
 -- two agree.
 busyTimeoutMs :: Query
 busyTimeoutMs = "5000"
 
-openDatabase :: FilePath -> Int -> IO DbHandle
-openDatabase path batchSize = do
+-- | How crash-safe this session's writes must be.
+data Durability
+  = -- | Catch-up mode: no journal, no fsync. SQLite writes each page once and
+    -- never waits for the disk — where 'Durable' pays WAL's double-write of
+    -- every page and an fsync per checkpoint.
+    --
+    -- The price is in the name: a CRASH mid-session (kill -9, OOM, power) can
+    -- corrupt the file arbitrarily, not merely lose recent rows. So the file is
+    -- flagged dirty for the whole session and a crashed file is refused ever
+    -- after ('DirtyDatabase') — the only recovery is delete-and-resync. A clean
+    -- exit (Ctrl-C\/SIGTERM land here via the interrupt handler) commits, syncs
+    -- and clears the flag on the way out, so only a genuine crash forfeits the
+    -- database. What is risked is time, never data: everything in this file is
+    -- reproducible from the chain. kupo makes the same trade for catch-up.
+    UnsafeBulk
+  | -- | WAL + @synchronous=NORMAL@: readers coexist with the writer and a crash
+    -- loses at most the un-checkpointed tail. What tip-following and serving
+    -- need, and the mode every session ends in ('makeDurable').
+    Durable
+  deriving (Eq, Show)
+
+-- | The file was left behind by an 'UnsafeBulk' session that never exited
+-- cleanly. With no journal there is no way to tell how much of it is missing or
+-- mangled, so it is refused outright rather than resumed from.
+newtype DirtyDatabase = DirtyDatabase FilePath
+
+instance Show DirtyDatabase where
+  show (DirtyDatabase path) =
+    unlines
+      [ path <> ": left dirty by an interrupted bulk sync."
+      , ""
+      , "Catch-up runs with SQLite journaling off for speed, so a crash mid-sync"
+      , "can corrupt the file in ways that cannot be detected, let alone repaired."
+      , "Its contents cannot be trusted. Delete it and sync again."
+      ]
+
+instance Exception DirtyDatabase
+
+-- | Open the database, prepare it (pragmas + schema) and return a batched
+-- 'DbHandle'. Pair every 'openDatabase' with 'closeDatabase' — via
+-- 'Control.Exception.finally' — so the final partial batch is always committed
+-- and an 'UnsafeBulk' session gets its dirty flag cleared.
+--
+-- Throws 'DirtyDatabase' — regardless of the mode asked for now — if the file
+-- was left behind by a crashed bulk session.
+openDatabase :: Durability -> FilePath -> Int -> IO DbHandle
+openDatabase durability path batchSize = do
   conn <- open path
   -- If preparing the freshly-opened connection throws, close it rather than
   -- leak the handle (the caller only gets to 'closeDatabase' a 'DbHandle' we return).
-  prepare conn `onException` close conn
+  prepare durability path conn `onException` close conn
   pending <- newIORef 0
   pure (DbHandle conn (max 1 batchSize) pending)
 
--- | Install the deferred secondary indexes on an already-open handle, committing
--- the open batch first. Fired once on reaching the chain tip — bulk catch-up
--- runs index-free to keep writes cheap (see "Cardano.Sieve.Schema").
+-- | Install the deferred secondary indexes on an already-open handle, then
+-- promote the session to 'Durable'. Fired once on reaching the chain tip — bulk
+-- catch-up runs index-free to keep writes cheap (see "Cardano.Sieve.Schema").
+--
+-- The indexes build BEFORE 'makeDurable', deliberately: on a bulk session they
+-- are then written once with no journal instead of twice through the WAL, and a
+-- crash mid-build is already covered by the still-set dirty flag.
 buildIndexesOn :: DbHandle -> IO ()
-buildIndexesOn db = flushBatch db >> installDeferredIndexes (dbConn db)
+buildIndexesOn db = do
+  flushBatch db
+  installDeferredIndexes (dbConn db)
+  makeDurable db
 
 -- | Open an existing database, install the deferred query indexes, and close.
 -- The @--build-indexes@ one-shot, for databases that never reach live tip (e.g.
 -- a bounded @--until@ sync or the benchmark).
+--
+-- Opens 'Durable' even though 'UnsafeBulk' would build faster: the input is an
+-- already-safe file that took a long sync to produce, and this tool must not be
+-- the thing that turns a crash into deleting it. A bulk session only ever risks
+-- a file it was itself producing.
 installIndexes :: FilePath -> IO ()
-installIndexes path = bracket (openDatabase path 1) closeDatabase buildIndexesOn
+installIndexes path = bracket (openDatabase Durable path 1) closeDatabase buildIndexesOn
 
--- | Commit the final partial batch (if any) and close the connection.
+-- | Promote the session to 'Durable': make everything written so far actually
+-- durable, clear the dirty flag, and adopt WAL. Idempotent — on an already
+-- 'Durable' session every step is a no-op restatement — so callers need not
+-- track which mode a handle was opened in.
+--
+-- The ordering carries the correctness. Bulk writes ran with @synchronous=OFF@,
+-- so committed pages may still be sitting in the OS page cache; clearing the
+-- flag before they reach disk would mark a possibly-losable file as clean. So
+-- @synchronous@ is raised FIRST, and the flag-clearing write's commit then
+-- fsyncs the database file — and fsync flushes every dirty page of the file,
+-- not just the header. Only then is WAL adopted, and the answer is checked:
+-- silently staying journal-less after the flag is cleared would be corruption
+-- exposure with no safety net, so a refused switch is fatal (the file itself is
+-- consistent and durable at that point; only this process stops).
+makeDurable :: DbHandle -> IO ()
+makeDurable db@DbHandle{dbConn = conn} = do
+  flushBatch db
+  execute_ conn "PRAGMA synchronous=FULL"
+  execute_ conn "PRAGMA user_version=0"
+  modes <- query_ conn "PRAGMA journal_mode=WAL" :: IO [Only Text]
+  case modes of
+    Only "wal" : _ -> execute_ conn "PRAGMA synchronous=NORMAL"
+    other -> error ("makeDurable: journal_mode=WAL refused, got " <> show other)
+
+-- | Commit the final partial batch (if any), mark the file clean, and close.
+--
+-- The clean-mark uses the same raise-synchronous-then-write ordering as
+-- 'makeDurable' and for the same reason: the flag must not say \"trustworthy\"
+-- before the data it vouches for is on disk. A cleanly closed bulk file is
+-- exactly as consistent as a durable one — every transaction committed — which
+-- is why a clean Ctrl-C mid-catch-up keeps the database and a crash does not.
 closeDatabase :: DbHandle -> IO ()
 closeDatabase db = do
   flushBatch db
+  execute_ (dbConn db) "PRAGMA synchronous=FULL"
+  execute_ (dbConn db) "PRAGMA user_version=0"
   close (dbConn db)
 
--- | Ready a freshly-opened connection for batched writes: set the session
--- PRAGMAs, then create the schema.
+-- | Ready a freshly-opened connection for batched writes: refuse a dirty file,
+-- set the session PRAGMAs for the requested 'Durability', then create the
+-- schema.
 --
--- @journal_mode=WAL@ lets the writer commit without blocking readers and keeps
--- each commit cheap; @synchronous=NORMAL@ replaces the per-commit @fsync@ with
--- one at each WAL checkpoint. @foreign_keys=ON@ enforces the @policies@ →
--- @outputs@ reference the schema declares. Together with batching, WAL +
--- NORMAL is where the write throughput comes from.
+-- 'Durable' is @journal_mode=WAL@ + @synchronous=NORMAL@: the writer commits
+-- without blocking readers, and the per-commit @fsync@ becomes one per WAL
+-- checkpoint. 'UnsafeBulk' turns both off entirely — see the constructor for
+-- the trade — after first flagging the file dirty, and the flag is written
+-- BEFORE the journal is disabled so the flag itself still has crash protection.
 --
--- The two mode PRAGMAs go through 'query_' rather than 'execute_' because
+-- @foreign_keys=ON@ enforces the @policies@ → @outputs@ reference the schema
+-- declares.
+--
+-- The journal-mode PRAGMAs go through 'query_' rather than 'execute_' because
 -- @PRAGMA journal_mode@ returns a row (the mode it settled on) and 'execute_'
 -- rejects statements that produce output.
-prepare :: Connection -> IO ()
-prepare conn = do
-  mapM_
-    (\q -> () <$ (query_ conn q :: IO [Only Text]))
-    [ "PRAGMA journal_mode=WAL"
-    , "PRAGMA synchronous=NORMAL"
-    ]
+prepare :: Durability -> FilePath -> Connection -> IO ()
+prepare durability path conn = do
+  flags <- query_ conn "PRAGMA user_version" :: IO [Only Int]
+  case flags of
+    Only flag : _ | flag /= 0 -> throwIO (DirtyDatabase path)
+    _ -> pure ()
+  case durability of
+    Durable ->
+      mapM_
+        (\q -> () <$ (query_ conn q :: IO [Only Text]))
+        [ "PRAGMA journal_mode=WAL"
+        , "PRAGMA synchronous=NORMAL"
+        ]
+    UnsafeBulk -> do
+      execute_ conn "PRAGMA user_version=1"
+      mapM_
+        (\q -> () <$ (query_ conn q :: IO [Only Text]))
+        [ "PRAGMA journal_mode=OFF"
+        , "PRAGMA synchronous=OFF"
+        ]
   -- Wait for a contended lock instead of failing on it. SQLite's default is 0 ms
   -- — return SQLITE_BUSY immediately — which is fine while the writer has the
   -- file to itself but not once a query server shares the process

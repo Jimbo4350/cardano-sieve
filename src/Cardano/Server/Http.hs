@@ -364,6 +364,19 @@ describeDatabase dbPath = do
 
   probe :: Connection -> IO (Int, Maybe Int64, Bool)
   probe conn = do
+    -- Refuse a file left dirty by a crashed bulk sync before reporting anything
+    -- from it — with journaling off there is no telling what state it is in, and
+    -- serving confidently-wrong rows is worse than not starting.
+    dirty <- query_ conn "PRAGMA user_version" :: IO [Only Int]
+    case dirty of
+      Only flag : _
+        | flag /= 0 ->
+            die
+              ( dbPath
+                  <> ": left dirty by an interrupted bulk sync — its contents cannot \
+                     \be trusted. Delete it and sync again."
+              )
+      _ -> pure ()
     rows <- query_ conn "SELECT count(*) FROM unspent"
     tips <- query_ conn "SELECT max(created_slot) FROM unspent"
     -- One representative deferred index; they are all installed together.

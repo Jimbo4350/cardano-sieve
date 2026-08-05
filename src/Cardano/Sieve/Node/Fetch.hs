@@ -50,6 +50,7 @@ import Cardano.Api
 import Cardano.Sieve.Node.Decode (preimagesInBlock, selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
+  , Durability (Durable, UnsafeBulk)
   , RedeemerCapture
   , applyBlock
   , buildIndexesOn
@@ -91,16 +92,18 @@ fetch
   -> NetworkId
   -> FilePath
   -> Int
+  -> Durability
   -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> IO ()
-fetch socketPath networkId dbPath batchSize capture selectors since =
+fetch socketPath networkId dbPath batchSize durability capture selectors since =
   runSync
     socketPath
     networkId
     dbPath
     batchSize
+    durability
     selectors
     (\dbHandle progress active -> followingClient dbHandle progress capture active since)
 
@@ -111,17 +114,19 @@ fetchBounded
   -> NetworkId
   -> FilePath
   -> Int
+  -> Durability
   -> RedeemerCapture
   -> [Selector]
   -> ChainPoint
   -> SlotNo
   -> IO ()
-fetchBounded socketPath networkId dbPath batchSize capture selectors since untilSlot =
+fetchBounded socketPath networkId dbPath batchSize durability capture selectors since untilSlot =
   runSync
     socketPath
     networkId
     dbPath
     batchSize
+    durability
     selectors
     (\dbHandle progress active -> boundedClient dbHandle progress capture active since untilSlot)
 
@@ -138,6 +143,7 @@ runSync
   -> NetworkId
   -> FilePath
   -> Int
+  -> Durability
   -> [Selector]
   -> ( DbHandle
        -> IORef Progress
@@ -145,9 +151,9 @@ runSync
        -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
      )
   -> IO ()
-runSync socketPath networkId dbPath batchSize configured mkClient =
+runSync socketPath networkId dbPath batchSize durability configured mkClient =
   bracket
-    (openDatabase dbPath batchSize)
+    (openDatabase durability dbPath batchSize)
     closeDatabase
     ( \dbHandle -> do
         -- Before a single block is fetched: refuse to index into a database that
@@ -165,6 +171,12 @@ runSync socketPath networkId dbPath batchSize configured mkClient =
               <> ")"
           )
         stamped ("indexing selectors: " <> describeSelectors selectors)
+        case durability of
+          UnsafeBulk ->
+            stamped
+              "bulk mode: journaling off for catch-up — a clean exit (Ctrl-C) is safe, \
+              \but a crash means delete the database and resync"
+          Durable -> pure ()
         connectToLocalNode connectInfo (protocols dbHandle progress selectors)
         summarise progress
     )
@@ -643,7 +655,11 @@ followingClient dbHandle progress capture selectors since =
                 t0 <- getMonotonicTime
                 buildIndexesOn dbHandle
                 t1 <- getMonotonicTime
-                stamped ("query indexes built in " <> duration (t1 - t0) <> " — now following the tip")
+                stamped
+                  ( "query indexes built in "
+                      <> duration (t1 - t0)
+                      <> " — database now durable (WAL), following the tip"
+                  )
                 writeIORef built IndexesBuilt
           pure (clientIdle built (At blockNo) tip n)
       , CSP.recvMsgRollBackward = \point serverTip -> do
