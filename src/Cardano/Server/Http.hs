@@ -215,7 +215,7 @@ data HashResolution = ResolveHashes | LeaveHashes
 -- subquery, keeping a single-value equality on the leading index column.
 policiesExists :: Query -> Query
 policiesExists extra =
-  "EXISTS (SELECT 1 FROM policies p WHERE p.output_reference = u.output_reference \
+  "EXISTS (SELECT 1 FROM policies p WHERE p.output_num = u.output_num \
   \AND p.policy_num = (SELECT policy_num FROM policy_ids WHERE policy_id = ?)"
     <> extra
     <> ")"
@@ -532,7 +532,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
       <> " FROM "
       <> planFrom plan
       <> " LEFT JOIN blocks bc ON bc.slot_no = u.created_slot \
-         \LEFT JOIN spends s ON s.output_reference = u.output_reference \
+         \LEFT JOIN spends s ON s.output_num = u.output_num \
          \LEFT JOIN blocks bs ON bs.slot_no = s.spent_slot"
       -- Only joined when asked for: both are primary-key probes, but resolving on
       -- every match would ship a datum body per row (and one popular datum is
@@ -624,7 +624,7 @@ planFor status = \case
   -- filter: the live-set table only ever holds unspent outputs.
   statusFilter = case status of
     OnlyUnspent -> ""
-    OnlySpent -> " AND s.output_reference IS NOT NULL"
+    OnlySpent -> " AND s.output_num IS NOT NULL"
     AllMatches -> ""
 
   onBase cond params = Plan baseTable (cond <> statusFilter) "u.created_slot" params

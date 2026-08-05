@@ -68,9 +68,11 @@ import Database.SQLite.Simple
   ( Connection
   , Only (Only)
   , Query
+  , changes
   , close
   , execute
   , execute_
+  , lastInsertRowId
   , open
   , query
   , query_
@@ -335,15 +337,17 @@ insertOutput conn slot o = do
            , slot
            )
     )
+  outputNum <- surrogateOf conn (soOutputRef o)
   execute
     conn
     "INSERT OR IGNORE INTO unspent \
-    \(output_reference, transaction_index, address, payment_credential, \
+    \(output_reference, output_num, transaction_index, address, payment_credential, \
     \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
     \created_slot) \
-    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ( (soOutputRef o, soTransactionIndex o, soAddress o, soPayCred o, soDelegCred o)
-        :. ( soValue o
+    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ( (soOutputRef o, outputNum, soTransactionIndex o, soAddress o, soPayCred o)
+        :. ( soDelegCred o
+           , soValue o
            , soDatumHash o
            , datumTypeToInt <$> soDatumType o
            , soReferenceScriptHash o
@@ -355,11 +359,33 @@ insertOutput conn slot o = do
         num <- policyNumOf conn pid
         execute
           conn
-          "INSERT OR IGNORE INTO policies (output_reference, policy_num, asset_name, created_slot) \
+          "INSERT OR IGNORE INTO policies (output_num, policy_num, asset_name, created_slot) \
           \VALUES (?, ?, ?, ?)"
-          (soOutputRef o, num, name, slot)
+          (outputNum, num, name, slot)
     )
     (soAssets o)
+
+-- | The @outputs.output_num@ surrogate for an output that was just inserted.
+--
+-- Both are C calls, not SQL, so the common path costs no statement at all —
+-- which is the whole reason this scheme is affordable. Contrast 'policyNumOf',
+-- which needs real statements because policies recur across outputs.
+--
+-- The @changes@ check is not optional. The insert above is @INSERT OR IGNORE@,
+-- so on a replay — a resume overlapping already-indexed blocks, which is normal
+-- — it inserts nothing and @last_insert_rowid@ still holds the id of whatever
+-- was inserted LAST. Using it blindly would attach this output's policy rows to
+-- an unrelated output. Only then do we pay a lookup.
+surrogateOf :: Connection -> ByteString -> IO Int64
+surrogateOf conn ref = do
+  inserted <- changes conn
+  if inserted > 0
+    then lastInsertRowId conn
+    else do
+      rows <- query conn "SELECT output_num FROM outputs WHERE output_reference = ?" (Only ref)
+      case rows of
+        Only num : _ -> pure num
+        [] -> error "surrogateOf: outputs row absent immediately after INSERT OR IGNORE"
 
 -- | Resolve a policy hash to its @policy_ids@ surrogate, inserting the
 -- dictionary row the first time that policy is seen.
@@ -428,14 +454,20 @@ recordSpend :: Connection -> Int64 -> SpentInput -> IO ()
 recordSpend conn slot si = do
   execute
     conn
+    -- The old form guarded with EXISTS (SELECT 1 FROM outputs WHERE
+    -- output_reference = ?) — an index probe purely to answer "do we track this
+    -- output?". Selecting output_num instead answers the same question AND
+    -- yields the surrogate, from the same probe. A spend of an untracked output
+    -- selects no rows and inserts nothing, exactly as before.
     "INSERT OR IGNORE INTO spends \
-    \(output_reference, spending_transaction_id, spending_input_index, spent_slot, \
+    \(output_num, spending_transaction_id, spending_input_index, spent_slot, \
     \redeemer) \
-    \SELECT ?, ?, ?, ?, ? \
-    \WHERE EXISTS (SELECT 1 FROM outputs WHERE output_reference = ?)"
-    ( (siConsumed si, siSpendingTxId si, siInputIndex si)
-        :. (slot, siRedeemer si, siConsumed si)
+    \SELECT output_num, ?, ?, ?, ? FROM outputs WHERE output_reference = ?"
+    ( (siSpendingTxId si, siInputIndex si, slot)
+        :. (siRedeemer si, siConsumed si)
     )
+  -- Still by reference: @unspent@ keeps it as its primary key, because results
+  -- return it and @transaction_id@ is generated from it.
   execute
     conn
     "DELETE FROM unspent WHERE output_reference = ?"
@@ -499,15 +531,15 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
       execute
         conn
         "INSERT OR IGNORE INTO unspent \
-        \(output_reference, transaction_index, address, payment_credential, \
+        \(output_reference, output_num, transaction_index, address, payment_credential, \
         \delegation_credential, value, datum_hash, datum_type, \
         \reference_script_hash, created_slot) \
-        \SELECT output_reference, transaction_index, address, payment_credential, \
+        \SELECT output_reference, output_num, transaction_index, address, payment_credential, \
         \delegation_credential, value, datum_hash, datum_type, \
         \reference_script_hash, created_slot \
         \FROM outputs \
         \WHERE created_slot <= ? \
-        \AND output_reference IN (SELECT output_reference FROM spends WHERE spent_slot > ?)"
+        \AND output_num IN (SELECT output_num FROM spends WHERE spent_slot > ?)"
         (slot, slot)
       execute conn "DELETE FROM policies WHERE created_slot > ?" (Only slot)
       execute conn "DELETE FROM unspent WHERE created_slot > ?" (Only slot)

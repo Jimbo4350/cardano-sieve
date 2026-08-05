@@ -75,7 +75,8 @@ tables =
     -- POSSIBLE, the absence of indexes keeps them best-effort scans, and appending
     -- to history stays cheap. See 'indexes'.
     "CREATE TABLE IF NOT EXISTS outputs \
-    \( output_reference BLOB    NOT NULL PRIMARY KEY \
+    \( output_num       INTEGER NOT NULL PRIMARY KEY \
+    \, output_reference BLOB    NOT NULL UNIQUE \
     \, transaction_id   BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
     \, transaction_index INTEGER NOT NULL \
     \, address          BLOB    NOT NULL \
@@ -92,6 +93,7 @@ tables =
     -- holds all the query indexes, joining out only for heavy preimages.
     "CREATE TABLE IF NOT EXISTS unspent \
     \( output_reference      BLOB    NOT NULL PRIMARY KEY \
+    \, output_num            INTEGER NOT NULL UNIQUE \
     \, transaction_id        BLOB    GENERATED ALWAYS AS (substr(output_reference, 1, 32)) VIRTUAL \
     \, transaction_index     INTEGER NOT NULL \
     \, address               BLOB    NOT NULL \
@@ -106,7 +108,7 @@ tables =
   , -- Append-only spend provenance, keyed by the consumed output reference. The
     -- header hash for spent_slot is obtained by joining @blocks@.
     "CREATE TABLE IF NOT EXISTS spends \
-    \( output_reference        BLOB    NOT NULL PRIMARY KEY \
+    \( output_num              INTEGER NOT NULL PRIMARY KEY \
     \, spending_transaction_id BLOB    NOT NULL \
     \, spending_input_index    INTEGER NOT NULL \
     \, spent_slot              INTEGER NOT NULL \
@@ -192,12 +194,12 @@ tables =
     --   so build it only once measured against kupo.
     --   See [[sieve-query-index-tuning]].
     "CREATE TABLE IF NOT EXISTS policies \
-    \( output_reference BLOB    NOT NULL \
+    \( output_num       INTEGER NOT NULL \
     \, policy_num       INTEGER NOT NULL \
     \, asset_name       BLOB    NOT NULL \
     \, created_slot     INTEGER NOT NULL \
-    \, PRIMARY KEY (output_reference, policy_num, asset_name) \
-    \, FOREIGN KEY (output_reference) REFERENCES outputs(output_reference) \
+    \, PRIMARY KEY (output_num, policy_num, asset_name) \
+    \, FOREIGN KEY (output_num) REFERENCES outputs(output_num) \
     \)"
   ]
 
