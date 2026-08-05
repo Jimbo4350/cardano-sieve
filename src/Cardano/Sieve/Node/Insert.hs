@@ -77,6 +77,7 @@ import Database.SQLite.Simple
   , Only (Only)
   , Query
   , Statement
+  , ToRow
   , changes
   , close
   , execute
@@ -504,8 +505,20 @@ applyBlock
         conn
         "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
         (slot, headerHash)
-    mapM_ (insertOutput conn policyIndexing slot) created
-    mapM_ (recordSpend conn slot) spent
+    -- The four per-row statements are prepared once per block and rebound per
+    -- row. 'execute' compiles its SQL on every call, and these are the only
+    -- statements that run per ROW rather than per block — roughly a million
+    -- compilations of four fixed strings over @origin..2,000,000@. Preparing
+    -- them here amortises one compile over every row in the block, and scoping
+    -- them to the block keeps statement handles out of 'DbHandle'.
+    unless (null created) $
+      withStatement conn insertOutputSql $ \outIns ->
+        withStatement conn insertUnspentSql $ \unsIns ->
+          mapM_ (insertOutput conn outIns unsIns policyIndexing slot) created
+    unless (null spent) $
+      withStatement conn insertSpendSql $ \spendIns ->
+        withStatement conn deleteUnspentSql $ \delUns ->
+          mapM_ (recordSpend spendIns delUns slot) spent
     -- Preimages are gathered from the WHOLE block, so gate them on the block
     -- being relevant to the configured selectors — otherwise a narrow selector
     -- drags in every datum and script on the chain. kupo does the same, and says
@@ -525,17 +538,46 @@ applyBlock
       then execute_ conn "COMMIT" >> writeIORef pending 0
       else writeIORef pending n'
 
--- | Write one matched output. @outputs@ is inserted before @policies@ so the
--- foreign key is satisfied within the transaction.
-insertOutput :: Connection -> PolicyIndexing -> Int64 -> StoredOutput -> IO ()
-insertOutput conn policyIndexing slot o = do
-  execute
-    conn
-    "INSERT OR IGNORE INTO outputs \
-    \(output_reference, transaction_index, address, payment_credential, \
-    \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
-    \created_slot) \
-    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+-- | The per-row SQL of the write path, named so 'applyBlock' can prepare it.
+insertOutputSql, insertUnspentSql, insertSpendSql, deleteUnspentSql :: Query
+insertOutputSql =
+  "INSERT OR IGNORE INTO outputs \
+  \(output_reference, transaction_index, address, payment_credential, \
+  \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
+  \created_slot) \
+  \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+insertUnspentSql =
+  "INSERT OR IGNORE INTO unspent \
+  \(output_reference, output_num, transaction_index, address, payment_credential, \
+  \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
+  \created_slot) \
+  \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+insertSpendSql =
+  -- Selecting output_num answers "do we track this output?" AND yields the
+  -- surrogate, from one index probe. A spend of an untracked output selects no
+  -- rows and inserts nothing.
+  "INSERT OR IGNORE INTO spends \
+  \(output_num, spending_transaction_id, spending_input_index, spent_slot, \
+  \redeemer) \
+  \SELECT output_num, ?, ?, ?, ? FROM outputs WHERE output_reference = ?"
+deleteUnspentSql =
+  -- By reference: @unspent@ keeps it as its primary key, because results
+  -- return it and @transaction_id@ is generated from it.
+  "DELETE FROM unspent WHERE output_reference = ?"
+
+-- | Run a prepared row statement with these parameters: bind, step, reset.
+-- 'withBind' resets on the way out, so the statement is ready for the next row.
+step :: ToRow p => Statement -> p -> IO ()
+step stmt p = withBind stmt p (() <$ (nextRow stmt :: IO (Maybe (Only Int64))))
+
+-- | Write one matched output through the block's prepared statements.
+-- @outputs@ is inserted before @policies@ so the foreign key is satisfied
+-- within the transaction.
+insertOutput
+  :: Connection -> Statement -> Statement -> PolicyIndexing -> Int64 -> StoredOutput -> IO ()
+insertOutput conn outIns unsIns policyIndexing slot o = do
+  step
+    outIns
     ( (soOutputRef o, soTransactionIndex o, soAddress o, soPayCred o, soDelegCred o)
         :. ( soValue o
            , soDatumHash o
@@ -545,13 +587,8 @@ insertOutput conn policyIndexing slot o = do
            )
     )
   outputNum <- surrogateOf conn (soOutputRef o)
-  execute
-    conn
-    "INSERT OR IGNORE INTO unspent \
-    \(output_reference, output_num, transaction_index, address, payment_credential, \
-    \delegation_credential, value, datum_hash, datum_type, reference_script_hash, \
-    \created_slot) \
-    \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  step
+    unsIns
     ( (soOutputRef o, outputNum, soTransactionIndex o, soAddress o, soPayCred o)
         :. ( soDelegCred o
            , soValue o
@@ -663,28 +700,14 @@ insertPreimage conn table hashCol bodyCol (h, body) =
 -- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
 -- @unspent@ set. The redeemer is whatever the decode stage captured — NULL unless
 -- 'CaptureRedeemers' was asked for. Untracked inputs no-op on both statements.
-recordSpend :: Connection -> Int64 -> SpentInput -> IO ()
-recordSpend conn slot si = do
-  execute
-    conn
-    -- The old form guarded with EXISTS (SELECT 1 FROM outputs WHERE
-    -- output_reference = ?) — an index probe purely to answer "do we track this
-    -- output?". Selecting output_num instead answers the same question AND
-    -- yields the surrogate, from the same probe. A spend of an untracked output
-    -- selects no rows and inserts nothing, exactly as before.
-    "INSERT OR IGNORE INTO spends \
-    \(output_num, spending_transaction_id, spending_input_index, spent_slot, \
-    \redeemer) \
-    \SELECT output_num, ?, ?, ?, ? FROM outputs WHERE output_reference = ?"
+recordSpend :: Statement -> Statement -> Int64 -> SpentInput -> IO ()
+recordSpend spendIns delUns slot si = do
+  step
+    spendIns
     ( (siSpendingTxId si, siInputIndex si, slot)
         :. (siRedeemer si, siConsumed si)
     )
-  -- Still by reference: @unspent@ keeps it as its primary key, because results
-  -- return it and @transaction_id@ is generated from it.
-  execute
-    conn
-    "DELETE FROM unspent WHERE output_reference = ?"
-    (Only (siConsumed si))
+  step delUns (Only (siConsumed si))
 
 -- | Commit the currently open (partial) batch, if any. A no-op when nothing is
 -- pending, so it is cheap to call speculatively — which is what the idle flush in
@@ -885,11 +908,11 @@ resumePoints DbHandle{dbConn = conn} = do
   rows <- query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC"
   pure (withOldest rows (pick 0 1 rows))
  where
-  -- Take row 0, then step 1, 2, 4, 8 … forward through the descending list.
+  -- Take row 0, then stride 1, 2, 4, 8 … forward through the descending list.
   pick _ _ [] = []
-  pick taken step (x : xs)
+  pick taken stride (x : xs)
     | taken >= resumePointCount = []
-    | otherwise = x : pick (taken + 1) (step * 2) (drop (step - 1) xs)
+    | otherwise = x : pick (taken + 1) (stride * 2) (drop (stride - 1) xs)
 
   -- Always end on the oldest checkpoint we hold. The exponential steps overshoot
   -- the end of the list, so without this the deepest point on offer is an
