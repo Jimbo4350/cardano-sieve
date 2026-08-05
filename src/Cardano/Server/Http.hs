@@ -6,11 +6,14 @@
 
 -- | Read query API (servant + warp) over the synced SQLite database.
 --
--- Three endpoints:
+-- The endpoints:
 --
 --   * @GET \/matches\/{pattern}@ — every dimension the indexer can match on
 --   * @GET \/datums\/{hash}@ — a datum preimage, @{datum}@
 --   * @GET \/scripts\/{hash}@ — a script preimage, @{script, language}@
+--   * @GET \/checkpoints@ — a sample of stored chain points, newest first
+--   * @GET \/checkpoints\/{slot-no}@ — the point at (or, by default, at-or-before)
+--     a slot; @?strict@ demands the exact slot
 --
 -- @\/matches@ covers every dimension. The pattern is parsed by
 -- 'Cardano.Sieve.Selector.selectorFromText' — the same grammar @--select@ uses at
@@ -42,7 +45,7 @@
 -- reference script).
 --
 -- Known gaps against kupo (audited against its OpenAPI spec,
--- @kupo\/docs\/api\/nightly.yaml@): the @\/patterns@, @\/checkpoints@, @\/metadata@,
+-- @kupo\/docs\/api\/nightly.yaml@): the @\/patterns@, @\/metadata@,
 -- @\/health@ and @\/metrics@ endpoints are absent, as is @DELETE
 -- \/matches\/{pattern}@; results are capped at 'pageLimit' where kupo streams every
 -- match; and within one slot the result order differs, since
@@ -63,7 +66,7 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Sieve.Node.Insert (busyTimeoutMs)
+import Cardano.Sieve.Node.Insert (busyTimeoutMs, sampleCheckpoints)
 import Cardano.Sieve.Selector
   ( Selector (..)
   , credentialHashToBytes
@@ -124,7 +127,18 @@ import Servant
 import Web.HttpApiData (FromHttpApiData (parseUrlPiece))
 
 -- | The query API.
-type API = MatchesAPI :<|> PreimageAPI
+type API = MatchesAPI :<|> CheckpointsAPI :<|> PreimageAPI
+
+-- | Chain points the indexer has recorded, kupo-shaped.
+--
+-- The list endpoint is a /sample/ (the exponential ladder shared with resume,
+-- 'sampleCheckpoints') — one checkpoint per applied block exists underneath,
+-- which nobody wants in one response. The by-slot endpoint answers with the
+-- point at-or-before the slot unless @?strict@ demands an exact hit; an absent
+-- point is @null@, not a 404, matching kupo and \/datums.
+type CheckpointsAPI =
+  "checkpoints" :> Get '[JSON] [Value]
+    :<|> "checkpoints" :> Capture "slot-no" Int64 :> QueryFlag "strict" :> Get '[JSON] Value
 
 -- | Preimage lookups by hash: the bodies behind the hashes a match reports.
 --
@@ -425,7 +439,9 @@ logRequests app req respond = do
 
 server :: FilePath -> Server API
 server dbPath =
-  matches :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
+  matches
+    :<|> (checkpointsSample dbPath :<|> checkpointBySlot dbPath)
+    :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
  where
   -- Servant delivers every parameter positionally and untyped — three bare
   -- 'Bool's and eight loose 'Maybe's in a row — so the boundary is where they get
@@ -441,6 +457,38 @@ server dbPath =
       (if resolve then ResolveHashes else LeaveHashes)
       (SlotBounds cAfter cBefore sAfter sBefore)
       (Refinements pol asset tx ix)
+
+-- | @GET \/checkpoints@ — the stored chain points, sampled newest-first.
+checkpointsSample :: FilePath -> Handler [Value]
+checkpointsSample dbPath =
+  liftIO $ withReadConnection dbPath $ \conn ->
+    map pointJson <$> sampleCheckpoints conn
+
+-- | How @GET \/checkpoints\/{slot-no}@ matches the requested slot. From kupo's
+-- @?strict@: exact by request, at-or-before by default — the default exists to
+-- find a usable ancestor of any slot, e.g. for rollback detection.
+data SlotMatch = ExactSlot | AtOrBefore
+
+-- | @GET \/checkpoints\/{slot-no}@ — one point, or @null@ when nothing matches.
+checkpointBySlot :: FilePath -> Int64 -> Bool -> Handler Value
+checkpointBySlot dbPath slot strictFlag =
+  liftIO $ withReadConnection dbPath $ \conn -> do
+    rows <- case (if strictFlag then ExactSlot else AtOrBefore) of
+      ExactSlot ->
+        query conn "SELECT slot_no, header_hash FROM checkpoints WHERE slot_no = ?" (Only slot)
+      AtOrBefore ->
+        query
+          conn
+          "SELECT slot_no, header_hash FROM checkpoints \
+          \WHERE slot_no <= ? ORDER BY slot_no DESC LIMIT 1"
+          (Only slot)
+    pure $ case rows of
+      point : _ -> pointJson point
+      [] -> Null
+
+-- | A chain point in kupo's wire shape.
+pointJson :: (Int64, ByteString) -> Value
+pointJson (slot, hash) = object ["slot_no" .= slot, "header_hash" .= hexText hash]
 
 -- | @GET \/datums\/{hash}@ — the datum body behind a hash, or @null@.
 --

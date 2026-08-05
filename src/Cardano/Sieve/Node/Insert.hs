@@ -50,6 +50,7 @@ module Cardano.Sieve.Node.Insert
   , flushBatch
   , reconcileSelectors
   , resumePoints
+  , sampleCheckpoints
   , SelectorMismatch (..)
   , StoredSelectorUnparseable (..)
   )
@@ -904,7 +905,13 @@ reconcileSelectors DbHandle{dbConn = conn} configured = do
 -- Capped at 'resumePointCount' entries. Genesis is not included; the caller
 -- appends it as the last resort.
 resumePoints :: DbHandle -> IO [(Int64, ByteString)]
-resumePoints DbHandle{dbConn = conn} = do
+resumePoints DbHandle{dbConn = conn} = sampleCheckpoints conn
+
+-- | The exponential checkpoint sample, on a bare connection: what 'resumePoints'
+-- offers the node and what @GET \/checkpoints@ serves — one function so the two
+-- can never drift.
+sampleCheckpoints :: Connection -> IO [(Int64, ByteString)]
+sampleCheckpoints conn = do
   rows <- query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC"
   pure (withOldest rows (pick 0 1 rows))
  where
