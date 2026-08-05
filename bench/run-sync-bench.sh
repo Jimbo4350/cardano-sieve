@@ -22,10 +22,17 @@
 #   UNTIL_SLOT=4000000 RUNS=5 COOLDOWN=30 ./bench/run-sync-bench.sh
 #
 # Fairness notes (validated against both codebases):
-#   - Index parity: sieve's --until run does NOT build its deferred secondary
-#     indexes, so kupo runs with --defer-db-indexes; both then measure pure
-#     ingest. Index-build cost is a separate, one-time measurement (sieve does
-#     not wire installDeferredIndexes to the CLI yet).
+#   - Index parity: both tools defer derived structures during ingest — kupo via
+#     --defer-db-indexes, sieve by design (secondary indexes AND, since the
+#     deferred-policy-index change, the policies table itself). The sync_wall/
+#     sync_cpu columns are therefore the like-for-like pure-ingest pair.
+#     Sieve's one-shot completion (--build-indexes: derive policies + build all
+#     indexes) IS timed, reported as derive_s and folded into ttq_wall_s
+#     (time-to-queryable), and db_MiB is measured AFTER it — the size a
+#     queryable database actually occupies. kupo's own deferred index build
+#     cannot be triggered here (it fires at its real chain tip, not --until), so
+#     kupo's ttq_wall_s carries an unmeasured residue in kupo's favour; treat
+#     ttq as sieve-pessimistic.
 #   - Prune parity: neither prunes (kupo runs without --prune-utxo), so both
 #     keep full history — matching sieve's append-only model.
 #   - Storage-pragma asymmetry (NOT equalised): both use WAL + synchronous=NORMAL
@@ -127,9 +134,13 @@ cpu_time_s() { awk -F': ' '/User time/{u=$2} /System time/{s=$2} END{printf "%.2
 # Clock ticks per second, to convert /proc/<pid>/stat utime+stime into seconds.
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
-# ---- one sieve run: it exits at --until, so time(1) captures it directly ----
-run_sieve() { # $1 = run index -> "elapsed_s max_rss_kb db_bytes cpu_time_s"
-  local db="$WORK/sieve-$1.sqlite3" tf="$WORK/sieve-$1.time"
+# ---- one sieve run: it exits at --until, so time(1) captures it directly.
+#      The bounded sync defers the policy index and all secondary indexes, so a
+#      second timed step (--build-indexes) completes the database; its cost is
+#      reported separately and the db size is measured after it — that is what a
+#      QUERYABLE database costs, not just an ingested one. -----------------------
+run_sieve() { # $1 = run index -> "elapsed_s max_rss_kb db_bytes cpu_time_s derive_s derive_cpu_s"
+  local db="$WORK/sieve-$1.sqlite3" tf="$WORK/sieve-$1.time" df="$WORK/sieve-$1.derive.time"
   local sl="$WORK/sieve-$1.synclog"
   # Progress goes to a file rather than the terminal: it is one heartbeat line
   # every 5 s, so the write is immaterial to the measurement, but it keeps this
@@ -139,7 +150,9 @@ run_sieve() { # $1 = run index -> "elapsed_s max_rss_kb db_bytes cpu_time_s"
     "$SIEVE_BIN" \
       --socket-path "$NODE_SOCKET" --testnet-magic "$TESTNET_MAGIC" \
       --database "$db" --since origin --until "$UNTIL_SLOT" >"$sl" 2>&1
-  echo "$(elapsed_s "$tf") $(max_rss_kb "$tf") $(db_bytes "$db") $(cpu_time_s "$tf")"
+  "$TIME_BIN" -v -o "$df" \
+    "$SIEVE_BIN" --database "$db" --build-indexes >>"$sl" 2>&1
+  echo "$(elapsed_s "$tf") $(max_rss_kb "$tf") $(db_bytes "$db") $(cpu_time_s "$tf") $(elapsed_s "$df") $(cpu_time_s "$df")"
 }
 
 # ---- one kupo run: kupo keeps running after --until, so we poll /health and
@@ -205,25 +218,31 @@ run_kupo() { # $1 = run index -> "elapsed_s max_rss_kb db_bytes cpu_time_s"
   # Graceful shutdown (SIGINT, not SIGKILL) so kupo checkpoints its WAL and the
   # on-disk db size is real rather than stranded in the -wal sidecar.
   kill -INT "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  # No derive step: kupo's deferred index build fires at its real chain tip,
+  # which a bounded replay never reaches — that residue is unmeasurable here
+  # and is called out in the fairness notes. Zeros keep the field count uniform.
   awk -v s="$start" -v e="$end" -v r="${rss_kb:-0}" -v db="$(db_bytes "$dir/kupo.sqlite3")" -v cpu="${kcpu:-0}" \
-      'BEGIN { printf "%.2f %s %s %s\n", e - s, r, db, cpu }'
+      'BEGIN { printf "%.2f %s %s %s 0 0\n", e - s, r, db, cpu }'
 }
 
 median() { sort -n | awk '{a[NR]=$1} END{ print (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2 }'; }
 
 # One timed run of a tool; appends its (elapsed, rss, db) to that tool's files.
 one_run() { # $1=name $2=runner $3=run-index
-  local name="$1" fn="$2" i="$3" el rss db cpu pct
+  local name="$1" fn="$2" i="$3" el rss db cpu dw dc pct
   # Idle before each timed run so a CPU heated by the previous run (or the
   # warm-up) clocks back up; without this, thermal throttling makes later runs
   # slower and drifts the median upward.
   if [ "${COOLDOWN:-0}" -gt 0 ]; then log "cooldown ${COOLDOWN}s ..."; sleep "$COOLDOWN"; fi
   log "$name run $i/$RUNS ..."
-  read -r el rss db cpu < <("$fn" "$i")
+  read -r el rss db cpu dw dc < <("$fn" "$i")
   echo "$el" >>"$WORK/$name.el"; echo "$rss" >>"$WORK/$name.rss"
   echo "$db" >>"$WORK/$name.db"; echo "$cpu" >>"$WORK/$name.cpu"
+  echo "$dw" >>"$WORK/$name.dw"; echo "$dc" >>"$WORK/$name.dc"
   pct=$(awk -v c="$cpu" -v w="$el" 'BEGIN{ printf "%.0f", (w>0)? c/w*100 : 0 }')
-  log "  -> ${el}s wall, ${cpu}s cpu (${pct}% CPU), $((rss / 1024)) MiB RSS, $((db / 1024 / 1024)) MiB db"
+  local dnote=""
+  [ "$dw" != 0 ] && dnote=" (+${dw}s derive)"
+  log "  -> ${el}s wall, ${cpu}s cpu (${pct}% CPU), $((rss / 1024)) MiB RSS, $((db / 1024 / 1024)) MiB db${dnote}"
   # Reclaim this run's scratch DB so ~1.5 GB of them don't accumulate in the
   # page cache and evict the node's warm immutable-chunk cache (which would
   # re-cold later runs). Keep run 1 — the correctness gate reads it.
@@ -236,7 +255,10 @@ one_run() { # $1=name $2=runner $3=run-index
 log "range origin..$UNTIL_SLOT (wildcard), $RUNS runs each, interleaved"
 log "sieve = $SIEVE_BIN"
 log "kupo  = $KUPO_BIN"
-for name in sieve kupo; do : >"$WORK/$name.el"; : >"$WORK/$name.rss"; : >"$WORK/$name.db"; : >"$WORK/$name.cpu"; done
+for name in sieve kupo; do
+  : >"$WORK/$name.el"; : >"$WORK/$name.rss"; : >"$WORK/$name.db"
+  : >"$WORK/$name.cpu"; : >"$WORK/$name.dw"; : >"$WORK/$name.dc"
+done
 # A stray kupo from an aborted earlier run can still hold KUPO_PORT, making a
 # fresh kupo fail to bind — it exits instantly and shows up as a 0-row run.
 # Clear the port before starting.
@@ -268,17 +290,32 @@ s_all=$(sqlite3 "$WORK/sieve-1.sqlite3"      'SELECT count(*) FROM outputs' 2>/d
 s_uns=$(sqlite3 "$WORK/sieve-1.sqlite3"      'SELECT count(*) FROM unspent' 2>/dev/null || echo '?')
 k_all=$(sqlite3 "$WORK/kupo-1/kupo.sqlite3"  'SELECT count(*) FROM inputs' 2>/dev/null || echo '?')
 k_uns=$(sqlite3 "$WORK/kupo-1/kupo.sqlite3"  'SELECT count(*) FROM inputs WHERE spent_at IS NULL' 2>/dev/null || echo '?')
-log "  outputs-ever: sieve=$s_all kupo=$k_all | unspent: sieve=$s_uns kupo=$k_uns"
-if [ "$s_all" != "$k_all" ] || [ "$s_uns" != "$k_uns" ]; then
+# The derive ran during run 1, so the policy index is comparable too. kupo
+# stores one row per (output, policy); sieve one per (output, policy, asset) —
+# so sieve is collapsed to distinct (output, policy) pairs for the comparison.
+s_pol=$(sqlite3 "$WORK/sieve-1.sqlite3" \
+  'SELECT count(*) FROM (SELECT DISTINCT output_num, policy_num FROM policies)' 2>/dev/null || echo '?')
+k_pol=$(sqlite3 "$WORK/kupo-1/kupo.sqlite3" 'SELECT count(*) FROM policies' 2>/dev/null || echo '?')
+log "  outputs-ever: sieve=$s_all kupo=$k_all | unspent: sieve=$s_uns kupo=$k_uns | (output,policy) pairs: sieve=$s_pol kupo=$k_pol"
+if [ "$s_all" != "$k_all" ] || [ "$s_uns" != "$k_uns" ] || [ "$s_pol" != "$k_pol" ]; then
   log "  WARNING: counts differ — the tools are NOT doing equal work; the numbers below are not comparable."
 fi
 
-printf '\n%-7s %9s %9s %7s %13s %11s\n' tool wall_s cpu_s CPU% peak_RSS_MiB db_MiB
+# sync_* is the like-for-like pure-ingest pair. derive_s is sieve completing the
+# database (policy index + all secondary indexes), "-" for kupo whose equivalent
+# fires only at its real tip. ttq_wall_s = sync + derive: wall time from empty
+# database to one that can serve every query dimension. db_MiB is post-derive.
+printf '\n%-7s %11s %10s %7s %9s %10s %13s %11s\n' \
+  tool sync_wall_s sync_cpu_s CPU% derive_s ttq_wall_s peak_RSS_MiB db_MiB
 for name in sieve kupo; do
   mw=$(median <"$WORK/$name.el"); mc=$(median <"$WORK/$name.cpu")
-  printf '%-7s %9.1f %9.1f %6.0f%% %13.0f %11.0f\n' \
+  mdw=$(median <"$WORK/$name.dw")
+  dshow=$(awk -v d="$mdw" 'BEGIN{ print (d>0)? sprintf("%.1f",d) : "-" }')
+  printf '%-7s %11.1f %10.1f %6.0f%% %9s %10.1f %13.0f %11.0f\n' \
     "$name" "$mw" "$mc" \
     "$(awk -v c="$mc" -v w="$mw" 'BEGIN{print (w>0)? c/w*100 : 0}')" \
+    "$dshow" \
+    "$(awk -v w="$mw" -v d="$mdw" 'BEGIN{print w+d}')" \
     "$(awk -v r="$(median <"$WORK/$name.rss")" 'BEGIN{print r/1024}')" \
     "$(awk -v d="$(median <"$WORK/$name.db")" 'BEGIN{print d/1024/1024}')"
 done
