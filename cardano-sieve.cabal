@@ -46,6 +46,7 @@ library
     , containers               ^>=0.7
     , http-api-data            ^>=0.6
     , cardano-slotting         ^>=0.2
+    , http-types
     , microlens                ^>=0.4
     , optparse-applicative     ^>=0.19
     , ouroboros-network:protocols ^>=1.1

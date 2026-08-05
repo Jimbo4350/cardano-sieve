@@ -103,7 +103,16 @@ import Database.SQLite.Simple
   , (:.) ((:.))
   )
 import GHC.Clock (getMonotonicTime)
-import Network.Wai (Middleware, rawPathInfo, rawQueryString, requestMethod)
+import Network.HTTP.Types.Status (status304)
+import Network.Wai
+  ( Middleware
+  , mapResponseHeaders
+  , rawPathInfo
+  , rawQueryString
+  , requestHeaders
+  , requestMethod
+  , responseLBS
+  )
 import Network.Wai.Handler.Warp qualified as Warp
 import System.Exit (die)
 import System.Posix.Files (fileExist)
@@ -341,7 +350,7 @@ runServer dbPath port = do
         <> summary
         <> ")"
     )
-  Warp.run port (logRequests (serve (Proxy :: Proxy API) (server dbPath)))
+  Warp.run port (logRequests (cacheHeaders dbPath (serve (Proxy :: Proxy API) (server dbPath))))
 
 -- | Check the database before serving from it, and describe what is in it.
 --
@@ -417,6 +426,41 @@ withReadConnection dbPath act =
   withConnection dbPath $ \conn -> do
     () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
     act conn
+
+-- | Conditional-request support, kupo's contract exactly.
+--
+-- Every response carries @X-Most-Recent-Checkpoint@ (the newest indexed slot,
+-- @0@ when the database is empty) and, when a checkpoint exists, @ETag@ — the
+-- tip block's header hash as bare hex, no quotes. A request whose
+-- @If-None-Match@ equals the current tag short-circuits to an empty @304@
+-- before any handler runs: the chain has not moved since the client last
+-- looked, so neither has any answer this server could give. That is what makes
+-- polling cheap — kupo's spec documents the same @304@ on its read endpoints.
+--
+-- The tag is deliberately the raw hex kupo compares with plain equality, not an
+-- RFC-quoted validator: kupo clients send back exactly what @ETag@ carried, and
+-- matching kupo means matching that byte-for-byte.
+--
+-- One point lookup per request (the newest checkpoint, off the primary key).
+-- kupo answers this from an in-memory health record instead; a cached tip is a
+-- later refinement alongside the connection pool.
+cacheHeaders :: FilePath -> Middleware
+cacheHeaders dbPath app req respond = do
+  tip <- withReadConnection dbPath $ \conn ->
+    query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC LIMIT 1"
+      :: IO [(Int64, ByteString)]
+  case tip of
+    [] ->
+      app req (respond . mapResponseHeaders (("X-Most-Recent-Checkpoint", "0") :))
+    (slot, hash) : _ -> do
+      let etag = encodeUtf8 (hexText hash)
+          headers =
+            [ ("X-Most-Recent-Checkpoint", B8.pack (show slot))
+            , ("ETag", etag)
+            ]
+      if lookup "if-none-match" (requestHeaders req) == Just etag
+        then respond (responseLBS status304 headers "")
+        else app req (respond . mapResponseHeaders (headers <>))
 
 -- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
 -- obvious the server is alive and requests are landing. The per-line cost is
