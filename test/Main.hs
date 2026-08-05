@@ -36,6 +36,7 @@ import Cardano.Api
   , makeShelleyAddress
   , makeStakeAddress
   , serialiseAddress
+  , serialiseToRawBytes
   , serialiseToRawBytesHexText
   , toAddressAny
   )
@@ -44,10 +45,12 @@ import Cardano.Sieve.Node.Insert
   ( DbHandle
   , DirtyDatabase
   , Durability (Durable, UnsafeBulk)
+  , PolicyIndexing (DeferPolicies, MaintainPolicies)
   , SelectorMismatch
   , SpentInput (..)
   , StoredOutput (..)
   , applyBlock
+  , buildPolicyIndex
   , closeDatabase
   , openDatabase
   , reconcileSelectors
@@ -67,6 +70,7 @@ import Cardano.Sieve.Selector
   , selectorFromText
   , selectorToText
   )
+import Cardano.Sieve.Value (encodeValue)
 
 import Control.Exception (bracket, bracket_, try)
 import Control.Monad (when)
@@ -112,7 +116,75 @@ tests =
     , selectorPersistenceTests
     , checkpointTests
     , durabilityTests
+    , policyIndexTests
     ]
+
+-- ----------------------------------------------------------------------------
+-- Deferred policy index
+-- ----------------------------------------------------------------------------
+
+-- | The bulk derive must store exactly what per-row maintenance stores — same
+-- (output, policy, asset) rows, reached through the dictionary. Surrogate
+-- numbers may differ between the two (assignment order is first-seen versus
+-- DISTINCT), so equivalence is judged on resolved triples, never on policy_num.
+policyIndexTests :: TestTree
+policyIndexTests =
+  testGroup
+    "deferred policy index"
+    [ testCase "the bulk derive stores what per-row maintenance stores" $ do
+        maintained <- withTempDb "pol-maintain" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db MaintainPolicies 100 (hash 1) [assetOutput refA] [] mempty
+            applyBlock db MaintainPolicies 200 (hash 2) [adaOutput refB] [] mempty
+          resolvedTriples path
+        derived <- withTempDb "pol-defer" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db DeferPolicies 100 (hash 1) [assetOutput refA] [] mempty
+            applyBlock db DeferPolicies 200 (hash 2) [adaOutput refB] [] mempty
+            buildPolicyIndex db
+          resolvedTriples path
+        derived @?= maintained
+        length derived @?= 1
+    , testCase "the derive completes a partially maintained index" $
+        withTempDb "pol-gap" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db MaintainPolicies 100 (hash 1) [assetOutput refA] [] mempty
+            applyBlock db DeferPolicies 200 (hash 2) [assetOutput refB] [] mempty
+            buildPolicyIndex db
+          triples <- resolvedTriples path
+          length triples @?= 2
+    , testCase "re-deriving a complete index changes nothing" $
+        withTempDb "pol-idem" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db DeferPolicies 100 (hash 1) [assetOutput refA] [] mempty
+            buildPolicyIndex db
+            buildPolicyIndex db
+          triples <- resolvedTriples path
+          length triples @?= 1
+    ]
+ where
+  refA = BS.replicate 32 6 <> BS.replicate 8 0
+  refB = BS.replicate 32 7 <> BS.replicate 8 0
+  hash n = BS.replicate 32 n
+
+  -- One output carrying an asset (its value round-trips through encodeValue,
+  -- which is what the derive decodes) and one carrying only ada.
+  assetOutput ref = (storedOutput ref){soValue = encodeValue assetValue, soAssets = assetsOfValue}
+  adaOutput ref = (storedOutput ref){soValue = encodeValue (fromList [])}
+  assetsOfValue =
+    [(serialiseToRawBytes policyId, serialiseToRawBytes assetName)]
+
+  withDb path = bracket (openDatabase Durable path 1) closeDatabase
+
+  resolvedTriples :: FilePath -> IO [(ByteString, ByteString, ByteString)]
+  resolvedTriples path = withConnection path $ \conn ->
+    query_
+      conn
+      "SELECT o.output_reference, i.policy_id, p.asset_name \
+      \FROM policies p \
+      \JOIN policy_ids i USING (policy_num) \
+      \JOIN outputs o USING (output_num) \
+      \ORDER BY o.output_reference, i.policy_id, p.asset_name"
 
 -- ----------------------------------------------------------------------------
 -- Bulk durability flag
@@ -170,14 +242,14 @@ checkpointTests =
     [ testCase "an applied block leaves a checkpoint" $
         withTempDb "cp-write" $ \path -> do
           withDb path $ \db ->
-            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 100 (blockHash 100) [storedOutput outputRef] [] mempty
           n <- withConnection path $ \conn -> count conn "SELECT count(*) FROM checkpoints"
           n @?= 1
     , testCase "a rollback drops the checkpoints above it" $
         withTempDb "cp-rollback" $ \path -> do
           withDb path $ \db -> do
-            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
-            applyBlock db 200 (blockHash 200) [storedOutput outputRef2] [] mempty
+            applyBlock db MaintainPolicies 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 200 (blockHash 200) [storedOutput outputRef2] [] mempty
             rollbackAbove db (Just 150)
           (n, top) <- withConnection path $ \conn ->
             (,)
@@ -188,7 +260,9 @@ checkpointTests =
         withTempDb "cp-order" $ \path -> do
           withDb path $ \db -> do
             mapM_
-              (\sl -> applyBlock db sl (blockHash (fromIntegral sl)) [storedOutput outputRef] [] mempty)
+              ( \sl ->
+                  applyBlock db MaintainPolicies sl (blockHash (fromIntegral sl)) [storedOutput outputRef] [] mempty
+              )
               [100, 200, 300]
             points <- resumePoints db
             map fst points @?= [300, 200, 100]
@@ -274,8 +348,8 @@ rollbackTests =
           withDb path $ \db -> do
             -- Created well below the rollback point, spent above it: the output
             -- itself survives, its spend does not.
-            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
-            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            applyBlock db MaintainPolicies 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 200 (blockHash 200) [] [spentInput outputRef] mempty
             rollbackAbove db (Just 150)
           (outs, unspent, spends, expected) <- withConnection path $ \conn ->
             (,,,)
@@ -289,8 +363,8 @@ rollbackTests =
     , testCase "rolling back below an output's creation removes it entirely" $
         withTempDb "create-rollback" $ \path -> do
           withDb path $ \db -> do
-            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
-            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            applyBlock db MaintainPolicies 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 200 (blockHash 200) [] [spentInput outputRef] mempty
             rollbackAbove db (Just 50)
           (outs, unspent, spends) <- withConnection path $ \conn ->
             (,,)
@@ -306,8 +380,8 @@ rollbackTests =
       testCase "an output created and spent above the point is removed, not restored" $
         withTempDb "created-and-spent-above" $ \path -> do
           withDb path $ \db -> do
-            applyBlock db 160 (blockHash 160) [storedOutput outputRef] [] mempty
-            applyBlock db 200 (blockHash 200) [] [spentInput outputRef] mempty
+            applyBlock db MaintainPolicies 160 (blockHash 160) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 200 (blockHash 200) [] [spentInput outputRef] mempty
             rollbackAbove db (Just 150)
           (outs, unspent, spends, expected) <- withConnection path $ \conn ->
             (,,,)
@@ -320,7 +394,7 @@ rollbackTests =
     , testCase "an unspent output is untouched by a later rollback" $
         withTempDb "untouched" $ \path -> do
           withDb path $ \db -> do
-            applyBlock db 100 (blockHash 100) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 100 (blockHash 100) [storedOutput outputRef] [] mempty
             rollbackAbove db (Just 150)
           (unspent, expected) <- withConnection path $ \conn ->
             (,)

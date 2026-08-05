@@ -51,6 +51,7 @@ import Cardano.Sieve.Node.Decode (preimagesInBlock, selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , Durability (Durable, UnsafeBulk)
+  , PolicyIndexing (DeferPolicies, MaintainPolicies)
   , RedeemerCapture
   , applyBlock
   , buildIndexesOn
@@ -405,17 +406,19 @@ sieveBlock
   :: DbHandle
   -> IORef Progress
   -> RedeemerCapture
+  -> PolicyIndexing
   -> [Selector]
   -> Maybe SlotNo
   -> BlockInMode
   -> IO BlockHeader
-sieveBlock dbHandle progress capture selectors target blockInMode@(BlockInMode _ block) = do
+sieveBlock dbHandle progress capture policyIndexing selectors target blockInMode@(BlockInMode _ block) = do
   let header = getBlockHeader block
       BlockHeader slotNo hash _blockNo = header
       selected = selectedStored selectors blockInMode
       spent = spentInputs capture blockInMode
   applyBlock
     dbHandle
+    policyIndexing
     (fromIntegral (unSlotNo slotNo))
     (serialiseToRawBytes hash)
     selected
@@ -636,8 +639,17 @@ followingClient dbHandle progress capture selectors since =
   clientNext built n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
+          -- The policy index follows the same phase as the deferred indexes:
+          -- skipped while catching up, maintained per block once at the tip. The
+          -- block that TRIGGERS the transition is still processed as deferred —
+          -- its rows are committed before 'buildIndexesOn' runs, so the bulk
+          -- derive below covers it.
+          st0 <- readIORef built
+          let policyIndexing = case st0 of
+                IndexesPending -> DeferPolicies
+                IndexesBuilt -> MaintainPolicies
           BlockHeader _ _ blockNo <-
-            sieveBlock dbHandle progress capture selectors (chainTipSlot serverTip) blockInMode
+            sieveBlock dbHandle progress capture policyIndexing selectors (chainTipSlot serverTip) blockInMode
           let tip = fromChainTip serverTip
           -- On first catching the node's tip, build the deferred query indexes
           -- once: bulk catch-up ran index-free, and from here tip updates are
@@ -651,12 +663,13 @@ followingClient dbHandle progress capture selectors since =
                 -- it happens with the heartbeat silenced (no blocks are being
                 -- rolled forward while it runs), so without these two lines
                 -- sieve looks hung at exactly the moment it finishes catching up.
-                stamped "reached tip — building query indexes (this can take a few minutes)"
+                stamped
+                  "reached tip — deriving the policy index and building query indexes (this can take a few minutes)"
                 t0 <- getMonotonicTime
                 buildIndexesOn dbHandle
                 t1 <- getMonotonicTime
                 stamped
-                  ( "query indexes built in "
+                  ( "policy + query indexes built in "
                       <> duration (t1 - t0)
                       <> " — database now durable (WAL), following the tip"
                   )
@@ -746,7 +759,10 @@ boundedClient dbHandle progress capture selectors since untilSlot =
               if slotNo > untilSlot
                 then pure (clientIdle Draining Origin (fromChainTip serverTip) n)
                 else do
-                  _ <- sieveBlock dbHandle progress capture selectors (Just untilSlot) blockInMode
+                  -- Always deferred: a bounded run never reaches the tip
+                  -- transition, and --build-indexes derives the policy index
+                  -- along with the rest.
+                  _ <- sieveBlock dbHandle progress capture DeferPolicies selectors (Just untilSlot) blockInMode
                   let next = if slotNo >= untilSlot then Draining else Indexing
                   pure (clientIdle next (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->

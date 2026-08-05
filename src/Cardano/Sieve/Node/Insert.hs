@@ -22,10 +22,13 @@
 -- committed by 'closeDatabase'; run it via 'Control.Exception.finally' so it
 -- also fires when the caller is torn down by an async exception.
 --
--- Not persisted yet: datum/script /preimages/ (@binary_data@ / @scripts@) — we
--- store the hashes on the output rows but not the bodies — and /spends/ (the
--- @spends@ table and delete-from-@unspent@ on consumption). Both are the next
--- write-path cut.
+-- The @policies@ index is not necessarily maintained per block: during catch-up
+-- the write path skips it ('DeferPolicies') and 'buildPolicyIndex' derives the
+-- whole table from @outputs.value@ at the tip, the same way the secondary
+-- indexes are deferred. Everything it needs is already stored — the value blob
+-- decodes back to exactly the (policy, asset) pairs — so per-row maintenance
+-- during bulk sync would be paying 2.28 million statements for rows a single
+-- set-based pass can produce.
 module Cardano.Sieve.Node.Insert
   ( DbHandle
   , Durability (..)
@@ -38,6 +41,8 @@ module Cardano.Sieve.Node.Insert
   , openDatabase
   , closeDatabase
   , applyBlock
+  , PolicyIndexing (..)
+  , buildPolicyIndex
   , rollbackAbove
   , buildIndexesOn
   , installIndexes
@@ -57,6 +62,7 @@ import Cardano.Sieve.Selector
   , selectorFromText
   , selectorToText
   )
+import Cardano.Sieve.Value (decodeValue)
 
 import Control.Exception (Exception, bracket, onException, throwIO)
 import Control.Monad (unless, when)
@@ -70,14 +76,19 @@ import Database.SQLite.Simple
   ( Connection
   , Only (Only)
   , Query
+  , Statement
   , changes
   , close
   , execute
   , execute_
+  , fold_
   , lastInsertRowId
+  , nextRow
   , open
   , query
   , query_
+  , withBind
+  , withStatement
   , (:.) ((:.))
   )
 
@@ -142,6 +153,18 @@ data SpentInput = SpentInput
   -- enabled. 'Nothing' both for a non-script spend and when capture is off, which
   -- the schema cannot distinguish — see 'RedeemerCapture'.
   }
+
+-- | Whether 'applyBlock' maintains the @policies@\/@policy_ids@ index per row,
+-- or leaves it for 'buildPolicyIndex' to derive later.
+--
+-- Deferred during catch-up because the per-row spelling is the single largest
+-- item in the write phase — two interning statements plus an insert per asset
+-- row, 2.28 million statements over @origin..2,000,000@ — for a table that a
+-- one-shot set-based pass reproduces from @outputs.value@. Maintained again
+-- once at the tip, where blocks arrive every ~20s and the per-row cost is
+-- irrelevant.
+data PolicyIndexing = DeferPolicies | MaintainPolicies
+  deriving (Eq, Show)
 
 -- | Whether to pull spend redeemers out of the witness set and store them.
 --
@@ -253,8 +276,79 @@ openDatabase durability path batchSize = do
 buildIndexesOn :: DbHandle -> IO ()
 buildIndexesOn db = do
   flushBatch db
+  -- Policies first, indexes second: @policiesByPolicyId@ and @policiesByAssetId@
+  -- index the rows this derive creates, and bulk-inserting into an already
+  -- indexed table would pay index maintenance per row instead of one build.
+  buildPolicyIndex db
   installDeferredIndexes (dbConn db)
   makeDurable db
+
+-- | Derive @policy_ids@ and @policies@ from @outputs.value@, in bulk — the
+-- deferred counterpart of what 'MaintainPolicies' does per row.
+--
+-- One Haskell pass decodes each stored value (SQLite cannot read CBOR; this is
+-- the only part that cannot be SQL) into a temporary staging table of
+-- @(output_num, policy_id, asset_name)@ triples. Everything after is set-based:
+-- one statement tops up the dictionary with the policies not yet in it, and one
+-- @INSERT … SELECT … JOIN@ writes the index — the join IS the interning,
+-- replacing per-row lookups with a single relational operation. No cache,
+-- nothing held in memory beyond the statement.
+--
+-- Idempotent, and more: it /completes/ a partial index rather than assuming
+-- emptiness. A database that was maintained for a while, then extended with
+-- deferred blocks (a bounded resume), ends up whole — the dictionary top-up
+-- skips known policies and the final insert is @OR IGNORE@ against the primary
+-- key. Re-running on an already-complete database re-derives and ignores
+-- everything: wasteful, harmless.
+--
+-- A value that fails to decode is fatal. Every stored value was written by
+-- 'Cardano.Sieve.Value.encodeValue', so an undecodable one is corruption or a
+-- codec bug, and silently skipping it would quietly lose index rows.
+buildPolicyIndex :: DbHandle -> IO ()
+buildPolicyIndex db@DbHandle{dbConn = conn} = do
+  flushBatch db
+  execute_ conn "BEGIN TRANSACTION"
+  execute_
+    conn
+    "CREATE TEMP TABLE policy_staging \
+    \( output_num   INTEGER NOT NULL \
+    \, policy_id    BLOB    NOT NULL \
+    \, asset_name   BLOB    NOT NULL \
+    \, created_slot INTEGER NOT NULL \
+    \)"
+  withStatement
+    conn
+    "INSERT INTO policy_staging (output_num, policy_id, asset_name, created_slot) \
+    \VALUES (?, ?, ?, ?)"
+    (\ins -> fold_ conn "SELECT output_num, value, created_slot FROM outputs" () (stage ins))
+  execute_
+    conn
+    "INSERT INTO policy_ids (policy_id) \
+    \SELECT DISTINCT policy_id FROM policy_staging \
+    \WHERE policy_id NOT IN (SELECT policy_id FROM policy_ids)"
+  execute_
+    conn
+    "INSERT OR IGNORE INTO policies (output_num, policy_num, asset_name, created_slot) \
+    \SELECT s.output_num, i.policy_num, s.asset_name, s.created_slot \
+    \FROM policy_staging s JOIN policy_ids i ON i.policy_id = s.policy_id"
+  execute_ conn "DROP TABLE policy_staging"
+  execute_ conn "COMMIT"
+ where
+  stage :: Statement -> () -> (Int64, ByteString, Int64) -> IO ()
+  stage ins () (outputNum, value, slot) =
+    case decodeValue value of
+      Left err ->
+        error ("buildPolicyIndex: undecodable value on output_num " <> show outputNum <> ": " <> err)
+      Right (_, assets) ->
+        mapM_
+          ( \(pid, name, quantity) ->
+              -- The q > 0 guard mirrors 'assetsOf', which feeds the per-row
+              -- path — the two spellings must store identical rows.
+              when (quantity > 0) $
+                withBind ins (outputNum, pid, name, slot) $
+                  () <$ (nextRow ins :: IO (Maybe (Only Int64)))
+          )
+          assets
 
 -- | Open an existing database, install the deferred query indexes, and close.
 -- The @--build-indexes@ one-shot, for databases that never reach live tip (e.g.
@@ -369,14 +463,22 @@ prepare durability path conn = do
 -- avoiding the @INSERT OR REPLACE@ delete that would trip the @policies@
 -- foreign key.
 applyBlock
-  :: DbHandle -> Int64 -> ByteString -> [StoredOutput] -> [SpentInput] -> Preimages -> IO ()
-applyBlock _ _ _ [] [] _ = pure ()
+  :: DbHandle
+  -> PolicyIndexing
+  -> Int64
+  -> ByteString
+  -> [StoredOutput]
+  -> [SpentInput]
+  -> Preimages
+  -> IO ()
+applyBlock _ _ _ _ [] [] _ = pure ()
 applyBlock
   DbHandle
     { dbConn = conn
     , dbBatchSize = batchSize
     , dbUncommittedRows = pending
     }
+  policyIndexing
   slot
   headerHash
   created
@@ -402,7 +504,7 @@ applyBlock
         conn
         "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
         (slot, headerHash)
-    mapM_ (insertOutput conn slot) created
+    mapM_ (insertOutput conn policyIndexing slot) created
     mapM_ (recordSpend conn slot) spent
     -- Preimages are gathered from the WHOLE block, so gate them on the block
     -- being relevant to the configured selectors — otherwise a narrow selector
@@ -425,8 +527,8 @@ applyBlock
 
 -- | Write one matched output. @outputs@ is inserted before @policies@ so the
 -- foreign key is satisfied within the transaction.
-insertOutput :: Connection -> Int64 -> StoredOutput -> IO ()
-insertOutput conn slot o = do
+insertOutput :: Connection -> PolicyIndexing -> Int64 -> StoredOutput -> IO ()
+insertOutput conn policyIndexing slot o = do
   execute
     conn
     "INSERT OR IGNORE INTO outputs \
@@ -459,16 +561,22 @@ insertOutput conn slot o = do
            , slot
            )
     )
-  mapM_
-    ( \(pid, name) -> do
-        num <- policyNumOf conn pid
-        execute
-          conn
-          "INSERT OR IGNORE INTO policies (output_num, policy_num, asset_name, created_slot) \
-          \VALUES (?, ?, ?, ?)"
-          (outputNum, num, name, slot)
-    )
-    (soAssets o)
+  -- Under 'DeferPolicies' the whole loop is skipped — and because 'StoredOutput'
+  -- fields are lazy, the 'soAssets' list is then never even computed by the
+  -- decode stage.
+  case policyIndexing of
+    DeferPolicies -> pure ()
+    MaintainPolicies ->
+      mapM_
+        ( \(pid, name) -> do
+            num <- policyNumOf conn pid
+            execute
+              conn
+              "INSERT OR IGNORE INTO policies (output_num, policy_num, asset_name, created_slot) \
+              \VALUES (?, ?, ?, ?)"
+              (outputNum, num, name, slot)
+        )
+        (soAssets o)
 
 -- | The @outputs.output_num@ surrogate for an output that was just inserted.
 --
