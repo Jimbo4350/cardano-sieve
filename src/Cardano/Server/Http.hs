@@ -74,7 +74,8 @@ import Cardano.Api
 
 import Cardano.Sieve.Node.Insert (busyTimeoutMs, sampleCheckpoints)
 import Cardano.Sieve.Selector
-  ( Selector (..)
+  ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
+  , Selector (..)
   , credentialHashToBytes
   , includes
   , overlaps
@@ -831,7 +832,13 @@ data Plan = Plan
 -- which is primary-key-only on purpose.
 planFor :: Status -> Selector -> Either Text Plan
 planFor status = \case
-  SelectAll _ -> Right (onBase "1" [])
+  -- The two wildcards differ: bare @*@ is everything, @*\/*@ excludes Byron.
+  -- Byron rows are exactly those with no payment credential (the decode stage
+  -- stores NULL for bootstrap addresses, by construction), so the column IS the
+  -- bootstrap filter. Discarding the filter here once made @*\/*@ return — and,
+  -- via DELETE \/matches, would have deleted — Byron outputs.
+  SelectAll IncludeBootstrap -> Right (onBase "1" [])
+  SelectAll OnlyShelley -> Right (onBase "u.payment_credential IS NOT NULL" [])
   SelectExact addr ->
     Right (onBase "u.address = ?" [blob (serialiseToRawBytes addr)])
   SelectPayment ch ->
