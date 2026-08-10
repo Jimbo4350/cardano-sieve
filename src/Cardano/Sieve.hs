@@ -180,7 +180,9 @@ sieve = do
     either (die . ("cardano-sieve: " <>)) pure (invocationOf raw)
   case cmd of
     BuildIndexes -> installIndexes db
-    Serve port -> runServer db port
+    -- No node: --serve without --socket-path IS serve-only by invocationOf's
+    -- rules, so /health reports disconnected with a null node tip, honestly.
+    Serve port -> runServer Nothing db port
     -- Indexing alone: catch-up runs in bulk mode (journaling off) and the
     -- session goes durable on reaching the tip. The trade is announced at
     -- startup and guarded by the dirty flag; see 'Durability'.
@@ -200,7 +202,9 @@ sieve = do
       -- Serving alongside: the readers need WAL to coexist with the writer
       -- (journal-off would have every query fight the sync for the file), so
       -- this mode forgoes the bulk-speed trade.
-      race_ (runSyncCommand Durable db sync) (runServer db port)
+      race_
+        (runSyncCommand Durable db sync)
+        (runServer (Just (syNode sync, syNetwork sync)) db port)
  where
   runSyncCommand
     durability

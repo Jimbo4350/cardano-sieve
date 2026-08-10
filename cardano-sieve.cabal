@@ -24,6 +24,8 @@ common project-config
 library
   import:          project-config
   hs-source-dirs:  src
+  autogen-modules: Paths_cardano_sieve
+  other-modules:   Paths_cardano_sieve
   exposed-modules: Cardano.Sieve
                    Cardano.Server.Http
                    Cardano.Sieve.Selector
