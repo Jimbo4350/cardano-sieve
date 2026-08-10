@@ -501,11 +501,17 @@ applyBlock
       conn
       "INSERT OR IGNORE INTO checkpoints (slot_no, header_hash) VALUES (?, ?)"
       (slot, headerHash)
-    unless (null created) $
-      execute
-        conn
-        "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
-        (slot, headerHash)
+    -- Unconditional for any APPLIED block, because the schema's contract is
+    -- "one row per block that produced a matched output OR A SPEND": a block
+    -- can spend tracked outputs while creating nothing that matches, and
+    -- gating this on created outputs left those spends rendering
+    -- @spent_at.header_hash@ as null. Unreachable under a wildcard selector —
+    -- every transaction creates matching outputs — which is why no benchmark
+    -- ever saw it.
+    execute
+      conn
+      "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"
+      (slot, headerHash)
     -- The four per-row statements are prepared once per block and rebound per
     -- row. 'execute' compiles its SQL on every call, and these are the only
     -- statements that run per ROW rather than per block — roughly a million

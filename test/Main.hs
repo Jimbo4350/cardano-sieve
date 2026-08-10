@@ -391,6 +391,17 @@ rollbackTests =
               <*> count conn unspentInvariant
           (outs, unspent, spends) @?= (0, 0, 0)
           unspent @?= expected
+    , -- The schema's own words: blocks holds "one row per block that produced a
+      -- matched output OR A SPEND". A block that only spends must still leave
+      -- one, or its spends render spent_at.header_hash as null.
+      testCase "a spend-only block still records its header hash" $
+        withTempDb "spend-only-block" $ \path -> do
+          withDb path $ \db -> do
+            applyBlock db MaintainPolicies 100 (blockHash 1) [storedOutput outputRef] [] mempty
+            applyBlock db MaintainPolicies 200 (blockHash 2) [] [spentInput outputRef] mempty
+          n <- withConnection path $ \conn ->
+            count conn "SELECT count(*) FROM blocks WHERE slot_no = 200"
+          n @?= 1
     , testCase "an unspent output is untouched by a later rollback" $
         withTempDb "untouched" $ \path -> do
           withDb path $ \db -> do
