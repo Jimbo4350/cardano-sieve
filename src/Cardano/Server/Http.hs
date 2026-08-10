@@ -14,6 +14,10 @@
 --   * @GET \/checkpoints@ — a sample of stored chain points, newest first
 --   * @GET \/checkpoints\/{slot-no}@ — the point at (or, by default, at-or-before)
 --     a slot; @?strict@ demands the exact slot
+--   * @GET \/patterns@ \/ @GET \/patterns\/{pattern}@ — the configured selectors,
+--     all of them or those including a given pattern
+--   * @PUT@\/@DELETE@ on @\/patterns@ — 501: reconfiguring a live indexer is a
+--     deliberate non-feature; restart it with different @--select@s instead
 --
 -- @\/matches@ covers every dimension. The pattern is parsed by
 -- 'Cardano.Sieve.Selector.selectorFromText' — the same grammar @--select@ uses at
@@ -45,7 +49,7 @@
 -- reference script).
 --
 -- Known gaps against kupo (audited against its OpenAPI spec,
--- @kupo\/docs\/api\/nightly.yaml@): the @\/patterns@, @\/metadata@,
+-- @kupo\/docs\/api\/nightly.yaml@): the @\/metadata@,
 -- @\/health@ and @\/metrics@ endpoints are absent, as is @DELETE
 -- \/matches\/{pattern}@; results are capped at 'pageLimit' where kupo streams every
 -- match; and within one slot the result order differs, since
@@ -70,6 +74,7 @@ import Cardano.Sieve.Node.Insert (busyTimeoutMs, sampleCheckpoints)
 import Cardano.Sieve.Selector
   ( Selector (..)
   , credentialHashToBytes
+  , includes
   , selectorFromText
   )
 import Cardano.Sieve.Value (decodeValue)
@@ -120,14 +125,17 @@ import System.Posix.Files (fileExist)
 import Servant
   ( Capture
   , CaptureAll
+  , Delete
   , Get
   , Handler
   , JSON
+  , Put
   , QueryFlag
   , QueryParam
   , Server
   , ServerError (errBody)
   , err400
+  , err501
   , serve
   , throwError
   , (:<|>) ((:<|>))
@@ -136,7 +144,27 @@ import Servant
 import Web.HttpApiData (FromHttpApiData (parseUrlPiece))
 
 -- | The query API.
-type API = MatchesAPI :<|> CheckpointsAPI :<|> PreimageAPI
+type API = MatchesAPI :<|> CheckpointsAPI :<|> PatternsAPI :<|> PreimageAPI
+
+-- | The configured selectors, read-only.
+--
+-- One 'CaptureAll' route per verb, because a pattern may span two path segments
+-- (the @payment\/delegation@ form embeds a @\/@) and because it makes the bare
+-- @\/patterns@ and @\/patterns\/{pattern}@ shapes one handler: no segments lists
+-- everything, segments filter to the stored patterns that /include/ the given
+-- one ('includes' — kupo's relation, so passing an address answers "which of my
+-- selectors would match this?").
+--
+-- The write verbs exist to say no properly. kupo's PUT\/DELETE reconfigure a
+-- RUNNING indexer — its handler rewinds the chain follower to re-index under
+-- the new pattern set. Sieve's server deliberately has no indexer to rewind
+-- (and when one shares the process, no channel to it), so these are 501 with
+-- instructions, not 404: the resource exists, this server just will not mutate
+-- it.
+type PatternsAPI =
+  "patterns" :> CaptureAll "pattern" Text :> Get '[JSON] [Text]
+    :<|> "patterns" :> CaptureAll "pattern" Text :> Put '[JSON] Value
+    :<|> "patterns" :> CaptureAll "pattern" Text :> Delete '[JSON] Value
 
 -- | Chain points the indexer has recorded, kupo-shaped.
 --
@@ -485,6 +513,7 @@ server :: FilePath -> Server API
 server dbPath =
   matches
     :<|> (checkpointsSample dbPath :<|> checkpointBySlot dbPath)
+    :<|> (patternsGet dbPath :<|> patternsRefuse :<|> patternsRefuse)
     :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
  where
   -- Servant delivers every parameter positionally and untyped — three bare
@@ -501,6 +530,45 @@ server dbPath =
       (if resolve then ResolveHashes else LeaveHashes)
       (SlotBounds cAfter cBefore sAfter sBefore)
       (Refinements pol asset tx ix)
+
+-- | Reject a request with the reason in the body. Top-level because both the
+-- \/matches and \/patterns handlers validate client-supplied patterns.
+badRequest :: Text -> Handler a
+badRequest msg = throwError err400{errBody = LBS.fromStrict (encodeUtf8 msg)}
+
+-- | @GET \/patterns@ and @GET \/patterns\/{pattern}@ — the selectors this
+-- database is indexed under, as stored (the canonical text 'reconcileSelectors'
+-- wrote). No segments lists all of them; a pattern filters to those that
+-- include it, and a malformed pattern is a 400.
+patternsGet :: FilePath -> [Text] -> Handler [Text]
+patternsGet dbPath segs = do
+  stored <- liftIO $ withReadConnection dbPath $ \conn ->
+    query_ conn "SELECT selector FROM patterns ORDER BY selector"
+  let texts = [t | Only t <- stored]
+  case segs of
+    [] -> pure texts
+    _ -> do
+      needle <- case selectorFromText (T.intercalate "/" segs) of
+        Left err -> badRequest ("invalid pattern: " <> pack (show err))
+        Right sel -> pure sel
+      -- Stored rows are canonical text written by selectorToText, so a parse
+      -- failure here is corruption, not client error — let it 500 loudly.
+      let parse t = either (\e -> error ("stored selector unparseable: " <> show e)) id (selectorFromText t)
+      pure [t | t <- texts, parse t `includes` needle]
+
+-- | @PUT@ and @DELETE@ under @\/patterns@: refused, with the reason and the
+-- alternative in the body.
+patternsRefuse :: [Text] -> Handler Value
+patternsRefuse _ =
+  throwError
+    err501
+      { errBody =
+          "sieve does not reconfigure a live indexer: adding or removing \
+          \patterns mid-sync leaves the database incomplete for what it claims \
+          \to index (kupo re-syncs from a rollback point instead). Stop the \
+          \indexer and restart it with the --select set you want; it will \
+          \refuse mismatches and tell you what it was built with."
+      }
 
 -- | @GET \/checkpoints@ — the stored chain points, sampled newest-first.
 checkpointsSample :: FilePath -> Handler [Value]
@@ -656,9 +724,6 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
       <> (if desc then " DESC" else " ASC")
       <> " LIMIT "
       <> Query (pack (show pageLimit))
-
-  badRequest :: Text -> Handler a
-  badRequest msg = throwError err400{errBody = LBS.fromStrict (encodeUtf8 msg)}
 
 -- | The table expression, filter and parameters for one selector.
 --

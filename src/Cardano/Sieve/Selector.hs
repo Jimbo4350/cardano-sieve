@@ -58,6 +58,7 @@ module Cardano.Sieve.Selector
   , selectorToText
   , SelectorParseError (..)
   , OutputContext (..)
+  , includes
   , satisfies
   , paymentHash
   , delegationHash
@@ -396,6 +397,60 @@ satisfies ctx = \case
     selectAsset (ocValue ctx) (AssetId pid name) > 0
   SelectMetadataTag tag ->
     tag `Set.member` ocMetadataTags ctx
+
+-- | Does selector @x@ /include/ selector @y@ — is everything @y@ matches also
+-- matched by @x@? This is the relation behind @GET \/patterns\/{pattern}@:
+-- kupo's spec defines it as "if all results matched by y are also matched by x,
+-- then x is said to include y", and its documented use is passing an address
+-- (itself a pattern) to learn which configured patterns would match it.
+--
+-- Mirrors kupo's own @includes@ (@Kupo.Data.Pattern@) case for case, quirks
+-- included, because this endpoint's answers should agree with kupo's:
+--
+--   * An exact address on the right is handled first, for ANY left side, by
+--     asking whether the left side matches that address — so
+--     @SelectAll OnlyShelley@ correctly excludes a Byron exact address even
+--     though the general wildcard row below would admit it.
+--   * kupo has @MatchAny OnlyShelley@ including every non-bootstrap pattern —
+--     policies, transactions, metadata tags — even though outputs at Byron
+--     addresses can carry native assets. Mirrored as-is.
+--   * kupo has @MatchOutputReference@ including @MatchTransactionId@ of the
+--     same transaction, which reads backwards against its own definition (the
+--     whole transaction matches more than one of its outputs). Mirrored as-is.
+includes :: Selector -> Selector -> Bool
+includes x y = case (x, y) of
+  (p, SelectExact addr) -> p `matchesAddress` addr
+  (SelectAll IncludeBootstrap, _) -> True
+  (SelectAll OnlyShelley, _) -> y /= SelectAll IncludeBootstrap
+  (SelectPayment a, SelectPayment a') -> a == a'
+  (SelectPayment a, SelectPaymentAndDelegation a' _) -> a == a'
+  (SelectDelegation b, SelectDelegation b') -> b == b'
+  (SelectDelegation b, SelectPaymentAndDelegation _ b') -> b == b'
+  (SelectPaymentAndDelegation a b, SelectPaymentAndDelegation a' b') -> a == a' && b == b'
+  (SelectOutputReference a, SelectOutputReference a') -> a == a'
+  (SelectOutputReference a, SelectTransactionId a') -> txIdOf a == a'
+  (SelectTransactionId a, SelectTransactionId a') -> a == a'
+  (SelectPolicyId a, SelectPolicyId a') -> a == a'
+  (SelectAssetId a b, SelectAssetId a' b') -> a == a' && b == b'
+  (SelectPolicyId a, SelectAssetId a' _) -> a == a'
+  (SelectMetadataTag a, SelectMetadataTag a') -> a == a'
+  _nonIncluded -> False
+ where
+  -- The address-only fragment of 'satisfies': which selectors can vouch for an
+  -- address with no transaction context. The context-needing selectors
+  -- (transaction, output reference, policy, asset, metadata) cannot, and fall
+  -- to False — same as kupo's matchingAddress.
+  matchesAddress :: Selector -> AddressAny -> Bool
+  matchesAddress p addr = case p of
+    SelectAll IncludeBootstrap -> True
+    SelectAll OnlyShelley -> isShelley addr
+    SelectExact a -> a == addr
+    SelectPayment c -> paymentHash addr == Just (credentialHashToBytes c)
+    SelectDelegation c -> delegationHash addr == Just (credentialHashToBytes c)
+    SelectPaymentAndDelegation c d ->
+      paymentHash addr == Just (credentialHashToBytes c)
+        && delegationHash addr == Just (credentialHashToBytes d)
+    _needsTransactionContext -> False
 
 -- | The transaction id of an output reference.
 txIdOf :: TxIn -> TxId
