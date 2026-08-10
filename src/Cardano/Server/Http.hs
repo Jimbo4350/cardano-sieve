@@ -92,7 +92,7 @@ import Cardano.Sieve.Selector
 import Cardano.Sieve.Value (decodeValue)
 import Cardano.Slotting.Slot (unSlotNo)
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (Null, String), object, (.=))
@@ -425,8 +425,14 @@ describeDatabase dbPath = do
   probed <-
     try (withReadConnection dbPath probe) :: IO (Either SomeException (Int, Maybe Int64, Bool))
   case probed of
-    Left err ->
-      die (dbPath <> ": not a readable cardano-sieve database — " <> show err)
+    -- 'SomeException' also catches the 'AsyncCancelled' that 'race_' delivers
+    -- when the sync thread dies first. That is not a database problem —
+    -- blaming the file for it buried the real error once — so cancellation
+    -- (and any other async exception) is rethrown, not reported.
+    Left err
+      | Just (SomeAsyncException _) <- fromException err -> throwIO err
+      | otherwise ->
+          die (dbPath <> ": not a readable cardano-sieve database — " <> show err)
     Right (rows, tip, indexed) -> do
       when (rows == 0) $
         putStrLn "WARNING: 0 unspent rows — every query will return []. Is the sync finished?"

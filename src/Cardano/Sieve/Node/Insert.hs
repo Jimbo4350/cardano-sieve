@@ -419,6 +419,21 @@ closeDatabase db = do
 -- rejects statements that produce output.
 prepare :: Durability -> FilePath -> Connection -> IO ()
 prepare durability path conn = do
+  -- Wait for a contended lock instead of failing on it — and set that policy
+  -- FIRST. A fresh connection has SQLite's default @busy_timeout@ of 0 ms:
+  -- return @SQLITE_BUSY@ immediately. Under @--serve@ alongside
+  -- @--socket-path@ the server's startup probe opens this same file at the
+  -- same instant, and whichever connection touches it first briefly holds an
+  -- exclusive lock rebuilding the WAL index — so even the @user_version@ read
+  -- below can lose that collision, and with no timeout it errored instead of
+  -- waiting out the microseconds, killing the process on ~9% of sync+serve
+  -- startups. The pragma itself is a connection setting, not a file access,
+  -- so it cannot be the loser. 'Cardano.Server.Http.withReadConnection' is
+  -- the reader-side mirror of this, for the same reason.
+  --
+  -- Goes through 'query_' because the pragma answers with an INTEGER row and
+  -- 'execute_' rejects statements that produce output.
+  () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
   flags <- query_ conn "PRAGMA user_version" :: IO [Only Int]
   case flags of
     Only flag : _ | flag /= 0 -> throwIO (DirtyDatabase path)
@@ -437,16 +452,6 @@ prepare durability path conn = do
         [ "PRAGMA journal_mode=OFF"
         , "PRAGMA synchronous=OFF"
         ]
-  -- Wait for a contended lock instead of failing on it. SQLite's default is 0 ms
-  -- — return SQLITE_BUSY immediately — which is fine while the writer has the
-  -- file to itself but not once a query server shares the process
-  -- (@--serve@ alongside @--socket-path@): WAL keeps ordinary reads clear of the
-  -- writer, yet the brief exclusive moments still collide, and with no timeout
-  -- the loser errors rather than waiting a few milliseconds.
-  --
-  -- Read back separately from the pragmas above because it answers with an
-  -- INTEGER where @journal_mode@ answers with TEXT.
-  () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
   execute_ conn "PRAGMA foreign_keys=ON"
   createSchema conn
 
