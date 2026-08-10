@@ -18,6 +18,8 @@
 --     all of them or those including a given pattern
 --   * @PUT@\/@DELETE@ on @\/patterns@ — 501: reconfiguring a live indexer is a
 --     deliberate non-feature; restart it with different @--select@s instead
+--   * @DELETE \/matches\/{pattern}@ — prune everything a pattern matched,
+--     refused while a configured selector still covers it
 --
 -- @\/matches@ covers every dimension. The pattern is parsed by
 -- 'Cardano.Sieve.Selector.selectorFromText' — the same grammar @--select@ uses at
@@ -50,8 +52,8 @@
 --
 -- Known gaps against kupo (audited against its OpenAPI spec,
 -- @kupo\/docs\/api\/nightly.yaml@): the @\/metadata@,
--- @\/health@ and @\/metrics@ endpoints are absent, as is @DELETE
--- \/matches\/{pattern}@; results are capped at 'pageLimit' where kupo streams every
+-- @\/health@ and @\/metrics@ endpoints are absent;
+-- results are capped at 'pageLimit' where kupo streams every
 -- match; and within one slot the result order differs, since
 -- matching kupo\'s @(created_slot, transaction_index, output_index)@ exactly would
 -- cost the index-covered sort. A fresh read connection is opened per request; a
@@ -75,6 +77,7 @@ import Cardano.Sieve.Selector
   ( Selector (..)
   , credentialHashToBytes
   , includes
+  , overlaps
   , selectorFromText
   )
 import Cardano.Sieve.Value (decodeValue)
@@ -102,6 +105,8 @@ import Database.SQLite.Simple
   , Only (Only)
   , Query (Query)
   , SQLData (SQLBlob, SQLInteger)
+  , execute
+  , execute_
   , query
   , query_
   , withConnection
@@ -187,6 +192,10 @@ type PreimageAPI =
     :<|> "scripts" :> Capture "script-hash" Text :> Get '[JSON] Value
 
 type MatchesAPI =
+  MatchesGetAPI
+    :<|> "matches" :> CaptureAll "pattern" Text :> Delete '[JSON] Value
+
+type MatchesGetAPI =
   "matches"
     :> CaptureAll "pattern" Text
     :> QueryFlag "unspent"
@@ -511,7 +520,7 @@ logRequests app req respond = do
 
 server :: FilePath -> Server API
 server dbPath =
-  matches
+  (matches :<|> matchesDelete dbPath)
     :<|> (checkpointsSample dbPath :<|> checkpointBySlot dbPath)
     :<|> (patternsGet dbPath :<|> patternsRefuse :<|> patternsRefuse)
     :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
@@ -535,6 +544,75 @@ server dbPath =
 -- \/matches and \/patterns handlers validate client-supplied patterns.
 badRequest :: Text -> Handler a
 badRequest msg = throwError err400{errBody = LBS.fromStrict (encodeUtf8 msg)}
+
+-- | @DELETE \/matches\/{pattern}@ — prune everything the pattern matched:
+-- the outputs, their live-set rows, their spend records and their policy index
+-- rows, in one transaction, answering @{"deleted": n}@ with the count of
+-- outputs removed. This is how disk is reclaimed after narrowing interest —
+-- e.g. having indexed under @*@ and later caring about one address — without
+-- a wipe-and-resync.
+--
+-- Refused ('overlaps') while a configured selector still covers the pattern:
+-- the indexer would re-create the rows from the next block, so the delete
+-- would be pointless churn. kupo guards identically. Remove the selector from
+-- @--select@ (and restart) first.
+--
+-- Row selection reuses 'planFor' — the same planner every @\/matches@ query
+-- goes through — with 'AllMatches', so what a pattern DELETES is exactly what
+-- it would have returned. The doomed set is materialised once into a TEMP
+-- table (per-connection, so concurrent deletes cannot collide) and the four
+-- tables are pruned from it, @policies@ before @outputs@ for the foreign key,
+-- as 'rollbackAbove' does.
+--
+-- A policy or asset pattern reads the @policies@ index to find its rows, and
+-- that index may legitimately not exist yet (it is derived at the tip). On an
+-- underived database the delete would silently remove nothing, so that case
+-- is refused with instructions rather than allowed to lie.
+matchesDelete :: FilePath -> [Text] -> Handler Value
+matchesDelete dbPath segs = do
+  sel <- case selectorFromText (T.intercalate "/" segs) of
+    Left err -> badRequest ("invalid pattern: " <> pack (show err))
+    Right s -> pure s
+  active <- liftIO $ withReadConnection dbPath $ \conn ->
+    query_ conn "SELECT selector FROM patterns"
+  let parse t = either (\e -> error ("stored selector unparseable: " <> show e)) id (selectorFromText t)
+  when (sel `overlaps` [parse t | Only t <- active]) $
+    badRequest
+      "pattern overlaps a configured selector: the indexer would re-create \
+      \these matches from the next block. Remove it from --select (and \
+      \restart the indexer) before deleting its matches."
+  plan <- either badRequest pure (planFor AllMatches sel)
+  needsPolicyIndex <- case sel of
+    SelectPolicyId{} -> pure True
+    SelectAssetId{} -> pure True
+    _ -> pure False
+  underived <- liftIO $ withReadConnection dbPath $ \conn -> do
+    hasPolicies <- query_ conn "SELECT EXISTS (SELECT 1 FROM policies)" :: IO [Only Int]
+    hasOutputs <- query_ conn "SELECT EXISTS (SELECT 1 FROM outputs)" :: IO [Only Int]
+    pure (needsPolicyIndex && hasPolicies == [Only 0] && hasOutputs == [Only 1])
+  when underived $
+    badRequest
+      "the policy index has not been derived yet, so this pattern would match \
+      \nothing to delete. Run --build-indexes first."
+  deleted <- liftIO $ withReadConnection dbPath $ \conn -> do
+    execute_ conn "BEGIN TRANSACTION"
+    execute
+      conn
+      ( "CREATE TEMP TABLE doomed AS SELECT u.output_num AS output_num FROM "
+          <> planFrom plan
+          <> " WHERE "
+          <> planWhere plan
+      )
+      (planParams plan)
+    counted <- query_ conn "SELECT count(*) FROM doomed" :: IO [Only Int]
+    execute_ conn "DELETE FROM policies WHERE output_num IN (SELECT output_num FROM doomed)"
+    execute_ conn "DELETE FROM spends WHERE output_num IN (SELECT output_num FROM doomed)"
+    execute_ conn "DELETE FROM unspent WHERE output_num IN (SELECT output_num FROM doomed)"
+    execute_ conn "DELETE FROM outputs WHERE output_num IN (SELECT output_num FROM doomed)"
+    execute_ conn "DROP TABLE doomed"
+    execute_ conn "COMMIT"
+    pure (case counted of Only n : _ -> n; [] -> 0)
+  pure (object ["deleted" .= deleted])
 
 -- | @GET \/patterns@ and @GET \/patterns\/{pattern}@ — the selectors this
 -- database is indexed under, as stored (the canonical text 'reconcileSelectors'

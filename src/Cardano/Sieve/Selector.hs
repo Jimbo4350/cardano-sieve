@@ -59,6 +59,7 @@ module Cardano.Sieve.Selector
   , SelectorParseError (..)
   , OutputContext (..)
   , includes
+  , overlaps
   , satisfies
   , paymentHash
   , delegationHash
@@ -435,22 +436,50 @@ includes x y = case (x, y) of
   (SelectPolicyId a, SelectAssetId a' _) -> a == a'
   (SelectMetadataTag a, SelectMetadataTag a') -> a == a'
   _nonIncluded -> False
+
+-- | Does the selector share ANY possible result with one of the given set?
+-- Symmetric where 'includes' is directional, and deliberately over-approximate
+-- — two base-address selectors "overlap" on either credential matching, though
+-- an output needs both. This is the guard on @DELETE \/matches\/{pattern}@:
+-- deleting matches a configured selector still covers is pointless churn (the
+-- indexer re-creates them next block), so erring towards refusal is the safe
+-- direction. Mirrors kupo's @overlaps@, checked in both directions per pair.
+overlaps :: Selector -> [Selector] -> Bool
+overlaps p = any (\p' -> overlapTwo p p' || overlapTwo p' p)
  where
-  -- The address-only fragment of 'satisfies': which selectors can vouch for an
-  -- address with no transaction context. The context-needing selectors
-  -- (transaction, output reference, policy, asset, metadata) cannot, and fall
-  -- to False — same as kupo's matchingAddress.
-  matchesAddress :: Selector -> AddressAny -> Bool
-  matchesAddress p addr = case p of
-    SelectAll IncludeBootstrap -> True
-    SelectAll OnlyShelley -> isShelley addr
-    SelectExact a -> a == addr
-    SelectPayment c -> paymentHash addr == Just (credentialHashToBytes c)
-    SelectDelegation c -> delegationHash addr == Just (credentialHashToBytes c)
-    SelectPaymentAndDelegation c d ->
-      paymentHash addr == Just (credentialHashToBytes c)
-        && delegationHash addr == Just (credentialHashToBytes d)
-    _needsTransactionContext -> False
+  overlapTwo x y = case (x, y) of
+    (SelectAll _, _) -> True
+    (SelectExact addr, p') -> p' `matchesAddress` addr
+    (SelectPayment a, SelectPayment a') -> a == a'
+    (SelectPayment a, SelectPaymentAndDelegation a' _) -> a == a'
+    (SelectDelegation b, SelectDelegation b') -> b == b'
+    (SelectDelegation b, SelectPaymentAndDelegation _ b') -> b == b'
+    (SelectPaymentAndDelegation a b, SelectPaymentAndDelegation a' b') -> a == a' || b == b'
+    (SelectOutputReference a, SelectOutputReference a') -> a == a'
+    (SelectOutputReference a, SelectTransactionId a') -> txIdOf a == a'
+    (SelectTransactionId a, SelectTransactionId a') -> a == a'
+    (SelectPolicyId a, SelectPolicyId a') -> a == a'
+    (SelectPolicyId a, SelectAssetId a' _) -> a == a'
+    (SelectAssetId a b, SelectAssetId a' b') -> a == a' && b == b'
+    (SelectMetadataTag a, SelectMetadataTag a') -> a == a'
+    _nonOverlapping -> False
+
+-- | The address-only fragment of 'satisfies': which selectors can vouch for an
+-- address with no transaction context. The context-needing selectors
+-- (transaction, output reference, policy, asset, metadata) cannot, and fall
+-- to False — same as kupo's matchingAddress. Shared by 'includes' and
+-- 'overlaps'.
+matchesAddress :: Selector -> AddressAny -> Bool
+matchesAddress p addr = case p of
+  SelectAll IncludeBootstrap -> True
+  SelectAll OnlyShelley -> isShelley addr
+  SelectExact a -> a == addr
+  SelectPayment c -> paymentHash addr == Just (credentialHashToBytes c)
+  SelectDelegation c -> delegationHash addr == Just (credentialHashToBytes c)
+  SelectPaymentAndDelegation c d ->
+    paymentHash addr == Just (credentialHashToBytes c)
+      && delegationHash addr == Just (credentialHashToBytes d)
+  _needsTransactionContext -> False
 
 -- | The transaction id of an output reference.
 txIdOf :: TxIn -> TxId
