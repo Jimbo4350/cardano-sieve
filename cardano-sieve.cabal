@@ -33,6 +33,7 @@ library
                    Cardano.Sieve.Schema
                    Cardano.Sieve.Node.Decode
                    Cardano.Sieve.Node.Fetch
+                   Cardano.Sieve.Node.FetchBlock
                    Cardano.Sieve.Node.Insert
   build-depends:
     , aeson                    >=2.2
@@ -45,6 +46,7 @@ library
     , cardano-api              >=11.2
     , cardano-ledger-alonzo
     , cardano-ledger-babbage
+    , cardano-ledger-core
     , containers               ^>=0.7
     , http-api-data            ^>=0.6
     , cardano-slotting         ^>=0.2
