@@ -41,6 +41,7 @@ import Cardano.Api
   , toAddressAny
   )
 
+import Cardano.Server.Http (Cursor (..), cursorFromText, cursorToText)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , DirtyDatabase
@@ -79,6 +80,7 @@ import Data.ByteString qualified as BS
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
 import Database.SQLite.Simple (Connection, Only (Only), Query, execute_, query_, withConnection)
 import GHC.Exts (fromList)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
@@ -117,6 +119,34 @@ tests =
     , checkpointTests
     , durabilityTests
     , policyIndexTests
+    , cursorTests
+    ]
+
+-- ----------------------------------------------------------------------------
+-- Pagination cursor
+-- ----------------------------------------------------------------------------
+
+-- | The opaque page cursor must survive its round trip exactly — a cursor that
+-- drifts by one row silently drops or repeats matches at every page boundary —
+-- and must reject anything it did not itself produce.
+cursorTests :: TestTree
+cursorTests =
+  testGroup
+    "pagination cursor"
+    [ testProperty "round-trips through its wire form" $
+        property $ do
+          desc <- forAll Gen.bool
+          slot <- forAll (Gen.int64 (Range.linear 0 maxBound))
+          rowid <- forAll (Gen.int64 (Range.linear 0 maxBound))
+          let c = Cursor desc slot rowid
+          cursorFromText (cursorToText c) === Just c
+    , testCase "rejects garbage, truncation, and a foreign direction byte" $ do
+        cursorFromText "not-a-cursor" @?= Nothing
+        cursorFromText "" @?= Nothing
+        -- One byte short of the 17 the codec promises.
+        cursorFromText (T.dropEnd 2 (cursorToText (Cursor True 5 7))) @?= Nothing
+        -- Right length, direction byte neither 0 nor 1.
+        cursorFromText ("02" <> T.drop 2 (cursorToText (Cursor True 5 7))) @?= Nothing
     ]
 
 -- ----------------------------------------------------------------------------

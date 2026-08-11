@@ -57,15 +57,22 @@
 -- pinned rows of every kind (datum by hash, inline datum, no datum, spent,
 -- reference script).
 --
--- Known gaps against kupo (audited against its OpenAPI spec,
--- @kupo\/docs\/api\/nightly.yaml@): results are capped at 'pageLimit'
--- where kupo streams every
--- match; and within one slot the result order differs, since
--- matching kupo\'s @(created_slot, transaction_index, output_index)@ exactly would
--- cost the index-covered sort. A fresh read connection is opened per request; a
--- connection pool is a later refinement.
+-- Known divergences from kupo (audited against its OpenAPI spec,
+-- @kupo\/docs\/api\/nightly.yaml@): kupo streams every match in one unbounded
+-- response, sieve serves 'pageLimit' rows per request with an @X-Next-Cursor@
+-- header \/ @?after@ parameter to walk the rest — every match is reachable,
+-- but a kupo client must learn to page. Within one slot the order is sieve's
+-- total @(created_slot, rowid)@ rather than kupo's
+-- @(created_slot, transaction_index, output_index)@, since matching that
+-- exactly would cost the index-covered sort. A fresh read connection is
+-- opened per request; a connection pool is a later refinement.
 module Cardano.Server.Http
   ( runServer
+
+    -- * Exposed for the test suite
+  , Cursor (..)
+  , cursorToText
+  , cursorFromText
   )
 where
 
@@ -268,7 +275,8 @@ type MatchesGetAPI =
     :> QueryParam "transaction_id" Text
     :> QueryParam "output_index" Word64
     :> QueryParam "order" Order
-    :> Get '[JSON] [Value]
+    :> QueryParam "after" Text
+    :> Get '[JSON] (Headers '[Header "X-Next-Cursor" Text] [Value])
 
 -- | Which way round results come back, from kupo's @?order@.
 --
@@ -605,6 +613,9 @@ server node dbPath =
       (if resolve then ResolveHashes else LeaveHashes)
       (SlotBounds cAfter cBefore sAfter sBefore)
       (Refinements pol asset tx ix)
+
+-- (?order and ?after stay positional through here; matchesByPattern
+-- reconciles them, since only the combination is meaningful.)
 
 -- | Reject a request with the reason in the body. Top-level because both the
 -- \/matches and \/patterns handlers validate client-supplied patterns.
@@ -1057,9 +1068,59 @@ metadatumJson = \case
 
 -- | How many matches one request returns. Kupo streams every match; we page, so
 -- a hot key cannot turn one request into a multi-hundred-megabyte response.
--- Cursor pagination is the follow-up that closes the parity gap.
+-- A full page carries an @X-Next-Cursor@ header; @?after@ with its value
+-- resumes exactly where the page stopped, so every match is reachable — the
+-- remaining divergence from kupo is that a client must walk pages rather than
+-- read one unbounded body.
 pageLimit :: Int
 pageLimit = 100
+
+-- | Where a page stopped: the sort key of its last row — @(created_slot,
+-- rowid)@ of the base table — plus the direction it was walking. The next page
+-- is everything strictly past it, which needs no OFFSET (O(page) per page, not
+-- O(pages walked)) and no server-side state.
+--
+-- The rowid is the tiebreak that makes the sort total, and it is deliberately
+-- @u.rowid@ rather than @output_num@: within duplicate @(column, created_slot)@
+-- keys SQLite orders index entries by rowid, so the existing composite indexes
+-- serve the two-column @ORDER BY@ with no sort pass and no index change.
+-- (On @outputs@ the rowid IS @output_num@; on @unspent@ it is the hidden one.)
+--
+-- Consequences a client can observe, both accepted: a cursor is only
+-- meaningful for the same query it came from (the base table, and so the
+-- rowid, changes with @?unspent@\/@?spent@); and a rollback that re-inserts
+-- rows mid-walk can shift them relative to a held cursor — pagination under a
+-- reorg is best-effort, where kupo's single-transaction stream is a snapshot.
+data Cursor = Cursor
+  { cursorDesc :: Bool
+  , cursorSlot :: Int64
+  , cursorRowId :: Int64
+  }
+  deriving (Eq, Show)
+
+-- | The wire form is opaque on purpose: 17 base16 bytes (direction, slot,
+-- rowid, the integers big-endian), promising clients nothing they could
+-- usefully parse — the contract is \"hand back what @X-Next-Cursor@ gave you\".
+cursorToText :: Cursor -> Text
+cursorToText (Cursor desc slot rowid) =
+  hexText
+    ( BS.singleton (if desc then 1 else 0)
+        <> beWord64 (fromIntegral slot)
+        <> beWord64 (fromIntegral rowid)
+    )
+
+cursorFromText :: Text -> Maybe Cursor
+cursorFromText t = case Base16.decode (encodeUtf8 t) of
+  Right raw
+    | BS.length raw == 17
+    , Just desc <- case BS.head raw of
+        0 -> Just False
+        1 -> Just True
+        _ -> Nothing ->
+        Just (Cursor desc (word64At 1 raw) (word64At 9 raw))
+  _ -> Nothing
+ where
+  word64At off = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0 . BS.take 8 . BS.drop off
 
 -- | @GET \/matches\/{pattern}@ — the whole query surface, dispatched on the parsed
 -- 'Selector' so every dimension the indexer can match is also queryable, over
@@ -1079,8 +1140,10 @@ matchesByPattern
   -> SlotBounds
   -> Refinements
   -> Maybe Order
-  -> Handler [Value]
-matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refine order = do
+  -> Maybe Text
+  -- ^ @?after@ — an 'X-Next-Cursor' value from a previous page.
+  -> Handler (Headers '[Header "X-Next-Cursor" Text] [Value])
+matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refine order afterParam = do
   -- The pattern is captured as PATH SEGMENTS and rejoined, because the
   -- payment/delegation form embeds a '/' and so spans two segments. kupo does the
   -- same (it matches on @"matches" : args@). No segments at all is the bare
@@ -1092,25 +1155,50 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
     Right s -> pure s
   plan <- either badRequest pure (planFor status selector)
   filters <- either badRequest pure (filtersFor (planSlotCol plan) bounds refine)
-  let desc = fromMaybe MostRecentFirst order == MostRecentFirst
-  liftIO $ withReadConnection dbPath $ \conn -> do
-    rows <-
-      query
-        conn
-        (planSql plan filters desc)
-        (planParams plan <> concatMap snd filters)
-    pure (map (rowToJson resolveHashes) rows)
+  cursor <- case afterParam of
+    Nothing -> pure Nothing
+    Just t -> case cursorFromText t of
+      Nothing -> badRequest "invalid ?after: pass back exactly what X-Next-Cursor carried"
+      Just c -> pure (Just c)
+  -- A cursor was cut under one direction; walking it the other way would skip
+  -- everything between the cursor and the far end. ?order may restate the
+  -- cursor's direction but not contradict it.
+  desc <- case cursor of
+    Nothing -> pure (fromMaybe MostRecentFirst order == MostRecentFirst)
+    Just c -> case order of
+      Just o
+        | (o == MostRecentFirst) /= cursorDesc c ->
+            badRequest "?after cursor was issued under the opposite ?order"
+      _ -> pure (cursorDesc c)
+  rows <- liftIO $ withReadConnection dbPath $ \conn ->
+    query
+      conn
+      (planSql plan filters desc cursor)
+      ( planParams plan
+          <> concatMap snd filters
+          <> foldMap (\c -> [SQLInteger (cursorSlot c), SQLInteger (cursorRowId c)]) cursor
+      )
+  -- One row beyond the page answers "is there more?" without a second query;
+  -- it is dropped, and its presence is what puts X-Next-Cursor on the response.
+  let (page, overflow) = splitAt pageLimit rows
+      withNext = case (overflow, reverse page) of
+        (_ : _, (core :. Only rowid) : _) ->
+          addHeader (cursorToText (Cursor desc (rowSlot core) rowid))
+        _ -> noHeader
+  pure (withNext (map (\(core :. _rowid) -> rowToJson resolveHashes core) page))
  where
+  rowSlot ((_, _, _, _, _, _, _, slot, _) :. _) = slot :: Int64
   -- One row shape for every status, so a single 'rowToJson' serves them all. The
   -- spends join is a primary-key probe that yields nothing on the @unspent@ base
   -- (those rows are deleted when spent), which at 'pageLimit' rows is immaterial.
-  planSql plan filters desc =
+  planSql plan filters desc cursor =
     "SELECT u.output_reference, u.transaction_index, u.address, u.value, u.datum_hash, \
     \u.datum_type, u.reference_script_hash, u.created_slot, bc.header_hash, \
     \s.spent_slot, bs.header_hash, s.spending_transaction_id, \
     \s.spending_input_index, s.redeemer, "
       <> (case resolveHashes of ResolveHashes -> "bd.datum, sc.script"; LeaveHashes -> "NULL, NULL")
-      <> " FROM "
+      -- The rowid rides along for the cursor and is stripped before rendering.
+      <> ", u.rowid FROM "
       <> planFrom plan
       <> " LEFT JOIN blocks bc ON bc.slot_no = u.created_slot \
          \LEFT JOIN spends s ON s.output_num = u.output_num \
@@ -1127,11 +1215,24 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
       <> " WHERE "
       <> planWhere plan
       <> foldMap (\(cond, _) -> " AND " <> cond) filters
+      -- The continuation: strictly past the cursor in the walk's direction. A
+      -- row value, so the comparison follows the same two-column order the
+      -- ORDER BY names and the index serves.
+      <> ( case cursor of
+             Just _ -> " AND (u.created_slot, u.rowid) " <> (if desc then "<" else ">") <> " (?, ?)"
+             Nothing -> ""
+         )
       <> " ORDER BY "
       <> planSlotCol plan
       <> (if desc then " DESC" else " ASC")
+      -- The rowid tiebreak makes the order total (a cursor needs an exact
+      -- resume point) and is free: within duplicate index keys SQLite already
+      -- stores entries in rowid order, so the composite indexes cover this
+      -- two-column sort exactly as they covered the one-column one.
+      <> ", u.rowid"
+      <> (if desc then " DESC" else " ASC")
       <> " LIMIT "
-      <> Query (pack (show pageLimit))
+      <> Query (pack (show (pageLimit + 1)))
 
 -- | The table expression, filter and parameters for one selector.
 --
