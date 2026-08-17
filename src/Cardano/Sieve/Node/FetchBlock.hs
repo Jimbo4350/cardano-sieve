@@ -8,7 +8,7 @@
 --
 -- kupo's equivalent (@FetchBlock.Node@) keeps one long-lived connection and
 -- takes exactly the block after the intersection; this one connects per
--- request — the same trade 'Cardano.Server.Http.healthSnapshot' makes for the
+-- request — the same trade 'Cardano.Server.Api.Health.healthSnapshot' makes for the
 -- node tip, and the same later refinement (a pooled connection) applies —
 -- and walks until the target slot, because sieve's checkpoints, though also
 -- stored per applied block, may start at a @--since@ rather than genesis.

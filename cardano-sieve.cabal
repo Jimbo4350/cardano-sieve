@@ -27,7 +27,15 @@ library
   autogen-modules: Paths_cardano_sieve
   other-modules:   Paths_cardano_sieve
   exposed-modules: Cardano.Sieve
-                   Cardano.Server.Http
+                   Cardano.Server.Api.Checkpoints
+                   Cardano.Server.Api.Common
+                   Cardano.Server.Api.Health
+                   Cardano.Server.Api.Matches
+                   Cardano.Server.Api.Metadata
+                   Cardano.Server.Api.Patterns
+                   Cardano.Server.Api.Preimages
+                   Cardano.Server.Run
+                   Cardano.Sieve.Database
                    Cardano.Sieve.Selector
                    Cardano.Sieve.Value
                    Cardano.Sieve.Schema

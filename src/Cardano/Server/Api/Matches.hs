@@ -1,32 +1,10 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Read query API (servant + warp) over the synced SQLite database.
---
--- The endpoints:
---
---   * @GET \/matches\/{pattern}@ — every dimension the indexer can match on
---   * @GET \/datums\/{hash}@ — a datum preimage, @{datum}@
---   * @GET \/scripts\/{hash}@ — a script preimage, @{script, language}@
---   * @GET \/checkpoints@ — a sample of stored chain points, newest first
---   * @GET \/checkpoints\/{slot-no}@ — the point at (or, by default, at-or-before)
---     a slot; @?strict@ demands the exact slot
---   * @GET \/patterns@ \/ @GET \/patterns\/{pattern}@ — the configured selectors,
---     all of them or those including a given pattern
---   * @PUT@\/@DELETE@ on @\/patterns@ — 501: reconfiguring a live indexer is a
---     deliberate non-feature; restart it with different @--select@s instead
---   * @DELETE \/matches\/{pattern}@ — prune everything a pattern matched,
---     refused while a configured selector still covers it
---   * @GET \/health@ — JSON health, kupo-shaped; @GET \/metrics@ — the same
---     facts in Prometheus exposition
---   * @GET \/metadata\/{slot-no}@ — a block's transaction metadata, fetched
---     from the node on demand (kupo stores none either); needs a node, so
---     serve-only mode refuses it
+-- | @\/matches@ — the query surface over everything the indexer stored.
 --
 -- @\/matches@ covers every dimension. The pattern is parsed by
 -- 'Cardano.Sieve.Selector.selectorFromText' — the same grammar @--select@ uses at
@@ -37,7 +15,7 @@
 --   * a bech32\/base58\/base16 address     * @*\@{txid}@ — a whole transaction
 --   * @{policy}.{name}@ \/ @{policy}.*@    * @{index}\@{txid}@ — one output
 --
--- All thirteen of kupo\'s documented @\/matches@ parameters: @?unspent@, @?spent@,
+-- All thirteen of kupo's documented @\/matches@ parameters: @?unspent@, @?spent@,
 -- @?resolve_hashes@, @?order@, @?created_after@, @?created_before@,
 -- @?spent_after@, @?spent_before@, @?policy_id@, @?asset_name@,
 -- @?transaction_id@, @?output_index@, plus the pattern itself. Passing neither
@@ -66,8 +44,9 @@
 -- @(created_slot, transaction_index, output_index)@, since matching that
 -- exactly would cost the index-covered sort. A fresh read connection is
 -- opened per request; a connection pool is a later refinement.
-module Cardano.Server.Http
-  ( runServer
+module Cardano.Server.Api.Matches
+  ( MatchesAPI
+  , matchesServer
 
     -- * Exposed for the test suite
   , Cursor (..)
@@ -78,183 +57,66 @@ where
 
 import Cardano.Api
   ( AsType (AsAddressAny)
-  , BlockHeader (BlockHeader)
-  , BlockInMode (BlockInMode)
-  , ChainPoint (ChainPoint, ChainPointAtGenesis)
-  , ChainTip (ChainTip, ChainTipAtGenesis)
-  , ConsensusModeParams (CardanoModeParams)
-  , EpochSlots (EpochSlots)
-  , Hash
-  , LocalNodeConnectInfo (..)
-  , NetworkId
-  , SocketPath
-  , Tx (ShelleyTx)
-  , TxId
   , TxIn (TxIn)
   , TxIx (TxIx)
   , deserialiseFromRawBytes
-  , deserialiseFromRawBytesHex
-  , getBlockHeader
-  , getBlockTxs
-  , getLocalChainTip
-  , getTxIdShelley
-  , proxyToAsType
   , serialiseAddress
   , serialiseToRawBytes
-  , shelleyBasedEraConstraints
   )
-import Cardano.Api.Ledger qualified as L
 
-import Cardano.Ledger.Alonzo.Core (TxAuxDataHash (unTxAuxDataHash), hashTxAuxData, originalBytes)
-import Cardano.Ledger.Metadata (Metadatum (..))
-import Cardano.Sieve.Node.FetchBlock (fetchBlockAtSlot)
-import Cardano.Sieve.Node.Insert (busyTimeoutMs, sampleCheckpoints)
+import Cardano.Server.Api.Common (badRequest, hexText, scriptLanguage, withReadConnection)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
   , Selector (..)
   , credentialHashToBytes
-  , includes
   , overlaps
   , selectorFromText
   )
 import Cardano.Sieve.Value (decodeValue)
-import Cardano.Slotting.Slot (SlotNo (SlotNo), unSlotNo)
 
-import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
-import Control.Monad (guard, unless, when)
+import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value (Null, String), object, (.=))
+import Data.Aeson (Value (Null), object, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base16 qualified as Base16
 import Data.ByteString.Builder (toLazyByteString, word64BE)
-import Data.ByteString.Char8 qualified as B8
 import Data.ByteString.Lazy qualified as LBS
 import Data.Int (Int64)
-import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Proxy (Proxy (Proxy))
+import Data.Maybe (fromMaybe)
 import Data.Text (Text, pack)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import Data.Version (showVersion)
-import Data.Word (Word64, Word8)
+import Data.Text.Encoding (encodeUtf8)
+import Data.Word (Word64)
 import Database.SQLite.Simple
-  ( Connection
-  , Only (Only)
+  ( Only (Only)
   , Query (Query)
   , SQLData (SQLBlob, SQLInteger)
   , execute
   , execute_
   , query
   , query_
-  , withConnection
   , (:.) ((:.))
   )
-import GHC.Clock (getMonotonicTime)
-import Lens.Micro ((^.))
-import Network.HTTP.Types.Status (status304)
-import Network.Wai
-  ( Middleware
-  , mapResponseHeaders
-  , rawPathInfo
-  , rawQueryString
-  , requestHeaders
-  , requestMethod
-  , responseLBS
-  )
-import Network.Wai.Handler.Warp qualified as Warp
-import System.Exit (die)
-import System.Posix.Files (fileExist)
 
-import Paths_cardano_sieve qualified as Paths
 import Servant
-  ( Capture
-  , CaptureAll
+  ( CaptureAll
   , Delete
   , Get
   , Handler
   , Header
   , Headers
   , JSON
-  , PlainText
-  , Put
   , QueryFlag
   , QueryParam
   , Server
-  , ServerError (errBody)
   , addHeader
-  , err400
-  , err501
-  , err503
   , noHeader
-  , serve
-  , throwError
   , (:<|>) ((:<|>))
   , (:>)
   )
 import Web.HttpApiData (FromHttpApiData (parseUrlPiece))
-
--- | The query API.
-type API =
-  MatchesAPI :<|> CheckpointsAPI :<|> PatternsAPI :<|> HealthAPI :<|> PreimageAPI :<|> MetadataAPI
-
--- | On-demand transaction metadata, kupo's contract: never stored, asked of
--- the node per request. See 'metadataBySlot' for the mechanism and the edge
--- cases inherited deliberately.
-type MetadataAPI =
-  "metadata"
-    :> Capture "slot-no" Int64
-    :> QueryParam "transaction_id" Text
-    :> Get '[JSON] (Headers '[Header "X-Block-Header-Hash" Text] [Value])
-
--- | Operational state, kupo's field names. @\/health@ answers JSON; @\/metrics@
--- answers the same facts in Prometheus exposition format (one divergence from
--- kupo, which content-negotiates both on either path).
-type HealthAPI =
-  "health" :> Get '[JSON] Value
-    :<|> "metrics" :> Get '[PlainText] Text
-
--- | The configured selectors, read-only.
---
--- One 'CaptureAll' route per verb, because a pattern may span two path segments
--- (the @payment\/delegation@ form embeds a @\/@) and because it makes the bare
--- @\/patterns@ and @\/patterns\/{pattern}@ shapes one handler: no segments lists
--- everything, segments filter to the stored patterns that /include/ the given
--- one ('includes' — kupo's relation, so passing an address answers "which of my
--- selectors would match this?").
---
--- The write verbs exist to say no properly. kupo's PUT\/DELETE reconfigure a
--- RUNNING indexer — its handler rewinds the chain follower to re-index under
--- the new pattern set. Sieve's server deliberately has no indexer to rewind
--- (and when one shares the process, no channel to it), so these are 501 with
--- instructions, not 404: the resource exists, this server just will not mutate
--- it.
-type PatternsAPI =
-  "patterns" :> CaptureAll "pattern" Text :> Get '[JSON] [Text]
-    :<|> "patterns" :> CaptureAll "pattern" Text :> Put '[JSON] Value
-    :<|> "patterns" :> CaptureAll "pattern" Text :> Delete '[JSON] Value
-
--- | Chain points the indexer has recorded, kupo-shaped.
---
--- The list endpoint is a /sample/ (the exponential ladder shared with resume,
--- 'sampleCheckpoints') — one checkpoint per applied block exists underneath,
--- which nobody wants in one response. The by-slot endpoint answers with the
--- point at-or-before the slot unless @?strict@ demands an exact hit; an absent
--- point is @null@, not a 404, matching kupo and \/datums.
-type CheckpointsAPI =
-  "checkpoints" :> Get '[JSON] [Value]
-    :<|> "checkpoints" :> Capture "slot-no" Int64 :> QueryFlag "strict" :> Get '[JSON] Value
-
--- | Preimage lookups by hash: the bodies behind the hashes a match reports.
---
--- Both return @null@ rather than a 404 for an unknown hash, as kupo does — a
--- referenced datum whose body has not been seen on chain is a normal state, not an
--- error.
-type PreimageAPI =
-  "datums" :> Capture "datum-hash" Text :> Get '[JSON] Value
-    :<|> "scripts" :> Capture "script-hash" Text :> Get '[JSON] Value
 
 type MatchesAPI =
   MatchesGetAPI
@@ -277,6 +139,28 @@ type MatchesGetAPI =
     :> QueryParam "order" Order
     :> QueryParam "after" Text
     :> Get '[JSON] (Headers '[Header "X-Next-Cursor" Text] [Value])
+
+-- | Both @\/matches@ routes.
+matchesServer :: FilePath -> Server MatchesAPI
+matchesServer dbPath = matches :<|> matchesDelete dbPath
+ where
+  -- Servant delivers every parameter positionally and untyped — three bare
+  -- 'Bool's and eight loose 'Maybe's in a row — so the boundary is where they get
+  -- names. 'QueryFlag' can only give us 'Bool', but nothing past this line has to
+  -- take one: the flags become 'HashResolution' and (in 'matchesByPattern') a
+  -- 'Status', and the filters become the two records.
+  matches segs unspent spent resolve cAfter cBefore sAfter sBefore pol asset tx ix =
+    matchesByPattern
+      dbPath
+      segs
+      unspent
+      spent
+      (if resolve then ResolveHashes else LeaveHashes)
+      (SlotBounds cAfter cBefore sAfter sBefore)
+      (Refinements pol asset tx ix)
+
+-- (?order and ?after stay positional through here; matchesByPattern
+-- reconciles them, since only the combination is meaningful.)
 
 -- | Which way round results come back, from kupo's @?order@.
 --
@@ -439,189 +323,6 @@ statusFromFlags unspent spent = case (unspent, spent) of
   (False, True) -> Right OnlySpent
   (False, False) -> Right AllMatches
 
--- | Serve the query API on @port@, reading from the SQLite database at @dbPath@.
--- Refuses to start unless the database is present and readable ('describeDatabase').
-runServer :: Maybe (SocketPath, NetworkId) -> FilePath -> Int -> IO ()
-runServer node dbPath port = do
-  summary <- describeDatabase dbPath
-  putStrLn
-    ( "cardano-sieve query API: http://127.0.0.1:"
-        <> show port
-        <> "  (database "
-        <> dbPath
-        <> " — "
-        <> summary
-        <> ")"
-    )
-  Warp.run port (logRequests (cacheHeaders dbPath (serve (Proxy :: Proxy API) (server node dbPath))))
-
--- | Check the database before serving from it, and describe what is in it.
---
--- Worth doing loudly because the failure is otherwise silent: 'withConnection' is
--- opened per request and SQLite /creates/ a missing file on open, so a deleted or
--- mistyped @--database@ path used to start a server that logged nothing (no
--- requests yet), then answered every query with @[]@. Dying here, and printing the
--- row count and tip slot on success, makes "is this pointed at real data?"
--- answerable from the startup line alone.
-describeDatabase :: FilePath -> IO String
-describeDatabase dbPath = do
-  exists <- fileExist dbPath
-  unless exists $
-    die (dbPath <> ": no such database — sync one first, or check --database")
-  probed <-
-    try (withReadConnection dbPath probe) :: IO (Either SomeException (Int, Maybe Int64, Bool))
-  case probed of
-    -- 'SomeException' also catches the 'AsyncCancelled' that 'race_' delivers
-    -- when the sync thread dies first. That is not a database problem —
-    -- blaming the file for it buried the real error once — so cancellation
-    -- (and any other async exception) is rethrown, not reported.
-    Left err
-      | Just (SomeAsyncException _) <- fromException err -> throwIO err
-      | otherwise ->
-          die (dbPath <> ": not a readable cardano-sieve database — " <> show err)
-    Right (rows, tip, indexed) -> do
-      when (rows == 0) $
-        putStrLn "WARNING: 0 unspent rows — every query will return []. Is the sync finished?"
-      unless indexed $
-        putStrLn "WARNING: query indexes absent — queries will be slow. Run with --build-indexes."
-      pure
-        ( show rows
-            <> " unspent rows, tip slot "
-            <> maybe "none" show tip
-            <> if indexed then ", indexed" else ", NOT indexed"
-        )
- where
-  headOr :: a -> [Only a] -> a
-  headOr d rs = case rs of Only x : _ -> x; [] -> d
-
-  probe :: Connection -> IO (Int, Maybe Int64, Bool)
-  probe conn = do
-    -- Refuse a file left dirty by a crashed bulk sync before reporting anything
-    -- from it — with journaling off there is no telling what state it is in, and
-    -- serving confidently-wrong rows is worse than not starting.
-    dirty <- query_ conn "PRAGMA user_version" :: IO [Only Int]
-    case dirty of
-      Only flag : _
-        | flag /= 0 ->
-            die
-              ( dbPath
-                  <> ": left dirty by an interrupted bulk sync — its contents cannot \
-                     \be trusted. Delete it and sync again."
-              )
-      _ -> pure ()
-    rows <- query_ conn "SELECT count(*) FROM unspent"
-    tips <- query_ conn "SELECT max(created_slot) FROM unspent"
-    -- One representative deferred index; they are all installed together.
-    idxs <-
-      query_
-        conn
-        "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='unspentByAddress'"
-    pure (headOr 0 rows, headOr Nothing tips, headOr (0 :: Int) idxs > 0)
-
--- | Open a read connection, matching the writer's lock-wait policy.
---
--- A plain 'withConnection' inherits SQLite's default @busy_timeout@ of 0 ms —
--- return @SQLITE_BUSY@ rather than wait. That is invisible while the server has
--- the database to itself, and breaks the moment an indexer shares the process
--- (@--serve@ alongside @--socket-path@): WAL keeps ordinary reads clear of the
--- writer, but the brief exclusive moments still collide and, with no timeout, the
--- reader errors instead of waiting a few milliseconds. Observed directly — a
--- fresh sync-and-serve failed with @ErrorBusy … database is locked@ on the
--- startup probe.
---
--- A connection is still opened per request; pooling is a separate refinement.
-withReadConnection :: FilePath -> (Connection -> IO a) -> IO a
-withReadConnection dbPath act =
-  withConnection dbPath $ \conn -> do
-    () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
-    act conn
-
--- | Conditional-request support, kupo's contract exactly.
---
--- Every response carries @X-Most-Recent-Checkpoint@ (the newest indexed slot,
--- @0@ when the database is empty) and, when a checkpoint exists, @ETag@ — the
--- tip block's header hash as bare hex, no quotes. A request whose
--- @If-None-Match@ equals the current tag short-circuits to an empty @304@
--- before any handler runs: the chain has not moved since the client last
--- looked, so neither has any answer this server could give. That is what makes
--- polling cheap — kupo's spec documents the same @304@ on its read endpoints.
---
--- The tag is deliberately the raw hex kupo compares with plain equality, not an
--- RFC-quoted validator: kupo clients send back exactly what @ETag@ carried, and
--- matching kupo means matching that byte-for-byte.
---
--- One point lookup per request (the newest checkpoint, off the primary key).
--- kupo answers this from an in-memory health record instead; a cached tip is a
--- later refinement alongside the connection pool.
-cacheHeaders :: FilePath -> Middleware
-cacheHeaders dbPath app req respond = do
-  tip <- withReadConnection dbPath $ \conn ->
-    query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC LIMIT 1"
-      :: IO [(Int64, ByteString)]
-  case tip of
-    [] ->
-      app req (respond . mapResponseHeaders (("X-Most-Recent-Checkpoint", "0") :))
-    (slot, hash) : _ -> do
-      let etag = encodeUtf8 (hexText hash)
-          headers =
-            [ ("X-Most-Recent-Checkpoint", B8.pack (show slot))
-            , ("ETag", etag)
-            ]
-      if lookup "if-none-match" (requestHeaders req) == Just etag
-        then respond (responseLBS status304 headers "")
-        else app req (respond . mapResponseHeaders (headers <>))
-
--- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
--- obvious the server is alive and requests are landing. The per-line cost is
--- negligible next to the SQL query and the HTTP round-trip.
-logRequests :: Middleware
-logRequests app req respond = do
-  t0 <- getMonotonicTime
-  app req $ \res -> do
-    sent <- respond res
-    t1 <- getMonotonicTime
-    putStrLn $
-      B8.unpack (requestMethod req)
-        <> " "
-        <> B8.unpack (rawPathInfo req)
-        <> B8.unpack (rawQueryString req)
-        <> "  "
-        <> show (round ((t1 - t0) * 1000) :: Int)
-        <> "ms"
-    pure sent
-
-server :: Maybe (SocketPath, NetworkId) -> FilePath -> Server API
-server node dbPath =
-  (matches :<|> matchesDelete dbPath)
-    :<|> (checkpointsSample dbPath :<|> checkpointBySlot dbPath)
-    :<|> (patternsGet dbPath :<|> patternsRefuse :<|> patternsRefuse)
-    :<|> (healthJson node dbPath :<|> healthMetrics node dbPath)
-    :<|> (datumByHash dbPath :<|> scriptByHash dbPath)
-    :<|> metadataBySlot node dbPath
- where
-  -- Servant delivers every parameter positionally and untyped — three bare
-  -- 'Bool's and eight loose 'Maybe's in a row — so the boundary is where they get
-  -- names. 'QueryFlag' can only give us 'Bool', but nothing past this line has to
-  -- take one: the flags become 'HashResolution' and (in 'matchesByPattern') a
-  -- 'Status', and the filters become the two records.
-  matches segs unspent spent resolve cAfter cBefore sAfter sBefore pol asset tx ix =
-    matchesByPattern
-      dbPath
-      segs
-      unspent
-      spent
-      (if resolve then ResolveHashes else LeaveHashes)
-      (SlotBounds cAfter cBefore sAfter sBefore)
-      (Refinements pol asset tx ix)
-
--- (?order and ?after stay positional through here; matchesByPattern
--- reconciles them, since only the combination is meaningful.)
-
--- | Reject a request with the reason in the body. Top-level because both the
--- \/matches and \/patterns handlers validate client-supplied patterns.
-badRequest :: Text -> Handler a
-badRequest msg = throwError err400{errBody = LBS.fromStrict (encodeUtf8 msg)}
-
 -- | @DELETE \/matches\/{pattern}@ — prune everything the pattern matched:
 -- the outputs, their live-set rows, their spend records and their policy index
 -- rows, in one transaction, answering @{"deleted": n}@ with the count of
@@ -690,381 +391,6 @@ matchesDelete dbPath segs = do
     execute_ conn "COMMIT"
     pure (case counted of Only n : _ -> n; [] -> 0)
   pure (object ["deleted" .= deleted])
-
--- | @GET \/patterns@ and @GET \/patterns\/{pattern}@ — the selectors this
--- database is indexed under, as stored (the canonical text 'reconcileSelectors'
--- wrote). No segments lists all of them; a pattern filters to those that
--- include it, and a malformed pattern is a 400.
-patternsGet :: FilePath -> [Text] -> Handler [Text]
-patternsGet dbPath segs = do
-  stored <- liftIO $ withReadConnection dbPath $ \conn ->
-    query_ conn "SELECT selector FROM patterns ORDER BY selector"
-  let texts = [t | Only t <- stored]
-  case segs of
-    [] -> pure texts
-    _ -> do
-      needle <- case selectorFromText (T.intercalate "/" segs) of
-        Left err -> badRequest ("invalid pattern: " <> pack (show err))
-        Right sel -> pure sel
-      -- Stored rows are canonical text written by selectorToText, so a parse
-      -- failure here is corruption, not client error — let it 500 loudly.
-      let parse t = either (\e -> error ("stored selector unparseable: " <> show e)) id (selectorFromText t)
-      pure [t | t <- texts, parse t `includes` needle]
-
--- | @PUT@ and @DELETE@ under @\/patterns@: refused, with the reason and the
--- alternative in the body.
-patternsRefuse :: [Text] -> Handler Value
-patternsRefuse _ =
-  throwError
-    err501
-      { errBody =
-          "sieve does not reconfigure a live indexer: adding or removing \
-          \patterns mid-sync leaves the database incomplete for what it claims \
-          \to index (kupo re-syncs from a rollback point instead). Stop the \
-          \indexer and restart it with the --select set you want; it will \
-          \refuse mismatches and tell you what it was built with."
-      }
-
--- | Everything the health endpoints report, gathered once per request.
-data HealthSnapshot = HealthSnapshot
-  { hsCheckpoint :: Maybe Int64
-  -- ^ Newest indexed slot, from @checkpoints@ — advances live under sync+serve.
-  , hsNodeTip :: Maybe Int64
-  -- ^ The node's tip slot, asked of the node itself ('getLocalChainTip') when a
-  -- socket was configured. 'Nothing' in serve-only mode, and when the node does
-  -- not answer — which downgrades 'hsConnected' too, exactly what monitoring
-  -- should see when the node dies out from under a sync+serve.
-  , hsConnected :: Bool
-  , hsIndexesInstalled :: Bool
-  , hsPolicyIndexDerived :: Bool
-  -- ^ Whether the deferred completion step ('buildIndexesOn') has run. Probed
-  -- via @policiesByPolicyId@'s existence, NOT the row count: a range with no
-  -- native assets legitimately derives an empty table. Until this is true,
-  -- policy\/asset queries answer @[]@ vacuously and DELETE by policy refuses.
-  , hsDatabaseBytes :: Int64
-  }
-
--- | One probe for both health endpoints. Every read is a pragma or a point
--- lookup — no @count(*)@ scans, so the cost does not grow with the database.
-healthSnapshot :: Maybe (SocketPath, NetworkId) -> FilePath -> IO HealthSnapshot
-healthSnapshot node dbPath = do
-  (cp, indexed, derived, bytes) <- withReadConnection dbPath $ \conn -> do
-    cp <- query_ conn "SELECT max(slot_no) FROM checkpoints" :: IO [Only (Maybe Int64)]
-    idx <- indexExists conn "unspentByAddress"
-    pol <- indexExists conn "policiesByPolicyId"
-    pages <- query_ conn "PRAGMA page_count" :: IO [Only Int64]
-    pageSize <- query_ conn "PRAGMA page_size" :: IO [Only Int64]
-    pure
-      ( case cp of Only c : _ -> c; [] -> Nothing
-      , idx
-      , pol
-      , product [n | Only n <- pages <> pageSize]
-      )
-  tip <- case node of
-    Nothing -> pure Nothing
-    Just (socket, network) -> do
-      -- A short-lived node-to-client connection per request: local socket,
-      -- milliseconds. kupo answers from an in-memory health record; a cached
-      -- tip here is a later refinement alongside the connection pool.
-      answer <- try (getLocalChainTip (connectInfo socket network)) :: IO (Either SomeException ChainTip)
-      pure $ case answer of
-        Right (ChainTip slot _ _) -> Just (fromIntegral (unSlotNo slot))
-        Right ChainTipAtGenesis -> Just 0
-        Left _ -> Nothing
-  pure
-    HealthSnapshot
-      { hsCheckpoint = cp
-      , hsNodeTip = tip
-      , hsConnected = maybe False (const True) tip
-      , hsIndexesInstalled = indexed
-      , hsPolicyIndexDerived = derived
-      , hsDatabaseBytes = bytes
-      }
- where
-  indexExists conn name = do
-    rows <-
-      query
-        conn
-        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?"
-        (Only (name :: Text))
-        :: IO [Only Int]
-    pure (not (null rows))
-  connectInfo socket network =
-    LocalNodeConnectInfo
-      { -- Byron-era slots-per-epoch, only used decoding Byron blocks; the tip
-        -- query never does. Same constant the indexer uses.
-        localConsensusModeParams = CardanoModeParams (EpochSlots 21600)
-      , localNodeNetworkId = network
-      , localNodeSocketPath = socket
-      }
-
--- | @GET \/health@ — kupo's field names, sieve's honesty about them.
--- @seconds_since_last_block@ is always null (sieve keeps no in-memory clock of
--- block arrival), and @network_synchronization@ is the checkpoint\/tip slot
--- ratio — kupo computes its own against wall-clock time via network parameters,
--- which sieve does not carry.
-healthJson :: Maybe (SocketPath, NetworkId) -> FilePath -> Handler Value
-healthJson node dbPath = do
-  hs <- liftIO (healthSnapshot node dbPath)
-  pure $
-    object
-      [ "connection_status" .= String (if hsConnected hs then "connected" else "disconnected")
-      , "most_recent_checkpoint" .= hsCheckpoint hs
-      , "most_recent_node_tip" .= hsNodeTip hs
-      , "seconds_since_last_block" .= Null
-      , "network_synchronization" .= synchronization hs
-      , "configuration"
-          .= object
-            [ "indexes" .= String (if hsIndexesInstalled hs then "installed" else "deferred")
-            , "policy_index" .= String (if hsPolicyIndexDerived hs then "derived" else "pending")
-            ]
-      , "version" .= showVersion Paths.version
-      ]
-
--- | @GET \/metrics@ — the same snapshot in Prometheus exposition format.
-healthMetrics :: Maybe (SocketPath, NetworkId) -> FilePath -> Handler Text
-healthMetrics node dbPath = do
-  hs <- liftIO (healthSnapshot node dbPath)
-  let gauge name v = "# TYPE sieve_" <> name <> " gauge\nsieve_" <> name <> " " <> v <> "\n"
-  pure $
-    mconcat
-      [ gauge "connection_status" (if hsConnected hs then "1" else "0")
-      , maybe "" (gauge "most_recent_checkpoint" . pack . show) (hsCheckpoint hs)
-      , maybe "" (gauge "most_recent_node_tip" . pack . show) (hsNodeTip hs)
-      , maybe "" (gauge "network_synchronization" . pack . show) (synchronization hs)
-      , gauge "indexes_installed" (if hsIndexesInstalled hs then "1" else "0")
-      , gauge "policy_index_derived" (if hsPolicyIndexDerived hs then "1" else "0")
-      , gauge "database_size_bytes" (pack (show (hsDatabaseBytes hs)))
-      ]
-
--- | Checkpoint over node tip, both known, else null — how far behind the chain
--- this database is, as a ratio a dashboard can alert on.
-synchronization :: HealthSnapshot -> Maybe Double
-synchronization hs = do
-  cp <- hsCheckpoint hs
-  tip <- hsNodeTip hs
-  if tip <= 0
-    then Nothing
-    else Just (fromIntegral (min cp tip) / fromIntegral tip)
-
--- | @GET \/checkpoints@ — the stored chain points, sampled newest-first.
-checkpointsSample :: FilePath -> Handler [Value]
-checkpointsSample dbPath =
-  liftIO $ withReadConnection dbPath $ \conn ->
-    map pointJson <$> sampleCheckpoints conn
-
--- | How @GET \/checkpoints\/{slot-no}@ matches the requested slot. From kupo's
--- @?strict@: exact by request, at-or-before by default — the default exists to
--- find a usable ancestor of any slot, e.g. for rollback detection.
-data SlotMatch = ExactSlot | AtOrBefore
-
--- | @GET \/checkpoints\/{slot-no}@ — one point, or @null@ when nothing matches.
-checkpointBySlot :: FilePath -> Int64 -> Bool -> Handler Value
-checkpointBySlot dbPath slot strictFlag =
-  liftIO $ withReadConnection dbPath $ \conn -> do
-    rows <- case (if strictFlag then ExactSlot else AtOrBefore) of
-      ExactSlot ->
-        query conn "SELECT slot_no, header_hash FROM checkpoints WHERE slot_no = ?" (Only slot)
-      AtOrBefore ->
-        query
-          conn
-          "SELECT slot_no, header_hash FROM checkpoints \
-          \WHERE slot_no <= ? ORDER BY slot_no DESC LIMIT 1"
-          (Only slot)
-    pure $ case rows of
-      point : _ -> pointJson point
-      [] -> Null
-
--- | A chain point in kupo's wire shape.
-pointJson :: (Int64, ByteString) -> Value
-pointJson (slot, hash) = object ["slot_no" .= slot, "header_hash" .= hexText hash]
-
--- | @GET \/datums\/{hash}@ — the datum body behind a hash, or @null@.
---
--- Shape is kupo's: @{"datum": "<hex>"}@.
-datumByHash :: FilePath -> Text -> Handler Value
-datumByHash dbPath h =
-  preimage dbPath h "SELECT datum FROM binary_data WHERE datum_hash = ?" $ \body ->
-    object ["datum" .= hexText body]
-
--- | @GET \/scripts\/{hash}@ — the script body behind a hash, or @null@.
---
--- Shape is kupo's: @{"script": "<hex>", "language": "native"|"plutus:v1"|…}@. The
--- stored blob is the hash preimage, which carries the language discriminator as
--- its leading byte, so the byte is split back off here: @language@ names it and
--- @script@ is the raw script without it. kupo documents the same split — "raw
--- scripts aren't exact pre-image of their hash digest".
-scriptByHash :: FilePath -> Text -> Handler Value
-scriptByHash dbPath h =
-  preimage dbPath h "SELECT script FROM scripts WHERE script_hash = ?" $ \body ->
-    case BS.uncons body of
-      Nothing -> Null
-      Just (tag, raw) ->
-        object ["script" .= hexText raw, "language" .= scriptLanguage tag]
-
--- | The language a stored script's discriminator byte names. Values confirmed
--- against both kupo's table and its OpenAPI enum.
-scriptLanguage :: Word8 -> Value
-scriptLanguage = \case
-  0 -> "native"
-  1 -> "plutus:v1"
-  2 -> "plutus:v2"
-  3 -> "plutus:v3"
-  n -> String ("unknown:" <> pack (show n))
-
--- | Look one preimage up by its hex hash. A malformed hash and an absent row are
--- both @null@: neither is a client error worth a 400, and kupo answers @null@ too.
-preimage :: FilePath -> Text -> Query -> (ByteString -> Value) -> Handler Value
-preimage dbPath h sql render =
-  case Base16.decode (encodeUtf8 h) of
-    Left _ -> pure Null
-    Right raw -> liftIO $ withReadConnection dbPath $ \conn -> do
-      rows <- query conn sql (Only raw)
-      pure $ case rows of
-        Only body : _ -> render body
-        [] -> Null
-
--- | @GET \/metadata\/{slot-no}@ — every transaction's metadata in the block at
--- a slot, fetched from the node on demand ('fetchBlockAtSlot'); kupo's contract,
--- including never storing any of it. The ancestor to walk from is the
--- checkpoint at-or-before @slot − 1@ — the same row @\/checkpoints\/{slot}@
--- serves — or genesis on an empty range.
---
--- Edge cases match kupo deliberately:
---
---   * slot @0@ is a hardcoded @[]@ with no header: nothing can have an
---     ancestor there. A negative slot is a 400.
---   * an unrecognised ancestor, or a rollback racing the walk, is a 400
---     (kupo's \"no ancestor\" answer) — the client should retry.
---   * a slot nobody minted in answers with the NEXT block's metadata: the
---     fetch stops at the first block at-or-past the target, checking nothing
---     (kupo takes the single block after its intersection, same thing). The
---     @X-Block-Header-Hash@ header carries the hash the answer actually came
---     from, and kupo's spec pushes verifying it onto the client.
---   * @?transaction_id@ filters to one transaction's items; a malformed id is
---     a 400.
---
--- One divergence: serve-only mode (no @--socket-path@) has no node to ask, so
--- it refuses with a 503 rather than pretending — the same honesty
--- @\/health@'s @connection_status@ shows in that mode.
-metadataBySlot
-  :: Maybe (SocketPath, NetworkId)
-  -> FilePath
-  -> Int64
-  -> Maybe Text
-  -> Handler (Headers '[Header "X-Block-Header-Hash" Text] [Value])
-metadataBySlot node dbPath slot txIdParam = do
-  (socket, network) <- case node of
-    Nothing ->
-      throwError
-        err503
-          { errBody =
-              "metadata is fetched from the node on demand, never stored (kupo \
-              \does the same) — and this server has no node: it is serving an \
-              \already-synced database. Run --serve alongside --socket-path to \
-              \serve /metadata."
-          }
-    Just sn -> pure sn
-  wanted <- case txIdParam of
-    Nothing -> pure Nothing
-    Just t -> case deserialiseFromRawBytesHex @TxId (encodeUtf8 t) of
-      Left _ -> badRequest "invalid transaction_id: expected a base16-encoded transaction id"
-      Right txid -> pure (Just txid)
-  when (slot < 0) $
-    badRequest "slot-no must be a non-negative slot number"
-  if slot == 0
-    then pure (noHeader [])
-    else do
-      ancestorRow <- liftIO $ withReadConnection dbPath $ \conn ->
-        query
-          conn
-          "SELECT slot_no, header_hash FROM checkpoints \
-          \WHERE slot_no <= ? ORDER BY slot_no DESC LIMIT 1"
-          (Only (slot - 1))
-          :: IO [(Int64, ByteString)]
-      ancestor <- case ancestorRow of
-        [] -> pure ChainPointAtGenesis
-        (aslot, hash) : _ ->
-          -- Stored by the indexer from a decoded header, so a parse failure
-          -- here is corruption, not client error — let it 500 loudly.
-          case deserialiseFromRawBytes (proxyToAsType (Proxy @(Hash BlockHeader))) hash of
-            Left err -> error ("stored header hash unparseable at slot " <> show aslot <> ": " <> show err)
-            Right h -> pure (ChainPoint (SlotNo (fromIntegral aslot)) h)
-      fetched <-
-        liftIO $ try (fetchBlockAtSlot socket network ancestor (SlotNo (fromIntegral slot)))
-      case fetched of
-        Left err
-          | Just (SomeAsyncException _) <- fromException (err :: SomeException) ->
-              liftIO (throwIO err)
-          | otherwise ->
-              throwError
-                err503
-                  { errBody =
-                      "the node did not answer: "
-                        <> LBS.fromStrict (encodeUtf8 (pack (show err)))
-                  }
-        Right Nothing ->
-          badRequest
-            "no known ancestor to that slot — a rollback likely raced this \
-            \request; retry it"
-        Right (Just (BlockInMode _ blk)) -> do
-          let BlockHeader _ headerHash _ = getBlockHeader blk
-          pure $
-            addHeader
-              (hexText (serialiseToRawBytes headerHash))
-              (metadataItems wanted (getBlockTxs blk))
-
--- | One item per transaction carrying auxiliary data, in block order — kupo's
--- shape: @{hash, raw, schema}@. Byron transactions cannot carry metadata (and
--- 'getBlockTxs' yields none for Byron blocks), so a Byron block is @[]@, as in
--- kupo.
---
--- @raw@ is the auxiliary data's on-chain serialisation and @hash@ its
--- blake2b-256 ('hashTxAuxData') — the hash the transaction body committed to.
--- kupo instead re-encodes the aux data into its newest era's format and
--- recomputes the hash over the re-encoding. The two agree wherever the
--- on-chain bytes already use the Alonzo tag-259 format — measured at 96% of
--- metadata-carrying preview blocks in slots 0–4M (2,443 of 2,545 sampled) —
--- and differ where a transaction shipped the legacy Shelley (bare map) or
--- Allegra (@[metadata, scripts]@ array) encoding, which stays legal in
--- Alonzo-era-and-later blocks: kupo then reports bytes that are not on the
--- chain and a hash the transaction body does not carry, while sieve's pair
--- round-trips against the chain. Diverging from kupo here is deliberate,
--- the same ruling as the spend-redeemer index: match the ledger, not kupo's
--- bug. Both stay self-consistent (@hash == blake2b-256(raw)@ either way).
--- @schema@ — which never differs — mirrors kupo's @encodeMetadatum@
--- constructor for constructor.
-metadataItems :: Maybe TxId -> [Tx era] -> [Value]
-metadataItems wanted = mapMaybe $ \(ShelleyTx sbe ledgerTx) ->
-  shelleyBasedEraConstraints sbe $ do
-    aux <- L.strictMaybeToMaybe (ledgerTx ^. L.auxDataTxL)
-    guard (maybe True (== getTxIdShelley sbe (ledgerTx ^. L.bodyTxL)) wanted)
-    pure $
-      object
-        [ "hash" .= hexText (L.hashToBytes (L.extractHash (unTxAuxDataHash (hashTxAuxData aux))))
-        , "raw" .= hexText (originalBytes aux)
-        , "schema"
-            .= object
-              [ Key.fromString (show label) .= metadatumJson m
-              | (label, m) <- Map.toAscList (aux ^. L.metadataTxAuxDataL)
-              ]
-        ]
-
--- | kupo's @schema@ rendering of one metadatum — its @encodeMetadatum@, shape
--- for shape: five primitives, each wrapped in a one-field object naming it.
-metadatumJson :: Metadatum -> Value
-metadatumJson = \case
-  I n -> object ["int" .= n]
-  S txt -> object ["string" .= txt]
-  B bytes -> object ["bytes" .= hexText bytes]
-  List xs -> object ["list" .= map metadatumJson xs]
-  Map kvs ->
-    object
-      [ "map"
-          .= [ object ["k" .= metadatumJson k, "v" .= metadatumJson v]
-             | (k, v) <- kvs
-             ]
-      ]
 
 -- | How many matches one request returns. Kupo streams every match; we page, so
 -- a hot key cannot turn one request into a multi-hundred-megabyte response.
@@ -1413,7 +739,7 @@ rowToJson
           ]
 
 -- | A stored script blob as @{script, language}@, splitting off the leading
--- discriminator byte — the same shape 'scriptByHash' returns.
+-- discriminator byte — the same shape @\/scripts\/{hash}@ returns.
 scriptBodyJson :: ByteString -> Maybe Value
 scriptBodyJson body = case BS.uncons body of
   Nothing -> Nothing
@@ -1427,10 +753,6 @@ datumTypeText = \case
   0 -> Just "hash"
   1 -> Just "inline"
   _ -> Nothing
-
--- | Base16 of raw bytes, as text.
-hexText :: ByteString -> Text
-hexText = decodeUtf8 . Base16.encode
 
 -- | The output reference is 32 tx-id bytes then a big-endian Word64 output
 -- index; recover the index.

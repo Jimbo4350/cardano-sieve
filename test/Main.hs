@@ -41,7 +41,7 @@ import Cardano.Api
   , toAddressAny
   )
 
-import Cardano.Server.Http (Cursor (..), cursorFromText, cursorToText)
+import Cardano.Server.Api.Matches (Cursor (..), cursorFromText, cursorToText)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , DirtyDatabase

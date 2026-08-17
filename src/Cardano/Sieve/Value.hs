@@ -6,7 +6,7 @@
 -- Both directions live in this one module deliberately: they are a matched pair
 -- and a drift between them is silent data loss. The write path
 -- ("Cardano.Sieve.Node.Decode") uses 'encodeValue'; the query path
--- ("Cardano.Server.Http") uses 'decodeValue'.
+-- ("Cardano.Server.Api.Matches") uses 'decodeValue'.
 --
 -- == Why not JSON
 --

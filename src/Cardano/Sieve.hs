@@ -27,7 +27,7 @@ import Cardano.Api
   , deserialiseFromRawBytesHex
   )
 
-import Cardano.Server.Http (runServer)
+import Cardano.Server.Run (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
 import Cardano.Sieve.Node.Insert
   ( Durability (Durable, UnsafeBulk)

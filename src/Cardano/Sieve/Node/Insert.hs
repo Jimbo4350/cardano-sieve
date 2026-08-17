@@ -56,6 +56,7 @@ module Cardano.Sieve.Node.Insert
   )
 where
 
+import Cardano.Sieve.Database (DirtyDatabase (..), isDirty, markClean, markDirty)
 import Cardano.Sieve.Schema (createSchema, installDeferredIndexes)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap)
@@ -235,23 +236,6 @@ data Durability
     Durable
   deriving (Eq, Show)
 
--- | The file was left behind by an 'UnsafeBulk' session that never exited
--- cleanly. With no journal there is no way to tell how much of it is missing or
--- mangled, so it is refused outright rather than resumed from.
-newtype DirtyDatabase = DirtyDatabase FilePath
-
-instance Show DirtyDatabase where
-  show (DirtyDatabase path) =
-    unlines
-      [ path <> ": left dirty by an interrupted bulk sync."
-      , ""
-      , "Catch-up runs with SQLite journaling off for speed, so a crash mid-sync"
-      , "can corrupt the file in ways that cannot be detected, let alone repaired."
-      , "Its contents cannot be trusted. Delete it and sync again."
-      ]
-
-instance Exception DirtyDatabase
-
 -- | Open the database, prepare it (pragmas + schema) and return a batched
 -- 'DbHandle'. Pair every 'openDatabase' with 'closeDatabase' — via
 -- 'Control.Exception.finally' — so the final partial batch is always committed
@@ -369,19 +353,15 @@ installIndexes path = bracket (openDatabase Durable path 1) closeDatabase buildI
 -- track which mode a handle was opened in.
 --
 -- The ordering carries the correctness. Bulk writes ran with @synchronous=OFF@,
--- so committed pages may still be sitting in the OS page cache; clearing the
--- flag before they reach disk would mark a possibly-losable file as clean. So
--- @synchronous@ is raised FIRST, and the flag-clearing write's commit then
--- fsyncs the database file — and fsync flushes every dirty page of the file,
--- not just the header. Only then is WAL adopted, and the answer is checked:
--- silently staying journal-less after the flag is cleared would be corruption
--- exposure with no safety net, so a refused switch is fatal (the file itself is
--- consistent and durable at that point; only this process stops).
+-- so committed pages may still be sitting in the OS page cache; 'markClean'
+-- fsyncs them before the flag flips. Only then is WAL adopted, and the answer is
+-- checked: silently staying journal-less after the flag is cleared would be
+-- corruption exposure with no safety net, so a refused switch is fatal (the file
+-- itself is consistent and durable at that point; only this process stops).
 makeDurable :: DbHandle -> IO ()
 makeDurable db@DbHandle{dbConn = conn} = do
   flushBatch db
-  execute_ conn "PRAGMA synchronous=FULL"
-  execute_ conn "PRAGMA user_version=0"
+  markClean conn
   modes <- query_ conn "PRAGMA journal_mode=WAL" :: IO [Only Text]
   case modes of
     Only "wal" : _ -> execute_ conn "PRAGMA synchronous=NORMAL"
@@ -389,16 +369,13 @@ makeDurable db@DbHandle{dbConn = conn} = do
 
 -- | Commit the final partial batch (if any), mark the file clean, and close.
 --
--- The clean-mark uses the same raise-synchronous-then-write ordering as
--- 'makeDurable' and for the same reason: the flag must not say \"trustworthy\"
--- before the data it vouches for is on disk. A cleanly closed bulk file is
--- exactly as consistent as a durable one — every transaction committed — which
--- is why a clean Ctrl-C mid-catch-up keeps the database and a crash does not.
+-- A cleanly closed bulk file is exactly as consistent as a durable one — every
+-- transaction committed — which is why a clean Ctrl-C mid-catch-up keeps the
+-- database and a crash does not.
 closeDatabase :: DbHandle -> IO ()
 closeDatabase db = do
   flushBatch db
-  execute_ (dbConn db) "PRAGMA synchronous=FULL"
-  execute_ (dbConn db) "PRAGMA user_version=0"
+  markClean (dbConn db)
   close (dbConn db)
 
 -- | Ready a freshly-opened connection for batched writes: refuse a dirty file,
@@ -428,16 +405,14 @@ prepare durability path conn = do
   -- below can lose that collision, and with no timeout it errored instead of
   -- waiting out the microseconds, killing the process on ~9% of sync+serve
   -- startups. The pragma itself is a connection setting, not a file access,
-  -- so it cannot be the loser. 'Cardano.Server.Http.withReadConnection' is
+  -- so it cannot be the loser. 'Cardano.Server.Api.Common.withReadConnection' is
   -- the reader-side mirror of this, for the same reason.
   --
   -- Goes through 'query_' because the pragma answers with an INTEGER row and
   -- 'execute_' rejects statements that produce output.
   () <$ (query_ conn ("PRAGMA busy_timeout=" <> busyTimeoutMs) :: IO [Only Int])
-  flags <- query_ conn "PRAGMA user_version" :: IO [Only Int]
-  case flags of
-    Only flag : _ | flag /= 0 -> throwIO (DirtyDatabase path)
-    _ -> pure ()
+  dirty <- isDirty conn
+  when dirty (throwIO (DirtyDatabase path))
   case durability of
     Durable ->
       mapM_
@@ -446,7 +421,7 @@ prepare durability path conn = do
         , "PRAGMA synchronous=NORMAL"
         ]
     UnsafeBulk -> do
-      execute_ conn "PRAGMA user_version=1"
+      markDirty conn
       mapM_
         (\q -> () <$ (query_ conn q :: IO [Only Text]))
         [ "PRAGMA journal_mode=OFF"
