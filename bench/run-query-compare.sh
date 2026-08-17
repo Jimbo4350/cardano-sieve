@@ -9,9 +9,20 @@
 # seconds, and the multi-minute sync is a command you run in a terminal you are
 # watching (it prints a progress heartbeat).
 #
-# Once everything is ready, it hits GET /matches/{addr}?unspent on BOTH servers
-# (kupo and sieve both accept a base16 address, so the URL is identical) N times
-# and reports p50/p95/p99 (ms) side by side.
+# Once everything is ready, it runs each query shape on BOTH servers (kupo and
+# sieve share the pattern grammar, so the URL is identical) and reports the two
+# side by side. The work is made EQUAL first: kupo streams every match in one
+# response, sieve serves 100-row pages behind an X-Next-Cursor header, so the
+# sieve side of every case walks the full cursor chain — every page, every row —
+# and its time is the sum of the per-request times. The row totals of the two
+# walks are compared and any mismatch is flagged, so a number is never quietly
+# measuring different work.
+#
+# Sampling is INTERLEAVED (sieve, kupo, sieve, kupo …) and judged on the PAIRED
+# per-round deltas, the run-flush-check.sh method: this box is shared with a
+# desktop and a cardano-node, so absolute times wander; the difference within a
+# back-to-back pair mostly cancels that, and the sign-consistency of the deltas
+# says whether the answer is trustworthy.
 #
 # The two servers are long-lived and live in their own terminals; this script
 # never starts or stops them, it just measures against them.
@@ -167,53 +178,105 @@ EOF
 }
 
 # --- measurement ------------------------------------------------------------
-# Both servers now STREAM every match, so total time is dominated by transferring
-# the body on any query with a lot of results — which would report bandwidth, not
-# query speed. So capture both:
-#   ttfb  time to first byte: how fast the server starts answering
-#   total time to last byte: ttfb plus serialising and shipping the whole result
-# On a small result they coincide; on a large one they are the interesting pair.
-timings() {
-  local i
-  for ((i = 0; i < ${N:-20}; i++)); do
-    curl -s -o /dev/null --fail --max-time 300 \
-      -w '%{time_starttransfer} %{time_total}\n' "$1" 2>/dev/null || true
-  done
-}
-stats() { # $1 = which column (1=ttfb, 2=total)
-  awk -v col="$1" 'NF >= 2 { print $col * 1000 }' | sort -n | awk '
-    { a[NR] = $1 }
-    function pct(p,   i) { i = int((p / 100) * NR + 0.999999); if (i < 1) i = 1; if (i > NR) i = NR; return a[i] }
-    END { if (NR == 0) { printf "%-38s", "no successful requests"; exit }
-          printf "p50=%8.1f  p95=%8.1f  p99=%8.1f", pct(50), pct(95), pct(99) }'
-}
-warm() { local i; for ((i = 0; i < WARMUP; i++)); do curl -s -o /dev/null --max-time 300 "$1" 2>/dev/null || true; done; }
+# Per round we keep two figures for each tool:
+#   ttfb  time to first byte of the FIRST response: how fast an answer starts
+#   total the whole answer: kupo's single response; sieve's page walk, summed
+# Summing curl's per-page time_total (rather than wall-clocking the walk) keeps
+# bash loop overhead out of sieve's number; every page still pays its real HTTP
+# connect + request cost, which is the honest price of the paging design.
+HDR="$(mktemp)"
+trap 'rm -f "$HDR"' EXIT
 
-# Race one query shape on both servers, reporting ttfb and total side by side.
+# Walk one sieve query to exhaustion, following X-Next-Cursor with ?after=.
+# Echoes "ttfb total pages" (seconds); fails if any page fails.
+sieve_walk() { # $1 = path (already carries ?…, so the cursor appends with &)
+  local after='' u t1 t2 ttfb='' total=0 pages=0 cur
+  while :; do
+    u="$SIEVE_URL$1"; [ -n "$after" ] && u="$u&after=$after"
+    read -r t1 t2 < <(curl -s -D "$HDR" -o /dev/null --fail --max-time 600 \
+      -w '%{time_starttransfer} %{time_total}\n' "$u" 2>/dev/null) || return 1
+    [ -z "$ttfb" ] && ttfb="$t1"
+    total=$(awk -v a="$total" -v b="$t2" 'BEGIN{printf "%.6f", a + b}')
+    pages=$((pages + 1))
+    cur=$(awk 'tolower($1) == "x-next-cursor:" { gsub(/\r/, "", $2); print $2 }' "$HDR")
+    [ -z "$cur" ] && break
+    after="$cur"
+  done
+  echo "$ttfb $total $pages"
+}
+
+# The same walk, counting rows instead of timing — run once per case to verify
+# both tools hand back the SAME number of rows before any time is compared.
+sieve_rows() { # $1 = path; echoes the row total across all pages
+  local after='' u n total=0 cur
+  while :; do
+    u="$SIEVE_URL$1"; [ -n "$after" ] && u="$u&after=$after"
+    n=$(curl -s -D "$HDR" --fail --max-time 600 "$u" 2>/dev/null | jq 'length') || return 1
+    total=$((total + n))
+    cur=$(awk 'tolower($1) == "x-next-cursor:" { gsub(/\r/, "", $2); print $2 }' "$HDR")
+    [ -z "$cur" ] && break
+    after="$cur"
+  done
+  echo "$total"
+}
+
+# One kupo request. Echoes "ttfb total" (seconds).
+kupo_one() { # $1 = path
+  curl -s -o /dev/null --fail --max-time 600 \
+    -w '%{time_starttransfer} %{time_total}\n' "$KUPO_URL$1" 2>/dev/null
+}
+
+median() { sort -n | awk '{a[NR]=$1} END{ if (NR == 0) { print 0; exit } print (NR % 2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2 }'; }
+ms() { awk -v x="$1" 'BEGIN{printf "%.1f", x * 1000}'; }
+
+# Race one query shape on both servers: verify equal rows, then n interleaved
+# rounds of (sieve walk, kupo stream) back to back, judged on the paired deltas.
 #
-# Iterations scale DOWN with result size. Both servers stream every match, so a hot
-# key ships hundreds of megabytes per request; N=30 against the live set would move
-# ~10 GB per server and take half an hour to say what five samples already say.
-# Small results keep the full N, where per-request noise actually needs averaging
-# out. The chosen N is printed with each case so a number is never read as more
-# precise than it is.
+# Rounds scale DOWN with result size. A hot key means a multi-second walk against
+# a multi-second stream; n=200 there would take an hour to say what three paired
+# rounds already say. Small results keep the full N, where per-request noise is
+# what actually needs averaging out. The chosen n is printed with each case so a
+# number is never read as more precise than it is.
 race() { # $1 = label  $2 = path  $3 = note
-  local sraw kraw sc kc n
-  sc=$(curl -sf --max-time 600 "$SIEVE_URL$2" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
-  kc=$(curl -sf --max-time 600 "$KUPO_URL$2" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
-  case "$sc" in
-    ''|'?') n=3 ;;
-    *) if [ "$sc" -gt 20000 ]; then n=3; elif [ "$sc" -gt 2000 ]; then n=8; else n=$N; fi ;;
-  esac
+  local sc kc n wr i pages='?'
   printf '\n%s  (%s)\n' "$1" "$3"
-  printf '  rows: sieve=%s kupo=%s%s   [n=%s]\n' "$sc" "$kc" \
-    "$([ "$sc" = "$kc" ] && echo '' || echo '  <- DIFFER, times below are not comparable')" "$n"
-  warm "$SIEVE_URL$2"; warm "$KUPO_URL$2"
-  sraw=$(N=$n timings "$SIEVE_URL$2"); kraw=$(N=$n timings "$KUPO_URL$2")
-  printf '  %-5s ttfb  %s\n' "sieve" "$(printf '%s\n' "$sraw" | stats 1)"
-  printf '  %-5s ttfb  %s\n' "kupo" "$(printf '%s\n' "$kraw" | stats 1)"
-  printf '  %-5s total %s\n' "sieve" "$(printf '%s\n' "$sraw" | stats 2)"
-  printf '  %-5s total %s\n' "kupo" "$(printf '%s\n' "$kraw" | stats 2)"
+  sc=$(sieve_rows "$2" || echo '?')
+  kc=$(curl -sf --max-time 600 "$KUPO_URL$2" 2>/dev/null | jq 'length' 2>/dev/null || echo '?')
+  case "$kc" in
+    ''|'?') n=3 ;;
+    *) if [ "$kc" -gt 20000 ]; then n=3; elif [ "$kc" -gt 2000 ]; then n=8; else n=$N; fi ;;
+  esac
+  wr=$(( n < N ? 1 : WARMUP ))
+  printf '  rows: sieve=%s kupo=%s%s   [n=%s, warmup=%s]\n' "$sc" "$kc" \
+    "$([ "$sc" = "$kc" ] && echo ' (equal work)' || echo '  <- DIFFER, times below are not comparable')" "$n" "$wr"
+  for ((i = 0; i < wr; i++)); do sieve_walk "$2" >/dev/null || true; kupo_one "$2" >/dev/null || true; done
+  local s_ttfb=() s_total=() k_ttfb=() k_total=() st sx sp kt kx
+  for ((i = 0; i < n; i++)); do
+    read -r st sx sp < <(sieve_walk "$2") || { log "  sieve walk failed on round $i"; continue; }
+    read -r kt kx < <(kupo_one "$2")      || { log "  kupo request failed on round $i"; continue; }
+    s_ttfb+=("$st"); s_total+=("$sx"); k_ttfb+=("$kt"); k_total+=("$kx"); pages="$sp"
+  done
+  [ "${#s_total[@]}" -gt 0 ] || { printf '  no successful paired rounds\n'; return 0; }
+  printf '  %-5s ttfb p50 %8s ms   total p50 %10s ms  (%s request(s)/round)\n' \
+    "sieve" "$(ms "$(printf '%s\n' "${s_ttfb[@]}" | median)")" \
+    "$(ms "$(printf '%s\n' "${s_total[@]}" | median)")" "$pages"
+  printf '  %-5s ttfb p50 %8s ms   total p50 %10s ms  (1 request/round)\n' \
+    "kupo" "$(ms "$(printf '%s\n' "${k_ttfb[@]}" | median)")" \
+    "$(ms "$(printf '%s\n' "${k_total[@]}" | median)")"
+  # Judge the PAIRED total-time difference, not the absolutes (see header).
+  local deltas=()
+  for ((i = 0; i < ${#s_total[@]}; i++)); do
+    deltas+=("$(awk -v a="${s_total[$i]}" -v b="${k_total[$i]}" 'BEGIN{printf "%.6f", a - b}')")
+  done
+  awk -v dm="$(printf '%s\n' "${deltas[@]}" | median)" \
+      -v km="$(printf '%s\n' "${k_total[@]}" | median)" \
+      -v ds="$(printf '%s ' "${deltas[@]}")" 'BEGIN{
+    split(ds, d, " "); pos = 0; tot = 0;
+    for (i in d) { if (d[i] != "") { tot++; if (d[i] > 0) pos++ } }
+    p = (km > 0) ? 100 * dm / km : 0;
+    printf "  paired delta (sieve - kupo)  median %+.1f ms  (%+.1f%% of kupo)  %d/%d rounds sieve slower\n", \
+      dm * 1000, p, pos, tot;
+  }'
 }
 
 # --- run --------------------------------------------------------------------
