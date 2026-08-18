@@ -22,49 +22,38 @@
 --     deliberate non-feature; restart it with different @--select@s instead
 --   * @DELETE \/matches\/{pattern}@ — prune everything a pattern matched,
 --     refused while a configured selector still covers it
---   * @GET \/health@ — JSON health, kupo-shaped; @GET \/metrics@ — the same
+--   * @GET \/health@ — JSON health; @GET \/metrics@ — the same
 --     facts in Prometheus exposition
 --   * @GET \/metadata\/{slot-no}@ — a block's transaction metadata, fetched
---     from the node on demand (kupo stores none either); needs a node, so
+--     from the node on demand, never stored; needs a node, so
 --     serve-only mode refuses it
 --
--- Each endpoint lives in its own @Cardano.Server.Api.*@ module; this module
+-- Each endpoint lives in its own @Cardano.Sieve.Server.Api.*@ module; this module
 -- assembles them and runs the server.
-module Cardano.Server.Run
+module Cardano.Sieve.Server.Run
   ( runServer
   )
 where
 
 import Cardano.Api (NetworkId, SocketPath)
 
-import Cardano.Server.Api.Checkpoints (CheckpointsAPI, checkpointsServer)
-import Cardano.Server.Api.Common (hexText, withReadConnection)
-import Cardano.Server.Api.Health (HealthAPI, healthServer)
-import Cardano.Server.Api.Matches (MatchesAPI, matchesServer)
-import Cardano.Server.Api.Metadata (MetadataAPI, metadataServer)
-import Cardano.Server.Api.Patterns (PatternsAPI, patternsServer)
-import Cardano.Server.Api.Preimages (PreimageAPI, preimageServer)
-import Cardano.Sieve.Database (isDirty)
+import Cardano.Sieve.Database.DirtyFlag (isDirty)
+import Cardano.Sieve.Server.Api.Checkpoints (CheckpointsAPI, checkpointsServer)
+import Cardano.Sieve.Server.Api.Common (withReadConnection)
+import Cardano.Sieve.Server.Api.Health (HealthAPI, healthServer)
+import Cardano.Sieve.Server.Api.Matches (MatchesAPI, matchesServer)
+import Cardano.Sieve.Server.Api.Metadata (MetadataAPI, metadataServer)
+import Cardano.Sieve.Server.Api.Patterns (PatternsAPI, patternsServer)
+import Cardano.Sieve.Server.Api.Preimages (PreimageAPI, preimageServer)
 
 import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
 import Control.Monad (unless, when)
-import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as B8
 import Data.Int (Int64)
 import Data.Proxy (Proxy (Proxy))
-import Data.Text.Encoding (encodeUtf8)
 import Database.SQLite.Simple (Connection, Only (Only), query_)
 import GHC.Clock (getMonotonicTime)
-import Network.HTTP.Types.Status (status304)
-import Network.Wai
-  ( Middleware
-  , mapResponseHeaders
-  , rawPathInfo
-  , rawQueryString
-  , requestHeaders
-  , requestMethod
-  , responseLBS
-  )
+import Network.Wai (Middleware, rawPathInfo, rawQueryString, requestMethod)
 import Network.Wai.Handler.Warp qualified as Warp
 import System.Exit (die)
 import System.Posix.Files (fileExist)
@@ -89,7 +78,7 @@ runServer node dbPath port = do
         <> summary
         <> ")"
     )
-  Warp.run port (logRequests (cacheHeaders dbPath (serve (Proxy :: Proxy API) (server node dbPath))))
+  Warp.run port (logRequests (serve (Proxy :: Proxy API) (server node dbPath)))
 
 -- | Check the database before serving from it, and describe what is in it.
 --
@@ -150,41 +139,6 @@ describeDatabase dbPath = do
         conn
         "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='unspentByAddress'"
     pure (headOr 0 rows, headOr Nothing tips, headOr (0 :: Int) idxs > 0)
-
--- | Conditional-request support, kupo's contract exactly.
---
--- Every response carries @X-Most-Recent-Checkpoint@ (the newest indexed slot,
--- @0@ when the database is empty) and, when a checkpoint exists, @ETag@ — the
--- tip block's header hash as bare hex, no quotes. A request whose
--- @If-None-Match@ equals the current tag short-circuits to an empty @304@
--- before any handler runs: the chain has not moved since the client last
--- looked, so neither has any answer this server could give. That is what makes
--- polling cheap — kupo's spec documents the same @304@ on its read endpoints.
---
--- The tag is deliberately the raw hex kupo compares with plain equality, not an
--- RFC-quoted validator: kupo clients send back exactly what @ETag@ carried, and
--- matching kupo means matching that byte-for-byte.
---
--- One point lookup per request (the newest checkpoint, off the primary key).
--- kupo answers this from an in-memory health record instead; a cached tip is a
--- later refinement alongside the connection pool.
-cacheHeaders :: FilePath -> Middleware
-cacheHeaders dbPath app req respond = do
-  tip <- withReadConnection dbPath $ \conn ->
-    query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC LIMIT 1"
-      :: IO [(Int64, ByteString)]
-  case tip of
-    [] ->
-      app req (respond . mapResponseHeaders (("X-Most-Recent-Checkpoint", "0") :))
-    (slot, hash) : _ -> do
-      let etag = encodeUtf8 (hexText hash)
-          headers =
-            [ ("X-Most-Recent-Checkpoint", B8.pack (show slot))
-            , ("ETag", etag)
-            ]
-      if lookup "if-none-match" (requestHeaders req) == Just etag
-        then respond (responseLBS status304 headers "")
-        else app req (respond . mapResponseHeaders (headers <>))
 
 -- | Minimal request log — "METHOD path?query  <ms>" per request — so it is
 -- obvious the server is alive and requests are landing. The per-line cost is

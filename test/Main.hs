@@ -41,7 +41,6 @@ import Cardano.Api
   , toAddressAny
   )
 
-import Cardano.Server.Api.Matches (Cursor (..), cursorFromText, cursorToText)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , DirtyDatabase
@@ -71,6 +70,7 @@ import Cardano.Sieve.Selector
   , selectorFromText
   , selectorToText
   )
+import Cardano.Sieve.Server.Api.Matches (Cursor (..), cursorFromText, cursorToText)
 import Cardano.Sieve.Value (encodeValue)
 
 import Control.Exception (bracket, bracket_, try)

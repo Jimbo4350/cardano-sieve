@@ -2,15 +2,14 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 
 -- | One-shot block retrieval over the node-to-client ChainSync protocol, for
--- @GET \/metadata@: metadata is never stored (kupo stores none either — the
--- chain itself already indexes it by slot), so each request opens a short-lived
--- connection and walks from a known ancestor to the block it wants.
+-- @GET \/metadata@: metadata is never stored (the chain itself already indexes
+-- it by slot), so each request opens a short-lived connection and walks from a
+-- known ancestor to the block it wants.
 --
--- kupo's equivalent (@FetchBlock.Node@) keeps one long-lived connection and
--- takes exactly the block after the intersection; this one connects per
--- request — the same trade 'Cardano.Server.Api.Health.healthSnapshot' makes for the
+-- Connecting per request is the same trade
+-- 'Cardano.Sieve.Server.Api.Health.healthSnapshot' makes for the
 -- node tip, and the same later refinement (a pooled connection) applies —
--- and walks until the target slot, because sieve's checkpoints, though also
+-- and it walks until the target slot, because sieve's checkpoints, though
 -- stored per applied block, may start at a @--since@ rather than genesis.
 module Cardano.Sieve.Node.FetchBlock
   ( fetchBlockAtSlot
@@ -44,13 +43,12 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 --
 -- 'Nothing' when the node does not recognise the ancestor, or when the chain
 -- rolls back mid-walk: both mean a rollback won a race against this request,
--- and both get kupo's \"no ancestor\" answer upstream. The walk is normally a
+-- and both get the \"no ancestor\" answer upstream. The walk is normally a
 -- single block — the at-or-before ancestor of @target − 1@ is the block
 -- immediately preceding @target@ wherever checkpoints are dense — and a
--- target past the node's tip blocks until the chain reaches it, exactly as
--- kupo's fetch does.
+-- target past the node's tip blocks until the chain reaches it.
 --
--- Note the contract inherited from kupo: this returns the first block AT OR
+-- Note the contract: this returns the first block AT OR
 -- PAST the target, with no check that a block sits exactly at it. A slot
 -- nobody minted in answers with the next block's content — which is why the
 -- endpoint reports the block's actual header hash for the client to verify.

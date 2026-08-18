@@ -44,7 +44,7 @@
 # and WARNS if it is absent.
 #
 # CAVEAT (coverage): this measures ONE dimension, unspent-by-address, because that
-# is all Cardano.Server.Run implements. The policy/asset query shapes live only in
+# is all Cardano.Sieve.Server.Run implements. The policy/asset query shapes live only in
 # bench/run-query-bench.sh.
 set -euo pipefail
 

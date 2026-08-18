@@ -15,11 +15,11 @@
 --   * a bech32\/base58\/base16 address     * @*\@{txid}@ — a whole transaction
 --   * @{policy}.{name}@ \/ @{policy}.*@    * @{index}\@{txid}@ — one output
 --
--- All thirteen of kupo's documented @\/matches@ parameters: @?unspent@, @?spent@,
+-- All thirteen @\/matches@ parameters: @?unspent@, @?spent@,
 -- @?resolve_hashes@, @?order@, @?created_after@, @?created_before@,
 -- @?spent_after@, @?spent_before@, @?policy_id@, @?asset_name@,
 -- @?transaction_id@, @?output_index@, plus the pattern itself. Passing neither
--- status flag returns both spent and unspent, as in kupo. Bare @\/matches@ with no
+-- status flag returns both spent and unspent. Bare @\/matches@ with no
 -- pattern is the wildcard.
 --
 -- The parameters are not all independent, and the invalid combinations are 400s
@@ -31,20 +31,11 @@
 -- indexed live set, anything spent-inclusive reads full history. Policy and asset
 -- stay index-served either way because @policies@ is itself full-history.
 --
--- Response shape is field-for-field identical to kupo's, verified by diffing
--- pinned rows of every kind (datum by hash, inline datum, no datum, spent,
--- reference script).
---
--- Known divergences from kupo (audited against its OpenAPI spec,
--- @kupo\/docs\/api\/nightly.yaml@): kupo streams every match in one unbounded
--- response, sieve serves 'pageLimit' rows per request with an @X-Next-Cursor@
--- header \/ @?after@ parameter to walk the rest — every match is reachable,
--- but a kupo client must learn to page. Within one slot the order is sieve's
--- total @(created_slot, rowid)@ rather than kupo's
--- @(created_slot, transaction_index, output_index)@, since matching that
--- exactly would cost the index-covered sort. A fresh read connection is
--- opened per request; a connection pool is a later refinement.
-module Cardano.Server.Api.Matches
+-- Sieve serves 'pageLimit' rows per request with an @X-Next-Cursor@ header
+-- \/ @?after@ parameter to walk the rest — every match is reachable. Within
+-- one slot the order is the total @(created_slot, rowid)@. A fresh read
+-- connection is opened per request; a connection pool is a later refinement.
+module Cardano.Sieve.Server.Api.Matches
   ( MatchesAPI
   , matchesServer
 
@@ -64,7 +55,6 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Server.Api.Common (badRequest, hexText, scriptLanguage, withReadConnection)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
   , Selector (..)
@@ -72,6 +62,7 @@ import Cardano.Sieve.Selector
   , overlaps
   , selectorFromText
   )
+import Cardano.Sieve.Server.Api.Common (badRequest, hexText, scriptLanguage, withReadConnection)
 import Cardano.Sieve.Value (decodeValue)
 
 import Control.Monad (when)
@@ -162,11 +153,11 @@ matchesServer dbPath = matches :<|> matchesDelete dbPath
 -- (?order and ?after stay positional through here; matchesByPattern
 -- reconciles them, since only the combination is meaningful.)
 
--- | Which way round results come back, from kupo's @?order@.
+-- | Which way round results come back, from @?order@.
 --
 -- A real type rather than the raw 'Text' so servant parses and rejects it at the
 -- boundary: @?order=sideways@ is a 400 before the handler runs, and the handler
--- cannot forget to validate it. Absent means 'MostRecentFirst', as in kupo.
+-- cannot forget to validate it. Absent means 'MostRecentFirst'.
 data Order = MostRecentFirst | OldestFirst
   deriving (Eq, Show)
 
@@ -180,7 +171,7 @@ instance FromHttpApiData Order where
 -- | The four slot-bound parameters, as they arrive.
 --
 -- Grouped rather than passed as four loose 'Maybe's because they are not
--- independent: kupo allows at most ONE lower bound and ONE upper bound, so
+-- independent: the API allows at most ONE lower bound and ONE upper bound, so
 -- @created_after@ together with @spent_after@ is a contradiction, not a
 -- conjunction. Keeping them in one value is what lets 'slotBoundsFor' state that
 -- rule once.
@@ -195,8 +186,8 @@ data SlotBounds = SlotBounds
 -- rather than choosing which index answers the query.
 --
 -- Grouped for the same reason as 'SlotBounds' — two of the four are only
--- meaningful in a pair. kupo's spec: @asset_name@ "can't be used alone and must be
--- provided alongside a @policy_id@", likewise @output_index@ with
+-- meaningful in a pair: @asset_name@ can't be used alone and must be
+-- provided alongside a @policy_id@, likewise @output_index@ with
 -- @transaction_id@.
 data Refinements = Refinements
   { rfPolicyId :: Maybe Text
@@ -232,7 +223,7 @@ policiesExists extra =
 
 -- | Every extra @AND@ a request's filters contribute, with their parameters.
 --
--- Returns 'Left' on a combination kupo rejects, so an impossible request fails
+-- Returns 'Left' on an invalid combination, so an impossible request fails
 -- loudly instead of quietly matching nothing.
 filtersFor :: Query -> SlotBounds -> Refinements -> Either Text [(Query, [SQLData])]
 filtersFor createdCol bounds refine = do
@@ -314,8 +305,8 @@ refinementsFor
 data Status = OnlyUnspent | OnlySpent | AllMatches
   deriving (Eq, Show)
 
--- | Total mapping from the pair of flags. Neither flag means both sides, as in
--- kupo; both flags at once is a contradiction rather than a default.
+-- | Total mapping from the pair of flags. Neither flag means both sides;
+-- both flags at once is a contradiction rather than a default.
 statusFromFlags :: Bool -> Bool -> Either Text Status
 statusFromFlags unspent spent = case (unspent, spent) of
   (True, True) -> Left "?spent and ?unspent are mutually exclusive"
@@ -332,7 +323,7 @@ statusFromFlags unspent spent = case (unspent, spent) of
 --
 -- Refused ('overlaps') while a configured selector still covers the pattern:
 -- the indexer would re-create the rows from the next block, so the delete
--- would be pointless churn. kupo guards identically. Remove the selector from
+-- would be pointless churn. Remove the selector from
 -- @--select@ (and restart) first.
 --
 -- Row selection reuses 'planFor' — the same planner every @\/matches@ query
@@ -392,12 +383,11 @@ matchesDelete dbPath segs = do
     pure (case counted of Only n : _ -> n; [] -> 0)
   pure (object ["deleted" .= deleted])
 
--- | How many matches one request returns. Kupo streams every match; we page, so
--- a hot key cannot turn one request into a multi-hundred-megabyte response.
+-- | How many matches one request returns. We page, so a hot key cannot turn
+-- one request into a multi-hundred-megabyte response.
 -- A full page carries an @X-Next-Cursor@ header; @?after@ with its value
--- resumes exactly where the page stopped, so every match is reachable — the
--- remaining divergence from kupo is that a client must walk pages rather than
--- read one unbounded body.
+-- resumes exactly where the page stopped, so every match is reachable — a
+-- client must walk pages rather than read one unbounded body.
 pageLimit :: Int
 pageLimit = 100
 
@@ -416,7 +406,7 @@ pageLimit = 100
 -- meaningful for the same query it came from (the base table, and so the
 -- rowid, changes with @?unspent@\/@?spent@); and a rollback that re-inserts
 -- rows mid-walk can shift them relative to a held cursor — pagination under a
--- reorg is best-effort, where kupo's single-transaction stream is a snapshot.
+-- reorg is best-effort.
 data Cursor = Cursor
   { cursorDesc :: Bool
   , cursorSlot :: Int64
@@ -471,9 +461,8 @@ matchesByPattern
   -> Handler (Headers '[Header "X-Next-Cursor" Text] [Value])
 matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refine order afterParam = do
   -- The pattern is captured as PATH SEGMENTS and rejoined, because the
-  -- payment/delegation form embeds a '/' and so spans two segments. kupo does the
-  -- same (it matches on @"matches" : args@). No segments at all is the bare
-  -- /matches route, which kupo treats as the wildcard.
+  -- payment/delegation form embeds a '/' and so spans two segments. No segments
+  -- at all is the bare /matches route, which is treated as the wildcard.
   let pat = if null segments then "*" else T.intercalate "/" segments
   status <- either badRequest pure (statusFromFlags unspentFlag spentFlag)
   selector <- case selectorFromText pat of
@@ -642,7 +631,7 @@ planFor status = \case
 
   -- EXISTS, never a JOIN. @policies@ holds one row per (output, policy, asset), so
   -- joining it emits an output once per MATCHING ASSET: an output holding six
-  -- assets of a policy came back six times, 14,780 rows where kupo returns 2,464.
+  -- assets of a policy came back six times, 14,780 rows.
   -- A semi-join asks only whether such a row exists.
   --
   -- Measured on the hottest policy at 4M, all three candidates return the correct
@@ -674,7 +663,7 @@ encodeOutputRef (TxIn txid (TxIx ix)) =
 beWord64 :: Word64 -> ByteString
 beWord64 = LBS.toStrict . toLazyByteString . word64BE
 
--- | One row as JSON, mirroring kupo's match shape field for field.
+-- | One row as JSON.
 rowToJson
   :: HashResolution
   -> ( ByteString
@@ -706,13 +695,13 @@ rowToJson
         , "transaction_index" .= txIx
         , "output_index" .= outputIndex oref
         , "address" .= addressText addr
-        , "value" .= kupoValue val
+        , "value" .= valueJson val
         , "datum_hash" .= (hexText <$> mDatum)
         , "script_hash" .= (hexText <$> mScript)
         , "created_at" .= object ["slot_no" .= slot, "header_hash" .= (hexText <$> mHeader)]
         , "spent_at" .= spentAt
         ]
-          -- Present only when there IS a datum: kupo omits the key entirely
+          -- Present only when there IS a datum: the key is omitted entirely
           -- rather than emitting null, and a null would read as "no datum" to a
           -- client that checks for the field's presence.
           <> ["datum_type" .= t | Just t <- [datumTypeText =<< mDatumType]]
@@ -745,7 +734,7 @@ scriptBodyJson body = case BS.uncons body of
   Nothing -> Nothing
   Just (tag, raw) -> Just (object ["script" .= hexText raw, "language" .= scriptLanguage tag])
 
--- | Render the stored datum-type flag the way kupo does. Anything other than the
+-- | Render the stored datum-type flag. Anything other than the
 -- two known encodings yields 'Nothing' rather than a guess, so a future third
 -- kind cannot be silently mislabelled as one of these.
 datumTypeText :: Int64 -> Maybe Text
@@ -759,22 +748,22 @@ datumTypeText = \case
 outputIndex :: ByteString -> Word64
 outputIndex = BS.foldl' (\a b -> a * 256 + fromIntegral b) 0 . BS.drop 32
 
--- | Render the raw address bytes as kupo does (bech32 for Shelley, base58 for
+-- | Render the raw address bytes (bech32 for Shelley, base58 for
 -- Byron); fall back to hex if it does not decode.
 addressText :: ByteString -> Text
 addressText raw = case deserialiseFromRawBytes AsAddressAny raw of
   Right a -> serialiseAddress a
   Left _ -> hexText raw
 
--- | Reshape a stored value into kupo's @{coins, assets:{"policy.name":qty}}@,
+-- | Reshape a stored value into the wire shape @{coins, assets:{"policy.name":qty}}@,
 -- quantities rendered as strings.
 --
 -- The stored form is the compact CBOR of "Cardano.Sieve.Value"; an asset with an
--- empty name renders as just the bare policy id, as kupo does. A value that fails
+-- empty name renders as just the bare policy id. A value that fails
 -- to decode yields zero coins and no assets rather than failing the request —
 -- a single unreadable row should not take out a whole page of results.
-kupoValue :: ByteString -> Value
-kupoValue raw = case decodeValue raw of
+valueJson :: ByteString -> Value
+valueJson raw = case decodeValue raw of
   Left _ -> object ["coins" .= ("0" :: Text), "assets" .= object []]
   Right (coins, assets) ->
     object

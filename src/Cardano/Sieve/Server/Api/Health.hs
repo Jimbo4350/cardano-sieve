@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeOperators #-}
 
 -- | @\/health@ and @\/metrics@ — operational state.
-module Cardano.Server.Api.Health
+module Cardano.Sieve.Server.Api.Health
   ( HealthAPI
   , healthServer
   )
@@ -20,7 +20,7 @@ import Cardano.Api
   , getLocalChainTip
   )
 
-import Cardano.Server.Api.Common (withReadConnection)
+import Cardano.Sieve.Server.Api.Common (withReadConnection)
 import Cardano.Slotting.Slot (unSlotNo)
 
 import Control.Exception (SomeException, try)
@@ -34,9 +34,8 @@ import Database.SQLite.Simple (Only (Only), query, query_)
 import Paths_cardano_sieve qualified as Paths
 import Servant (Get, Handler, JSON, PlainText, Server, (:<|>) ((:<|>)), (:>))
 
--- | Operational state, kupo's field names. @\/health@ answers JSON; @\/metrics@
--- answers the same facts in Prometheus exposition format (one divergence from
--- kupo, which content-negotiates both on either path).
+-- | Operational state. @\/health@ answers JSON; @\/metrics@
+-- answers the same facts in Prometheus exposition format.
 type HealthAPI =
   "health" :> Get '[JSON] Value
     :<|> "metrics" :> Get '[PlainText] Text
@@ -84,8 +83,8 @@ healthSnapshot node dbPath = do
     Nothing -> pure Nothing
     Just (socket, network) -> do
       -- A short-lived node-to-client connection per request: local socket,
-      -- milliseconds. kupo answers from an in-memory health record; a cached
-      -- tip here is a later refinement alongside the connection pool.
+      -- milliseconds. A cached tip here is a later refinement alongside the
+      -- connection pool.
       answer <- try (getLocalChainTip (connectInfo socket network)) :: IO (Either SomeException ChainTip)
       pure $ case answer of
         Right (ChainTip slot _ _) -> Just (fromIntegral (unSlotNo slot))
@@ -118,11 +117,10 @@ healthSnapshot node dbPath = do
       , localNodeSocketPath = socket
       }
 
--- | @GET \/health@ — kupo's field names, sieve's honesty about them.
+-- | @GET \/health@.
 -- @seconds_since_last_block@ is always null (sieve keeps no in-memory clock of
 -- block arrival), and @network_synchronization@ is the checkpoint\/tip slot
--- ratio — kupo computes its own against wall-clock time via network parameters,
--- which sieve does not carry.
+-- ratio.
 healthJson :: Maybe (SocketPath, NetworkId) -> FilePath -> Handler Value
 healthJson node dbPath = do
   hs <- liftIO (healthSnapshot node dbPath)

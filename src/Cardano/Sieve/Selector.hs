@@ -9,8 +9,7 @@
 -- matcher ('satisfies').
 --
 -- The type is the source of truth; the codec is one way to construct and render
--- it. They live together (as kupo pairs its @Pattern@ type with
--- @patternFromText@) so the syntax and the constructors it targets stay in
+-- it. They live together so the syntax and the constructors it targets stay in
 -- lock-step.
 --
 -- Most payloads reuse @cardano-api@ types (addresses, policy/asset ids,
@@ -21,7 +20,7 @@
 --
 -- == Surface syntax
 --
--- Parsing is /dispatch-then-decode/ rather than kupo's try-everything: we branch
+-- Parsing is /dispatch-then-decode/ rather than try-everything: we branch
 -- once on the structural delimiter present in the input, then run the single
 -- decoder that delimiter implies. That lets a failure name the shape it was
 -- decoding ('SelectorParseError') instead of collapsing every malformed input to
@@ -247,8 +246,8 @@ parseAssetId policyId name
   | otherwise = SelectAssetId <$> parsePolicyId policyId <*> parseAssetName name
 
 -- | A whole address: bech32 @addr@/@addr_test@ or base58 (Byron) → 'SelectExact';
--- bech32 @stake@/@stake_test@ → 'SelectDelegation' (matching on the stake part,
--- as kupo does); base16 → 'SelectExact'.
+-- bech32 @stake@/@stake_test@ → 'SelectDelegation' (matching on the stake part);
+-- base16 → 'SelectExact'.
 parseWholeAddress :: Text -> Either SelectorParseError Selector
 parseWholeAddress txt =
   maybe (Left err) Right (asAddress <|> asStakeAddress <|> asHexAddress)
@@ -401,23 +400,22 @@ satisfies ctx = \case
 
 -- | Does selector @x@ /include/ selector @y@ — is everything @y@ matches also
 -- matched by @x@? This is the relation behind @GET \/patterns\/{pattern}@:
--- kupo's spec defines it as "if all results matched by y are also matched by x,
--- then x is said to include y", and its documented use is passing an address
--- (itself a pattern) to learn which configured patterns would match it.
+-- if all results matched by y are also matched by x, then x is said to include
+-- y, and its use is passing an address (itself a pattern) to learn which
+-- configured patterns would match it.
 --
--- Mirrors kupo's own @includes@ (@Kupo.Data.Pattern@) case for case, quirks
--- included, because this endpoint's answers should agree with kupo's:
+-- Case-by-case behavior, quirks included:
 --
 --   * An exact address on the right is handled first, for ANY left side, by
 --     asking whether the left side matches that address — so
 --     @SelectAll OnlyShelley@ correctly excludes a Byron exact address even
 --     though the general wildcard row below would admit it.
---   * kupo has @MatchAny OnlyShelley@ including every non-bootstrap pattern —
+--   * @SelectAll OnlyShelley@ includes every non-bootstrap selector —
 --     policies, transactions, metadata tags — even though outputs at Byron
---     addresses can carry native assets. Mirrored as-is.
---   * kupo has @MatchOutputReference@ including @MatchTransactionId@ of the
---     same transaction, which reads backwards against its own definition (the
---     whole transaction matches more than one of its outputs). Mirrored as-is.
+--     addresses can carry native assets.
+--   * @SelectOutputReference@ includes @SelectTransactionId@ of the same
+--     transaction, which reads backwards against the definition above (the
+--     whole transaction matches more than one of its outputs).
 includes :: Selector -> Selector -> Bool
 includes x y = case (x, y) of
   (p, SelectExact addr) -> p `matchesAddress` addr
@@ -443,7 +441,7 @@ includes x y = case (x, y) of
 -- an output needs both. This is the guard on @DELETE \/matches\/{pattern}@:
 -- deleting matches a configured selector still covers is pointless churn (the
 -- indexer re-creates them next block), so erring towards refusal is the safe
--- direction. Mirrors kupo's @overlaps@, checked in both directions per pair.
+-- direction. Checked in both directions per pair.
 overlaps :: Selector -> [Selector] -> Bool
 overlaps p = any (\p' -> overlapTwo p p' || overlapTwo p' p)
  where
@@ -467,7 +465,7 @@ overlaps p = any (\p' -> overlapTwo p p' || overlapTwo p' p)
 -- | The address-only fragment of 'satisfies': which selectors can vouch for an
 -- address with no transaction context. The context-needing selectors
 -- (transaction, output reference, policy, asset, metadata) cannot, and fall
--- to False — same as kupo's matchingAddress. Shared by 'includes' and
+-- to False. Shared by 'includes' and
 -- 'overlaps'.
 matchesAddress :: Selector -> AddressAny -> Bool
 matchesAddress p addr = case p of

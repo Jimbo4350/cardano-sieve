@@ -9,7 +9,7 @@
 -- reaching 'markClean', so a non-zero flag at open time ('isDirty') is proof the
 -- file was abandoned mid-write — and with no journal that file may be corrupt in
 -- ways nothing can detect, so it is refused ('DirtyDatabase').
-module Cardano.Sieve.Database
+module Cardano.Sieve.Database.DirtyFlag
   ( DirtyDatabase (..)
   , markDirty
   , markClean

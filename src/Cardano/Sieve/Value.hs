@@ -6,7 +6,7 @@
 -- Both directions live in this one module deliberately: they are a matched pair
 -- and a drift between them is silent data loss. The write path
 -- ("Cardano.Sieve.Node.Decode") uses 'encodeValue'; the query path
--- ("Cardano.Server.Api.Matches") uses 'decodeValue'.
+-- ("Cardano.Sieve.Server.Api.Matches") uses 'decodeValue'.
 --
 -- == Why not JSON
 --
@@ -17,8 +17,7 @@
 --
 -- == The format
 --
--- The ledger's own @MaryValue@ shape, which is also what kupo stores, so disk
--- figures stay directly comparable:
+-- The ledger's own @MaryValue@ shape:
 --
 --   * ada-only: a bare CBOR unsigned integer (the lovelace amount).
 --     @1A00989680@ — 5 bytes, against 19 for @{"lovelace":10000000}@.
@@ -28,22 +27,19 @@
 -- Maps are emitted with keys in ascending byte order, definite length.
 --
 -- Measured at preview origin..2,000,000, 281,263 outputs: the value column went
--- 45,196,241 bytes of JSON to 21,856,001 — a 52% cut, and the same total kupo
--- produces to the byte.
+-- 45,196,241 bytes of JSON to 21,856,001 — a 52% cut.
 --
--- One deliberate divergence from kupo, in the asset map. CBOR packs a map's entry
+-- In the asset map, lengths are definite. CBOR packs a map's entry
 -- count into the head byte for counts 0..23, so a small map costs one byte
 -- (@A1@ = 1 entry); from 24 up the count needs a following byte (@B8 1B@ = 27
 -- entries). Indefinite length always costs two (@BF@ start, @FF@ break). So below
--- 24 entries definite length is strictly smaller and both encoders choose it;
--- at 24 and above the two forms tie at two bytes, and kupo takes the indefinite
--- one where this takes the definite one.
+-- 24 entries definite length is strictly smaller; at 24 and above the two forms
+-- tie at two bytes.
 --
--- Consequence: totals are byte-for-byte identical, and only 65 distinct blobs in
--- the whole 2M range differ at all — the outputs holding 24 or more asset names
--- under a single policy. Definite length is the more canonical choice, and
--- 'decodeValue' accepts both forms, so a value written by either encoder reads
--- back the same.
+-- Consequence: the choice only matters for outputs holding 24 or more asset
+-- names under a single policy — 65 distinct blobs in the whole 2M range.
+-- Definite length is the more canonical choice, and 'decodeValue' accepts both
+-- forms, so a value written by either encoder reads back the same.
 module Cardano.Sieve.Value
   ( encodeValue
   , decodeValue

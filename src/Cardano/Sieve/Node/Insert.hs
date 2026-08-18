@@ -4,11 +4,10 @@
 
 -- | Persistence layer: write matched outputs into the SQLite schema.
 --
--- 'openDatabase' installs the schema ('Cardano.Sieve.Schema.createSchema') and
+-- 'openDatabase' installs the schema ('Cardano.Sieve.Database.Schema.createSchema') and
 -- 'writeSelected' persists the outputs that survived the sieve into @blocks@,
 -- @outputs@, @unspent@ and @policies@ (interning policy hashes through
--- @policy_ids@ as it goes). It uses 'sqlite-simple' — the same
--- library kupo uses — so throughput/memory comparisons stay apples to apples.
+-- @policy_ids@ as it goes). It uses 'sqlite-simple'.
 --
 -- This module is deliberately SQLite-only: it knows nothing about
 -- @cardano-api@. The decode stage ("Cardano.Sieve.Node.Filter") turns a block
@@ -56,8 +55,8 @@ module Cardano.Sieve.Node.Insert
   )
 where
 
-import Cardano.Sieve.Database (DirtyDatabase (..), isDirty, markClean, markDirty)
-import Cardano.Sieve.Schema (createSchema, installDeferredIndexes)
+import Cardano.Sieve.Database.DirtyFlag (DirtyDatabase (..), isDirty, markClean, markDirty)
+import Cardano.Sieve.Database.Schema (createSchema, installDeferredIndexes)
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap)
   , Selector (SelectAll)
@@ -96,10 +95,10 @@ import Database.SQLite.Simple
   )
 
 -- | How an output supplied its datum: written out in full on the output itself,
--- or referenced only by hash. Kupo reports this as @datum_type@, and it is the
--- one thing a datum hash alone cannot tell you — with @DatumByHash@ the body may
--- not exist anywhere yet, whereas @DatumInline@ guarantees it was on chain with
--- the output.
+-- or referenced only by hash. Reported as @datum_type@ in match responses, and
+-- it is the one thing a datum hash alone cannot tell you — with @DatumByHash@
+-- the body may not exist anywhere yet, whereas @DatumInline@ guarantees it was
+-- on chain with the output.
 data DatumType = DatumInline | DatumByHash
   deriving (Eq, Show)
 
@@ -118,7 +117,7 @@ data StoredOutput = StoredOutput
   -- The schema derives @transaction_id@ from this, so it is not stored again.
   , soTransactionIndex :: Int64
   -- ^ Position of the producing transaction within its block. Stored because
-  -- kupo reports it, and because kupo's result ordering is
+  -- match responses report it, and because the result ordering is
   -- @(created_slot, transaction_index, output_index)@ — nothing else recovers it.
   , soAddress :: ByteString
   -- ^ Raw bytes of the output's address.
@@ -228,7 +227,7 @@ data Durability
     -- exit (Ctrl-C\/SIGTERM land here via the interrupt handler) commits, syncs
     -- and clears the flag on the way out, so only a genuine crash forfeits the
     -- database. What is risked is time, never data: everything in this file is
-    -- reproducible from the chain. kupo makes the same trade for catch-up.
+    -- reproducible from the chain.
     UnsafeBulk
   | -- | WAL + @synchronous=NORMAL@: readers coexist with the writer and a crash
     -- loses at most the un-checkpointed tail. What tip-following and serving
@@ -254,7 +253,7 @@ openDatabase durability path batchSize = do
 
 -- | Install the deferred secondary indexes on an already-open handle, then
 -- promote the session to 'Durable'. Fired once on reaching the chain tip — bulk
--- catch-up runs index-free to keep writes cheap (see "Cardano.Sieve.Schema").
+-- catch-up runs index-free to keep writes cheap (see "Cardano.Sieve.Database.Schema").
 --
 -- The indexes build BEFORE 'makeDurable', deliberately: on a bulk session they
 -- are then written once with no journal instead of twice through the WAL, and a
@@ -405,7 +404,7 @@ prepare durability path conn = do
   -- below can lose that collision, and with no timeout it errored instead of
   -- waiting out the microseconds, killing the process on ~9% of sync+serve
   -- startups. The pragma itself is a connection setting, not a file access,
-  -- so it cannot be the loser. 'Cardano.Server.Api.Common.withReadConnection' is
+  -- so it cannot be the loser. 'Cardano.Sieve.Server.Api.Common.withReadConnection' is
   -- the reader-side mirror of this, for the same reason.
   --
   -- Goes through 'query_' because the pragma answers with an INTEGER row and
@@ -508,15 +507,14 @@ applyBlock
           mapM_ (recordSpend spendIns delUns slot) spent
     -- Preimages are gathered from the WHOLE block, so gate them on the block
     -- being relevant to the configured selectors — otherwise a narrow selector
-    -- drags in every datum and script on the chain. kupo does the same, and says
-    -- why: "a best-effort at not storing all the garbage of the world".
+    -- drags in every datum and script on the chain.
     --
-    -- kupo's gate is "produced a tracked output OR spent a tracked input"; ours is
-    -- the first half only. Detecting the second would cost a lookup per input on
-    -- the sync hot path, and under a wildcard selector (how the benchmark runs)
-    -- any block with transactions produces tracked outputs, so the two coincide.
-    -- Under a narrow selector ours stores strictly less, which is the safe
-    -- direction. Verified by comparing the resulting row counts against kupo.
+    -- The gate is "produced a tracked output". Widening it to "or spent a
+    -- tracked input" would cost a lookup per input on the sync hot path, and
+    -- under a wildcard selector (how the benchmark runs) any block with
+    -- transactions produces tracked outputs, so the two coincide. Under a
+    -- narrow selector the narrower gate stores strictly less, which is the
+    -- safe direction.
     unless (null created) $ do
       mapM_ (insertPreimage conn "binary_data" "datum_hash" "datum") (pmDatums preimages)
       mapM_ (insertPreimage conn "scripts" "script_hash" "script") (pmScripts preimages)
@@ -714,10 +712,9 @@ flushBatch DbHandle{dbConn = conn, dbUncommittedRows = pending} = do
 -- Undoing a spend has to return its output to @unspent@, or the invariant the
 -- three-table split rests on — an output is in @unspent@ exactly when it has no
 -- @spends@ row — breaks silently and permanently: the output stays in @outputs@
--- with no spend recorded, yet no @?unspent@ query can ever see it again. kupo
--- keeps one @inputs@ table with a nullable @spent_at@, so for it this is a single
--- @UPDATE inputs SET spent_at = NULL WHERE spent_at > ?@; our split needs a
--- re-insert from @outputs@.
+-- with no spend recorded, yet no @?unspent@ query can ever see it again. A
+-- single-table design with a nullable @spent_at@ could undo this with one
+-- @UPDATE@; our split needs a re-insert from @outputs@.
 --
 -- @policy_ids@ is deliberately /not/ pruned. It is a pure interning dictionary
 -- with no slot column, keeping it append-only means surrogates never change and
@@ -745,8 +742,7 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
       -- statement order rather than reliant on it. Without it, an output created
       -- AND spent above the rollback point — which must disappear entirely —
       -- would be reinstated here and then survive if this ran after the
-      -- @unspent@ delete. kupo orders the equivalent pair the same way
-      -- (@rollbackQryUpdateInputs@ before @rollbackQryDeleteInputs@).
+      -- @unspent@ delete.
       --
       -- @spends(spent_slot)@ is indexed, and rollbacks only occur near the tip,
       -- by which point the deferred indexes are built — so the subquery is a
@@ -789,9 +785,8 @@ rollbackAbove db@DbHandle{dbConn = conn} mSlot = do
 --
 -- Both leave the database incomplete with respect to the patterns it claims to
 -- serve, and neither announces itself at query time — the result is simply
--- short. kupo refuses both for the same reason, and repairs the add case by
--- rolling the indexer back to re-index; sieve has no such mechanism, so it
--- refuses and says what to do instead.
+-- short. Sieve has no mechanism to repair either case, so it refuses and says
+-- what to do instead.
 data SelectorMismatch = SelectorMismatch
   { smStored :: [Selector]
   , smConfigured :: [Selector]
@@ -886,7 +881,7 @@ reconcileSelectors DbHandle{dbConn = conn} configured = do
 -- The spacing is exponential — newest, then 1, 2, 4, 8 … rows further back —
 -- so a shallow rollback rejoins within a block or two of where we stopped, and
 -- an implausibly deep one still finds something without carrying every
--- checkpoint over the wire. kupo builds its ladder the same way.
+-- checkpoint over the wire.
 --
 -- Capped at 'resumePointCount' entries. Genesis is not included; the caller
 -- appends it as the last resort.

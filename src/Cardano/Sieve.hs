@@ -27,7 +27,6 @@ import Cardano.Api
   , deserialiseFromRawBytesHex
   )
 
-import Cardano.Server.Run (runServer)
 import Cardano.Sieve.Node.Fetch (fetch, fetchBounded)
 import Cardano.Sieve.Node.Insert
   ( Durability (Durable, UnsafeBulk)
@@ -37,6 +36,7 @@ import Cardano.Sieve.Node.Insert
   , openDatabase
   )
 import Cardano.Sieve.Selector (Selector, selectorFromText)
+import Cardano.Sieve.Server.Run (runServer)
 import Cardano.Slotting.Slot (SlotNo (SlotNo))
 
 import Control.Applicative (many, optional)
@@ -408,7 +408,7 @@ optionsParser =
         )
 
 -- | Parse a @--since@ argument: @origin@, or @SLOT.HEADERHASH@ — a decimal slot
--- and a base16 block-header hash, as kupo and cardano-cli render chain points.
+-- and a base16 block-header hash, as cardano-cli renders chain points.
 readChainPoint :: String -> Either String ChainPoint
 readChainPoint "origin" = Right ChainPointAtGenesis
 readChainPoint s =

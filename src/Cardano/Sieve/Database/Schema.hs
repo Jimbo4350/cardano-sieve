@@ -1,10 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The SQLite schema — the authoritative definition of how matched data is
--- stored on disk. See @notes/Kupo-rewrite-pattern-and-storage-design.md@ for the
--- design and its rationale.
+-- stored on disk. See the design notes in @notes/@ for the rationale.
 --
--- Three core tables split kupo's single match table by write pattern:
+-- Three core tables, split by write pattern:
 --
 --   * @outputs@ — append-only history of every matched output; never mutated.
 --   * @unspent@ — the live UTxO set; INSERT on create, DELETE by primary key on
@@ -19,14 +18,14 @@
 -- bookkeeping tables.
 --
 -- There is no migration engine yet: tables are created with @CREATE TABLE IF NOT
--- EXISTS@ and schema changes are handled by wipe-and-resync during development
--- (as kupo itself does between versions). A @user_version@-keyed migration
--- system can be added later if forward-compatible upgrades are needed.
+-- EXISTS@ and schema changes are handled by wipe-and-resync during development.
+-- A @user_version@-keyed migration system can be added later if
+-- forward-compatible upgrades are needed.
 --
 -- Secondary indexes are /deferred/ ('installDeferredIndexes') until the initial
 -- catch-up sync reaches the tip, so the write-heavy catch-up pays only
 -- primary-key maintenance.
-module Cardano.Sieve.Schema
+module Cardano.Sieve.Database.Schema
   ( createSchema
   , installDeferredIndexes
   )
@@ -183,15 +182,15 @@ tables =
     --
     -- KNOWN HOT SPOT / redesign escalation (if we need to change this table):
     -- even with the composite indexes this table is full-history, so a query for
-    -- a hot policy still walks spent entries. If the kupo comparison shows we
-    -- lose here, give the UNSPENT policy/asset path its own live-set table,
+    -- a hot policy still walks spent entries. If measurement shows we need it,
+    -- give the UNSPENT policy/asset path its own live-set table,
     -- mirroring outputs-vs-unspent:
     --   unspent_policies(output_reference, policy_num, asset_name, created_slot),
     --   insert-on-create / delete-on-spend like @unspent@, indexed
     --   @(policy_num, created_slot)@ and @(policy_num, asset_name, created_slot)@
     --   — no spent entries to skip. Consistent with the "index the small live
     --   set" philosophy, but it adds ingest write work (a tier-1 fast-sync cost),
-    --   so build it only once measured against kupo.
+    --   so build it only once measured.
     --   See [[sieve-query-index-tuning]].
     "CREATE TABLE IF NOT EXISTS policies \
     \( output_num       INTEGER NOT NULL \

@@ -126,8 +126,8 @@ outputsInBlock (BlockInMode _ block) =
 --
 -- The position comes from the caller rather than the transaction itself: nothing
 -- on a transaction records where in its block it sits, so it is the enumeration
--- order of 'getBlockTxs' — which is the block's own transaction order, and so the
--- same index kupo reports as @transaction_index@.
+-- order of 'getBlockTxs' — which is the block's own transaction order, and so
+-- the index reported as @transaction_index@ in match responses.
 txOutputs :: Word64 -> Tx era -> [DecodedOutput]
 txOutputs txIx (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $
@@ -149,7 +149,7 @@ txOutputs txIx (ShelleyTx sbe ledgerTx) =
          where
           -- 'datumTxOutF' yields the FULL datum, so an inline datum is hashed here
           -- rather than reported as absent — and which branch we took is exactly
-          -- kupo's @datum_type@.
+          -- the stored @datum_type@.
           hashDatum d = case d of
             L.NoDatum -> Nothing
             L.DatumHash dh -> Just (DatumByHash, L.hashToBytes (L.extractHash dh))
@@ -206,17 +206,14 @@ txOutputs txIx (ShelleyTx sbe ledgerTx) =
 
 -- | Every datum and script preimage a block carries.
 --
--- Four sources, deliberately a superset of kupo's two. kupo collects only
--- witness-set datums and witness-set/auxiliary scripts; we also take the /inline/
--- datum and the /reference script/ straight off each output, where the body is
--- already in hand for free. On preview to slot 4,000,000 kupo ends up with bodies
--- for 182,228 of the 182,370 distinct datum hashes its outputs reference — the
--- inline sources are what close that gap.
+-- Four sources: witness-set datums and witness-set/auxiliary scripts, plus the
+-- /inline/ datum and the /reference script/ straight off each output, where the
+-- body is already in hand for free.
 --
 -- The caller decides whether to write these: see the relevance gate in
--- "Cardano.Sieve.Node.Insert", which mirrors kupo's — store a block's preimages
--- only if that block produced a tracked output or spent a tracked input, so a
--- narrow selector does not drag in the whole chain's datums.
+-- "Cardano.Sieve.Node.Insert" — store a block's preimages only if that block
+-- produced a tracked output, so a narrow selector does not drag in the whole
+-- chain's datums.
 preimagesInBlock :: BlockInMode -> Preimages
 preimagesInBlock (BlockInMode _ block) = foldMap txPreimages (getBlockTxs block)
 
@@ -353,8 +350,7 @@ spentInputs capture (BlockInMode _ block) =
 --
 -- It lines up here because 'L.inputsTxBodyL' is a 'Set', so @F.toList@ already
 -- yields sorted order, and 'siInputIndex' is that same enumeration. So pointer
--- index @n@ is exactly the input at @siInputIndex = n@ — the reason sieve's
--- @input_index@ already agreed with kupo's.
+-- index @n@ is exactly the input at @siInputIndex = n@.
 txSpends :: RedeemerCapture -> Tx era -> [SpentInput]
 txSpends capture (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $

@@ -27,18 +27,18 @@ library
   autogen-modules: Paths_cardano_sieve
   other-modules:   Paths_cardano_sieve
   exposed-modules: Cardano.Sieve
-                   Cardano.Server.Api.Checkpoints
-                   Cardano.Server.Api.Common
-                   Cardano.Server.Api.Health
-                   Cardano.Server.Api.Matches
-                   Cardano.Server.Api.Metadata
-                   Cardano.Server.Api.Patterns
-                   Cardano.Server.Api.Preimages
-                   Cardano.Server.Run
-                   Cardano.Sieve.Database
+                   Cardano.Sieve.Server.Api.Checkpoints
+                   Cardano.Sieve.Server.Api.Common
+                   Cardano.Sieve.Server.Api.Health
+                   Cardano.Sieve.Server.Api.Matches
+                   Cardano.Sieve.Server.Api.Metadata
+                   Cardano.Sieve.Server.Api.Patterns
+                   Cardano.Sieve.Server.Api.Preimages
+                   Cardano.Sieve.Server.Run
+                   Cardano.Sieve.Database.DirtyFlag
                    Cardano.Sieve.Selector
                    Cardano.Sieve.Value
-                   Cardano.Sieve.Schema
+                   Cardano.Sieve.Database.Schema
                    Cardano.Sieve.Node.Decode
                    Cardano.Sieve.Node.Fetch
                    Cardano.Sieve.Node.FetchBlock
@@ -58,7 +58,6 @@ library
     , containers               ^>=0.7
     , http-api-data            ^>=0.6
     , cardano-slotting         ^>=0.2
-    , http-types
     , microlens                ^>=0.4
     , optparse-applicative     ^>=0.19
     , ouroboros-network:protocols ^>=1.1

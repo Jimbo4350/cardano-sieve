@@ -4,14 +4,14 @@
 {-# LANGUAGE TypeOperators #-}
 
 -- | @\/patterns@ — the configured selectors, read-only.
-module Cardano.Server.Api.Patterns
+module Cardano.Sieve.Server.Api.Patterns
   ( PatternsAPI
   , patternsServer
   )
 where
 
-import Cardano.Server.Api.Common (badRequest, withReadConnection)
 import Cardano.Sieve.Selector (includes, selectorFromText)
+import Cardano.Sieve.Server.Api.Common (badRequest, withReadConnection)
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value)
@@ -40,12 +40,11 @@ import Servant
 -- (the @payment\/delegation@ form embeds a @\/@) and because it makes the bare
 -- @\/patterns@ and @\/patterns\/{pattern}@ shapes one handler: no segments lists
 -- everything, segments filter to the stored patterns that /include/ the given
--- one ('includes' — kupo's relation, so passing an address answers "which of my
+-- one ('includes' — passing an address answers "which of my
 -- selectors would match this?").
 --
--- The write verbs exist to say no properly. kupo's PUT\/DELETE reconfigure a
--- RUNNING indexer — its handler rewinds the chain follower to re-index under
--- the new pattern set. Sieve's server deliberately has no indexer to rewind
+-- The write verbs exist to say no properly. Sieve's server deliberately has
+-- no indexer to rewind
 -- (and when one shares the process, no channel to it), so these are 501 with
 -- instructions, not 404: the resource exists, this server just will not mutate
 -- it.
@@ -87,7 +86,7 @@ patternsRefuse _ =
       { errBody =
           "sieve does not reconfigure a live indexer: adding or removing \
           \patterns mid-sync leaves the database incomplete for what it claims \
-          \to index (kupo re-syncs from a rollback point instead). Stop the \
+          \to index. Stop the \
           \indexer and restart it with the --select set you want; it will \
           \refuse mismatches and tell you what it was built with."
       }

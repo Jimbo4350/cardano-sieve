@@ -6,8 +6,8 @@
 {-# LANGUAGE TypeOperators #-}
 
 -- | @\/metadata@ — a block's transaction metadata, fetched from the node on
--- demand and never stored (kupo's contract).
-module Cardano.Server.Api.Metadata
+-- demand and never stored.
+module Cardano.Sieve.Server.Api.Metadata
   ( MetadataAPI
   , metadataServer
   )
@@ -35,8 +35,8 @@ import Cardano.Api.Ledger qualified as L
 
 import Cardano.Ledger.Alonzo.Core (TxAuxDataHash (unTxAuxDataHash), hashTxAuxData, originalBytes)
 import Cardano.Ledger.Metadata (Metadatum (..))
-import Cardano.Server.Api.Common (badRequest, hexText, withReadConnection)
 import Cardano.Sieve.Node.FetchBlock (fetchBlockAtSlot)
+import Cardano.Sieve.Server.Api.Common (badRequest, hexText, withReadConnection)
 import Cardano.Slotting.Slot (SlotNo (SlotNo))
 
 import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
@@ -72,9 +72,9 @@ import Servant
   , (:>)
   )
 
--- | On-demand transaction metadata, kupo's contract: never stored, asked of
+-- | On-demand transaction metadata: never stored, asked of
 -- the node per request. See 'metadataBySlot' for the mechanism and the edge
--- cases inherited deliberately.
+-- cases.
 type MetadataAPI =
   "metadata"
     :> Capture "slot-no" Int64
@@ -86,22 +86,21 @@ metadataServer :: Maybe (SocketPath, NetworkId) -> FilePath -> Server MetadataAP
 metadataServer = metadataBySlot
 
 -- | @GET \/metadata\/{slot-no}@ — every transaction's metadata in the block at
--- a slot, fetched from the node on demand ('fetchBlockAtSlot'); kupo's contract,
--- including never storing any of it. The ancestor to walk from is the
+-- a slot, fetched from the node on demand ('fetchBlockAtSlot') and never
+-- stored. The ancestor to walk from is the
 -- checkpoint at-or-before @slot − 1@ — the same row @\/checkpoints\/{slot}@
 -- serves — or genesis on an empty range.
 --
--- Edge cases match kupo deliberately:
+-- Edge cases:
 --
 --   * slot @0@ is a hardcoded @[]@ with no header: nothing can have an
 --     ancestor there. A negative slot is a 400.
 --   * an unrecognised ancestor, or a rollback racing the walk, is a 400
---     (kupo's \"no ancestor\" answer) — the client should retry.
+--     — the client should retry.
 --   * a slot nobody minted in answers with the NEXT block's metadata: the
---     fetch stops at the first block at-or-past the target, checking nothing
---     (kupo takes the single block after its intersection, same thing). The
---     @X-Block-Header-Hash@ header carries the hash the answer actually came
---     from, and kupo's spec pushes verifying it onto the client.
+--     fetch stops at the first block at-or-past the target, checking nothing.
+--     The @X-Block-Header-Hash@ header carries the hash the answer actually
+--     came from; verifying it is on the client.
 --   * @?transaction_id@ filters to one transaction's items; a malformed id is
 --     a 400.
 --
@@ -120,8 +119,8 @@ metadataBySlot node dbPath slot txIdParam = do
       throwError
         err503
           { errBody =
-              "metadata is fetched from the node on demand, never stored (kupo \
-              \does the same) — and this server has no node: it is serving an \
+              "metadata is fetched from the node on demand, never stored — and \
+              \this server has no node: it is serving an \
               \already-synced database. Run --serve alongside --socket-path to \
               \serve /metadata."
           }
@@ -175,26 +174,16 @@ metadataBySlot node dbPath slot txIdParam = do
               (hexText (serialiseToRawBytes headerHash))
               (metadataItems wanted (getBlockTxs blk))
 
--- | One item per transaction carrying auxiliary data, in block order — kupo's
--- shape: @{hash, raw, schema}@. Byron transactions cannot carry metadata (and
--- 'getBlockTxs' yields none for Byron blocks), so a Byron block is @[]@, as in
--- kupo.
+-- | One item per transaction carrying auxiliary data, in block order, shaped
+-- @{hash, raw, schema}@. Byron transactions cannot carry metadata (and
+-- 'getBlockTxs' yields none for Byron blocks), so a Byron block is @[]@.
 --
 -- @raw@ is the auxiliary data's on-chain serialisation and @hash@ its
 -- blake2b-256 ('hashTxAuxData') — the hash the transaction body committed to.
--- kupo instead re-encodes the aux data into its newest era's format and
--- recomputes the hash over the re-encoding. The two agree wherever the
--- on-chain bytes already use the Alonzo tag-259 format — measured at 96% of
--- metadata-carrying preview blocks in slots 0–4M (2,443 of 2,545 sampled) —
--- and differ where a transaction shipped the legacy Shelley (bare map) or
--- Allegra (@[metadata, scripts]@ array) encoding, which stays legal in
--- Alonzo-era-and-later blocks: kupo then reports bytes that are not on the
--- chain and a hash the transaction body does not carry, while sieve's pair
--- round-trips against the chain. Diverging from kupo here is deliberate,
--- the same ruling as the spend-redeemer index: match the ledger, not kupo's
--- bug. Both stay self-consistent (@hash == blake2b-256(raw)@ either way).
--- @schema@ — which never differs — mirrors kupo's @encodeMetadatum@
--- constructor for constructor.
+-- A transaction may ship the legacy Shelley (bare map) or Allegra
+-- (@[metadata, scripts]@ array) encoding, which stays legal in
+-- Alonzo-era-and-later blocks; sieve's pair round-trips against the chain
+-- either way and stays self-consistent (@hash == blake2b-256(raw)@).
 metadataItems :: Maybe TxId -> [Tx era] -> [Value]
 metadataItems wanted = mapMaybe $ \(ShelleyTx sbe ledgerTx) ->
   shelleyBasedEraConstraints sbe $ do
@@ -211,8 +200,8 @@ metadataItems wanted = mapMaybe $ \(ShelleyTx sbe ledgerTx) ->
               ]
         ]
 
--- | kupo's @schema@ rendering of one metadatum — its @encodeMetadatum@, shape
--- for shape: five primitives, each wrapped in a one-field object naming it.
+-- | The @schema@ rendering of one metadatum: five primitives, each wrapped in
+-- a one-field object naming it.
 metadatumJson :: Metadatum -> Value
 metadatumJson = \case
   I n -> object ["int" .= n]

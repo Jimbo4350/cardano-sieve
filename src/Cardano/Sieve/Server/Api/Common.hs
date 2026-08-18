@@ -3,7 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Helpers shared by the server and its endpoint modules.
-module Cardano.Server.Api.Common
+module Cardano.Sieve.Server.Api.Common
   ( withReadConnection
   , badRequest
   , hexText
@@ -50,8 +50,7 @@ badRequest msg = throwError err400{errBody = LBS.fromStrict (encodeUtf8 msg)}
 hexText :: ByteString -> Text
 hexText = decodeUtf8 . Base16.encode
 
--- | The language a stored script's discriminator byte names. Values confirmed
--- against both kupo's table and its OpenAPI enum.
+-- | The language a stored script's discriminator byte names.
 scriptLanguage :: Word8 -> Value
 scriptLanguage = \case
   0 -> "native"

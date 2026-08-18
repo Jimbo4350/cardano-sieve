@@ -750,7 +750,7 @@ boundedClient dbHandle progress capture selectors since untilSlot =
             Draining -> pure (clientIdle Draining Origin (fromChainTip serverTip) n)
             Indexing -> do
               -- Peek the slot BEFORE indexing: a block past the bound must not
-              -- be written. --until is inclusive (kupo's <= semantics), so index
+              -- be written. --until is inclusive, so index
               -- iff slot <= untilSlot; the first block beyond the bound flips us
               -- to draining without being indexed. A block landing exactly on
               -- untilSlot is indexed and starts the drain in the same step.
