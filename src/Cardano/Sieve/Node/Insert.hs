@@ -838,16 +838,16 @@ instance Exception StoredSelectorUnparseable
 -- Runs inside the caller's transaction discipline: it commits nothing itself,
 -- and the write it may perform is picked up by the next 'flushBatch'.
 reconcileSelectors :: DbHandle -> [Selector] -> IO [Selector]
-reconcileSelectors DbHandle{dbConn = conn} configured = do
+reconcileSelectors DbHandle{dbConn = conn} cliSelectors = do
   rows <- query_ conn "SELECT selector FROM patterns"
-  stored <- traverse parseStored [t | Only t <- rows]
-  case (stored, configured) of
+  stored <- traverse parseStoredOrThrow [t | Only t <- rows]
+  case (stored, cliSelectors) of
     -- Nothing stored and nothing asked for: match everything, and record that,
     -- so the next run adopts it rather than re-deciding. The default lives here
     -- rather than in the option parser because it is a value that has to be
     -- PERSISTED, and this is the only place that both chooses and writes it.
     ([], []) -> defaulted <$ mapM_ insertSelector defaulted
-    ([], _) -> configured <$ mapM_ insertSelector configured
+    ([], _) -> cliSelectors <$ mapM_ insertSelector cliSelectors
     -- Asked for nothing, so use what the database was built with. This is what
     -- makes a bare restart work without repeating every --select.
     (_, []) -> pure stored
@@ -856,12 +856,12 @@ reconcileSelectors DbHandle{dbConn = conn} configured = do
       -- actually holds, 'Selector' has no 'Ord', and the codec round-trips, so
       -- text equality and selector equality are the same question.
       | Set.fromList (map selectorToText stored)
-          == Set.fromList (map selectorToText configured) ->
+          == Set.fromList (map selectorToText cliSelectors) ->
           pure stored
-      | otherwise -> throwIO (SelectorMismatch stored configured)
+      | otherwise -> throwIO (SelectorMismatch stored cliSelectors)
  where
   defaulted = [SelectAll IncludeBootstrap]
-  parseStored t = either (const (throwIO (StoredSelectorUnparseable t))) pure (selectorFromText t)
+  parseStoredOrThrow t = either (const (throwIO (StoredSelectorUnparseable t))) pure (selectorFromText t)
   insertSelector s =
     execute
       conn

@@ -104,7 +104,7 @@ fetch socketPath networkId dbPath batchSize durability capture selectors since =
     selectors
     (\dbHandle progress active -> followingClient dbHandle progress capture active since)
 
--- | As 'fetch', but index only from @since@ up to and including @untilSlot@,
+-- | Same as 'fetch', but index only from @since@ up to and including @untilSlot@,
 -- then stop. For bounded backfills and benchmark runs.
 fetchBounded
   :: SocketPath
@@ -148,15 +148,16 @@ runSync
        -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
      )
   -> IO ()
-runSync socketPath networkId dbPath batchSize durability configured mkClient =
+runSync socketPath networkId dbPath batchSize durability cliSelectors mkClient =
   bracket
     (openDatabase durability dbPath batchSize)
     closeDatabase
     ( \dbHandle -> do
         -- Before a single block is fetched: refuse to index into a database that
-        -- was built with different selectors, and adopt its stored set when none
-        -- were given. Throws 'SelectorMismatch', which is fatal by design.
-        selectors <- reconcileSelectors dbHandle configured
+        -- was built with different selectors ('SelectorMismatch', fatal by
+        -- design). When this run was given no --select at all, it reuses the
+        -- selectors stored in the database, so a bare restart continues as before.
+        selectors <- reconcileSelectors dbHandle cliSelectors
         progress <- newProgress
         stamped
           ( "sync starting  db "
