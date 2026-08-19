@@ -1,5 +1,3 @@
--- DataKinds: 'collectFlushingWhenIdle' names the pipeline depth it returns at,
--- @(S n)@, promoting typed-protocols' 'N' constructor to the type level.
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
@@ -8,21 +6,19 @@
 -- | Follow the chain over the node-to-client ChainSync protocol (pipelined),
 -- sieve each block's outputs, and write the matches to SQLite.
 --
--- The indexing loop (ADR-020) is a single-threaded, pipelined ChainSync client
+-- The indexing loop is a single-threaded, pipelined ChainSync client
 -- with no application-level queue. The buffering below the application (node
 -- send buffer, kernel, mux ingress) provides flow control; pipelining depth is
 -- the only bound on in-flight data.
 --
 -- There are two clients, both starting from a configurable point (@--since@,
--- genesis by default) and sharing 'sieveBlock' for the roll-forward body:
+-- genesis by default), and both handling a rolled-forward block the same way,
+-- by calling 'sieveBlock' on it; they differ only in when they stop.
 -- 'followingClient' streams forever; 'boundedClient' stops after a given slot
 -- (@--until@), draining the requests still in flight before it finishes.
 module Cardano.Sieve.Node.Fetch
   ( fetch
   , fetchBounded
-
-    -- * Pipelining and the write cadence
-    -- $pipelining
   )
 where
 
@@ -47,7 +43,7 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Sieve.Node.Decode (preimagesInBlock, selectedStored, spentInputs)
+import Cardano.Sieve.Node.Decode (datumsAndScriptsInBlock, selectedStored, spentInputs)
 import Cardano.Sieve.Node.Insert
   ( DbHandle
   , Durability (Durable, UnsafeBulk)
@@ -423,7 +419,7 @@ sieveBlock dbHandle progress capture policyIndexing selectors target blockInMode
     (serialiseToRawBytes hash)
     selected
     spent
-    (preimagesInBlock blockInMode)
+    (datumsAndScriptsInBlock blockInMode)
   tick progress slotNo target (length selected) (length spent)
   pure header
 

@@ -29,11 +29,12 @@ library
   exposed-modules: Cardano.Sieve
                    Cardano.Sieve.Server.Api.Checkpoints
                    Cardano.Sieve.Server.Api.Common
+                   Cardano.Sieve.Server.Api.Datums
                    Cardano.Sieve.Server.Api.Health
                    Cardano.Sieve.Server.Api.Matches
                    Cardano.Sieve.Server.Api.Metadata
                    Cardano.Sieve.Server.Api.Patterns
-                   Cardano.Sieve.Server.Api.Preimages
+                   Cardano.Sieve.Server.Api.Scripts
                    Cardano.Sieve.Server.Run
                    Cardano.Sieve.Database.DirtyFlag
                    Cardano.Sieve.Selector

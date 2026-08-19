@@ -11,8 +11,8 @@
 -- The endpoints:
 --
 --   * @GET \/matches\/{pattern}@ — every dimension the indexer can match on
---   * @GET \/datums\/{hash}@ — a datum preimage, @{datum}@
---   * @GET \/scripts\/{hash}@ — a script preimage, @{script, language}@
+--   * @GET \/datums\/{hash}@ — the datum behind a hash, @{datum}@
+--   * @GET \/scripts\/{hash}@ — the script behind a hash, @{script, language}@
 --   * @GET \/checkpoints@ — a sample of stored chain points, newest first
 --   * @GET \/checkpoints\/{slot-no}@ — the point at (or, by default, at-or-before)
 --     a slot; @?strict@ demands the exact slot
@@ -40,11 +40,12 @@ import Cardano.Api (NetworkId, SocketPath)
 import Cardano.Sieve.Database.DirtyFlag (isDirty)
 import Cardano.Sieve.Server.Api.Checkpoints (CheckpointsAPI, checkpointsServer)
 import Cardano.Sieve.Server.Api.Common (withReadConnection)
+import Cardano.Sieve.Server.Api.Datums (DatumsAPI, datumsServer)
 import Cardano.Sieve.Server.Api.Health (HealthAPI, healthServer)
 import Cardano.Sieve.Server.Api.Matches (MatchesAPI, matchesServer)
 import Cardano.Sieve.Server.Api.Metadata (MetadataAPI, metadataServer)
 import Cardano.Sieve.Server.Api.Patterns (PatternsAPI, patternsServer)
-import Cardano.Sieve.Server.Api.Preimages (PreimageAPI, preimageServer)
+import Cardano.Sieve.Server.Api.Scripts (ScriptsAPI, scriptsServer)
 
 import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
 import Control.Monad (unless, when)
@@ -62,7 +63,13 @@ import Servant (Server, serve, (:<|>) ((:<|>)))
 
 -- | The query API.
 type API =
-  MatchesAPI :<|> CheckpointsAPI :<|> PatternsAPI :<|> HealthAPI :<|> PreimageAPI :<|> MetadataAPI
+  MatchesAPI
+    :<|> CheckpointsAPI
+    :<|> PatternsAPI
+    :<|> HealthAPI
+    :<|> DatumsAPI
+    :<|> ScriptsAPI
+    :<|> MetadataAPI
 
 -- | Serve the query API on @port@, reading from the SQLite database at @dbPath@.
 -- Refuses to start unless the database is present and readable ('describeDatabase').
@@ -165,5 +172,6 @@ server node dbPath =
     :<|> checkpointsServer dbPath
     :<|> patternsServer dbPath
     :<|> healthServer node dbPath
-    :<|> preimageServer dbPath
+    :<|> datumsServer dbPath
+    :<|> scriptsServer dbPath
     :<|> metadataServer node dbPath

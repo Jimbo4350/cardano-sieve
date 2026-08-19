@@ -196,12 +196,12 @@ data Refinements = Refinements
   , rfOutputIndex :: Maybe Word64
   }
 
--- | Whether @?resolve_hashes@ was asked for: does a match carry the datum and
--- script /bodies/ behind its hashes, or just the hashes?
+-- | Whether @?resolve_hashes@ was asked for: does a match carry the datums and
+-- scripts behind its hashes, or just the hashes?
 --
 -- Servant's 'QueryFlag' can only hand us a 'Bool', but it stops there. The flag
 -- decides three separate things — which columns the SELECT projects, whether the
--- two preimage tables are joined, and what 'rowToJson' emits — and a bare 'Bool'
+-- datum and script tables are joined, and what 'rowToJson' emits — and a bare 'Bool'
 -- threaded to all three says nothing at any of them.
 data HashResolution = ResolveHashes | LeaveHashes
   deriving (Eq, Show)
@@ -519,7 +519,7 @@ matchesByPattern dbPath segments unspentFlag spentFlag resolveHashes bounds refi
          \LEFT JOIN spends s ON s.output_num = u.output_num \
          \LEFT JOIN blocks bs ON bs.slot_no = s.spent_slot"
       -- Only joined when asked for: both are primary-key probes, but resolving on
-      -- every match would ship a datum body per row (and one popular datum is
+      -- every match would ship the full datum per row (and one popular datum is
       -- referenced by 2,480 outputs, so a large page would repeat it).
       <> ( case resolveHashes of
              ResolveHashes ->
@@ -688,7 +688,7 @@ rowToJson
 rowToJson
   resolved
   ( (oref, txIx, addr, val, mDatum, mDatumType, mScript, slot, mHeader)
-      :. (mSpentSlot, mSpentHeader, mSpendTx, mInputIx, mRedeemer, mDatumBody, mScriptBody)
+      :. (mSpentSlot, mSpentHeader, mSpendTx, mInputIx, mRedeemer, mResolvedDatum, mResolvedScript)
     ) =
     object
       ( [ "transaction_id" .= hexText (BS.take 32 oref)
@@ -705,12 +705,13 @@ rowToJson
           -- rather than emitting null, and a null would read as "no datum" to a
           -- client that checks for the field's presence.
           <> ["datum_type" .= t | Just t <- [datumTypeText =<< mDatumType]]
-          -- ?resolve_hashes inlines the bodies. Emitted whenever resolving was
-          -- asked for, null when the body is not stored, so a client can tell
-          -- "not resolved" from "resolved, nothing there".
-          <> [ "datum" .= (hexText <$> mDatumBody) | resolved == ResolveHashes
+          -- ?resolve_hashes inlines the datum and script. Emitted whenever
+          -- resolving was asked for, null when nothing is stored under the
+          -- hash, so a client can tell "not resolved" from "resolved, nothing
+          -- there".
+          <> [ "datum" .= (hexText <$> mResolvedDatum) | resolved == ResolveHashes
              ]
-          <> [ "script" .= (scriptBodyJson =<< mScriptBody) | resolved == ResolveHashes
+          <> [ "script" .= (scriptJson =<< mResolvedScript) | resolved == ResolveHashes
              ]
       )
    where
@@ -729,8 +730,8 @@ rowToJson
 
 -- | A stored script blob as @{script, language}@, splitting off the leading
 -- discriminator byte — the same shape @\/scripts\/{hash}@ returns.
-scriptBodyJson :: ByteString -> Maybe Value
-scriptBodyJson body = case BS.uncons body of
+scriptJson :: ByteString -> Maybe Value
+scriptJson stored = case BS.uncons stored of
   Nothing -> Nothing
   Just (tag, raw) -> Just (object ["script" .= hexText raw, "language" .= scriptLanguage tag])
 

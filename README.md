@@ -98,8 +98,8 @@ against kupo v2.11):
 |---|---|
 | `GET /matches` / `GET /matches/{pattern}` | matching outputs; all thirteen of kupo's parameters (`?unspent`, `?spent`, `?order`, `?created_after`/`_before`, `?spent_after`/`_before`, `?policy_id`, `?asset_name`, `?transaction_id`, `?output_index`, `?resolve_hashes`) |
 | `DELETE /matches/{pattern}` | prune everything a pattern matched; refused while a configured selector still covers it |
-| `GET /datums/{hash}` | datum preimage |
-| `GET /scripts/{hash}` | script preimage with its language |
+| `GET /datums/{hash}` | the datum behind a hash |
+| `GET /scripts/{hash}` | the script behind a hash, with its language |
 | `GET /checkpoints` | a sample of stored chain points, newest first |
 | `GET /checkpoints/{slot-no}` | the point at-or-before a slot; `?strict` demands the exact slot |
 | `GET /patterns` / `GET /patterns/{pattern}` | the configured selectors |

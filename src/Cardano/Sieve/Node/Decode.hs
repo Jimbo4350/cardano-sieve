@@ -26,7 +26,7 @@
 module Cardano.Sieve.Node.Decode
   ( DecodedOutput (..)
   , outputsInBlock
-  , preimagesInBlock
+  , datumsAndScriptsInBlock
   , toContext
   , selectedOutputs
   , selectedStored
@@ -58,19 +58,17 @@ import Cardano.Api.Ledger qualified as L
 -- @originalBytes@ (the memoised CBOR a ledger decoder kept) is not re-exported by
 -- @Cardano.Api.Ledger@, same as 'IsValid' and 'collateralReturnTxBodyL'; take it
 -- from the ledger directly.
-import Cardano.Ledger.Alonzo.Core (originalBytes)
+import Cardano.Ledger.Alonzo.Core (originalBytes, scriptPrefixTag)
 import Cardano.Ledger.Alonzo.Scripts
-  ( AlonzoScript (NativeScript, PlutusScript)
-  , AsIx (AsIx)
+  ( AsIx (AsIx)
   , mkSpendingPurpose
-  , plutusScriptLanguage
   )
 import Cardano.Ledger.Alonzo.Tx (IsValid (..), isValidTxL)
 import Cardano.Ledger.Alonzo.TxWits (datsTxWitsL, rdmrsTxWitsL, unRedeemers, unTxDats)
 import Cardano.Ledger.Babbage.TxBody (collateralReturnTxBodyL)
 import Cardano.Sieve.Node.Insert
   ( DatumType (DatumByHash, DatumInline)
-  , Preimages (..)
+  , DatumsAndScripts (..)
   , RedeemerCapture (CaptureRedeemers, SkipRedeemers)
   , SpentInput (..)
   , StoredOutput (..)
@@ -85,7 +83,6 @@ import Cardano.Sieve.Selector
 import Cardano.Sieve.Value (encodeValue)
 
 import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
 import Data.ByteString.Builder (toLazyByteString, word64BE)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Foldable qualified as F
@@ -118,7 +115,7 @@ data DecodedOutput = DecodedOutput
 -- nothing ('getBlockTxs' is @[]@ for them).
 outputsInBlock :: BlockInMode -> [DecodedOutput]
 outputsInBlock (BlockInMode _ block) =
-  concat (zipWith txOutputs [0 ..] (getBlockTxs block))
+  concat (zipWith outputsInTx [0 ..] (getBlockTxs block))
 
 -- | Decode every output of one transaction. Each output carries the
 -- transaction's id (in its output reference), its position within the block, and
@@ -128,8 +125,8 @@ outputsInBlock (BlockInMode _ block) =
 -- on a transaction records where in its block it sits, so it is the enumeration
 -- order of 'getBlockTxs' — which is the block's own transaction order, and so
 -- the index reported as @transaction_index@ in match responses.
-txOutputs :: Word64 -> Tx era -> [DecodedOutput]
-txOutputs txIx (ShelleyTx sbe ledgerTx) =
+outputsInTx :: Word64 -> Tx era -> [DecodedOutput]
+outputsInTx txIx (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $
     let txid = getTxIdShelley sbe (ledgerTx ^. L.bodyTxL)
 
@@ -179,45 +176,45 @@ txOutputs txIx (ShelleyTx sbe ledgerTx) =
             , doReferenceScriptHash = refScriptHash o
             , doMetadataTags = tags
             }
-        declared = F.toList (ledgerTx ^. L.bodyTxL . L.outputsTxBodyL)
-        declaredOutputs = zipWith mkOutput [0 ..] (TxOut <$> declared)
+        txOuts = F.toList (ledgerTx ^. L.bodyTxL . L.outputsTxBodyL)
+        txOutputs = zipWith mkOutput [0 ..] (TxOut <$> txOuts)
      in -- Every era enumerated (no wildcard) so a future era must be handled
         -- explicitly, not silently take the pre-Babbage path. On a
-        -- Babbage/Conway isValid=false (phase-2 failure) tx the declared outputs
-        -- were never created; the only created output is the collateral return,
-        -- at index = number of declared outputs. Each branch builds
+        -- Babbage/Conway isValid=false (phase-2 failure) tx the transaction's
+        -- outputs were never created; the only created output is the collateral
+        -- return, at index = number of outputs. Each branch builds
         -- DecodedOutputs directly (mkOutput applied where the ledger era is
         -- concrete) so the case result carries no era index.
         case sbe of
-          ShelleyBasedEraShelley -> declaredOutputs
-          ShelleyBasedEraAllegra -> declaredOutputs
-          ShelleyBasedEraMary -> declaredOutputs
-          ShelleyBasedEraAlonzo -> declaredOutputs
+          ShelleyBasedEraShelley -> txOutputs
+          ShelleyBasedEraAllegra -> txOutputs
+          ShelleyBasedEraMary -> txOutputs
+          ShelleyBasedEraAlonzo -> txOutputs
           ShelleyBasedEraBabbage -> case ledgerTx ^. isValidTxL of
-            IsValid True -> declaredOutputs
+            IsValid True -> txOutputs
             IsValid False -> case ledgerTx ^. L.bodyTxL . collateralReturnTxBodyL of
-              L.SJust o -> [mkOutput (fromIntegral (length declared)) (TxOut o)]
+              L.SJust o -> [mkOutput (fromIntegral (length txOuts)) (TxOut o)]
               L.SNothing -> []
           ShelleyBasedEraConway -> case ledgerTx ^. isValidTxL of
-            IsValid True -> declaredOutputs
+            IsValid True -> txOutputs
             IsValid False -> case ledgerTx ^. L.bodyTxL . collateralReturnTxBodyL of
-              L.SJust o -> [mkOutput (fromIntegral (length declared)) (TxOut o)]
+              L.SJust o -> [mkOutput (fromIntegral (length txOuts)) (TxOut o)]
               L.SNothing -> []
 
--- | Every datum and script preimage a block carries.
+-- | Every datum and script a block carries.
 --
 -- Four sources: witness-set datums and witness-set/auxiliary scripts, plus the
 -- /inline/ datum and the /reference script/ straight off each output, where the
--- body is already in hand for free.
+-- bytes are already in hand for free.
 --
 -- The caller decides whether to write these: see the relevance gate in
--- "Cardano.Sieve.Node.Insert" — store a block's preimages only if that block
--- produced a tracked output, so a narrow selector does not drag in the whole
--- chain's datums.
-preimagesInBlock :: BlockInMode -> Preimages
-preimagesInBlock (BlockInMode _ block) = foldMap txPreimages (getBlockTxs block)
+-- "Cardano.Sieve.Node.Insert" — store a block's datums and scripts only if that
+-- block produced a tracked output, so a narrow selector does not drag in the
+-- whole chain's datums.
+datumsAndScriptsInBlock :: BlockInMode -> DatumsAndScripts
+datumsAndScriptsInBlock (BlockInMode _ block) = foldMap datumsAndScriptsInTx (getBlockTxs block)
 
--- | The preimages of one transaction. Every era is enumerated (no wildcard) so a
+-- | The datums and scripts of one transaction. Every era is enumerated (no wildcard) so a
 -- future era must be handled explicitly rather than silently yielding nothing.
 -- Note on shape: the era-specific lenses ('datsTxWitsL' needs @AlonzoEraTxWits@,
 -- 'datumTxOutF' @AlonzoEraTxOut@, 'referenceScriptTxOutL' @BabbageEraTxOut@) are
@@ -225,8 +222,8 @@ preimagesInBlock (BlockInMode _ block) = foldMap txPreimages (getBlockTxs block)
 -- only brings the era-generic constraints into scope, so hoisting those reads into
 -- a @let@ fails to typecheck — the same trap as building the collateral output via
 -- a polymorphic helper. Only the era-agnostic post-processing is factored out.
-txPreimages :: Tx era -> Preimages
-txPreimages (ShelleyTx sbe ledgerTx) =
+datumsAndScriptsInTx :: Tx era -> DatumsAndScripts
+datumsAndScriptsInTx (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $
     let outs = F.toList (ledgerTx ^. L.bodyTxL . L.outputsTxBodyL)
 
@@ -253,61 +250,24 @@ txPreimages (ShelleyTx sbe ledgerTx) =
             datumsOfWits (ledgerTx ^. L.witsTxL . datsTxWitsL)
               <> concatMap (datumOfOut . (^. L.datumTxOutF)) outs
 
-        -- Scripts, per era: the witness set throughout, plus output reference
-        -- scripts from Babbage. Each branch inlines its own comprehension rather
-        -- than sharing a helper: the script type differs by era (a bare native
-        -- script before Alonzo, 'AlonzoScript' after), and @GADTs@ implies
-        -- @MonoLocalBinds@, so one @let@-bound helper would be pinned to a single
-        -- era's type. Matching @sbe@ also refines @era@ to a concrete era, which is
-        -- what brings @AlonzoEraScript@ into scope for 'plutusScriptLanguage'.
-        --
-        -- Every stored script is prefixed with its one-byte LANGUAGE TAG — 0 for a
-        -- native script, then 1/2/3/4 for PlutusV1..V4. This is not decoration: a
-        -- Cardano script hash is @blake2b224 (tag <> scriptBytes)@, so the tag is
-        -- part of the hash preimage. Without it the stored blob does not hash to
-        -- the key it is filed under, and a caller cannot verify what it was given.
-        -- It is also the only thing distinguishing byte-identical scripts under
-        -- different Plutus versions — they are genuinely different scripts with
-        -- different hashes. Verified: @blake2b224 (01 <> bytes)@ reproduces the
-        -- @script_hash@ exactly, and dropping the tag does not.
-        scriptRowsOf tag ss =
-          [ (serialiseToRawBytes (fromShelleyScriptHash sh), BS.cons tag (originalBytes s))
-          | (sh, s) <- ss
-          ]
-        plutusTag s = case s of
-          NativeScript _ -> 0
-          PlutusScript ps -> fromIntegral (1 + fromEnum (plutusScriptLanguage ps))
-        scripts = case sbe of
-          ShelleyBasedEraShelley -> []
-          ShelleyBasedEraAllegra ->
-            scriptRowsOf 0 (Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL))
-          ShelleyBasedEraMary ->
-            scriptRowsOf 0 (Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL))
-          ShelleyBasedEraAlonzo ->
-            [ (serialiseToRawBytes (fromShelleyScriptHash sh), BS.cons (plutusTag s) (originalBytes s))
-            | (sh, s) <- Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL)
-            ]
-          ShelleyBasedEraBabbage ->
-            [ (serialiseToRawBytes (fromShelleyScriptHash sh), BS.cons (plutusTag s) (originalBytes s))
-            | (sh, s) <- Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL)
-            ]
-              <> [ ( serialiseToRawBytes (fromShelleyScriptHash (L.hashScript s))
-                   , BS.cons (plutusTag s) (originalBytes s)
-                   )
-                 | o <- outs
-                 , L.SJust s <- [o ^. L.referenceScriptTxOutL]
-                 ]
-          ShelleyBasedEraConway ->
-            [ (serialiseToRawBytes (fromShelleyScriptHash sh), BS.cons (plutusTag s) (originalBytes s))
-            | (sh, s) <- Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL)
-            ]
-              <> [ ( serialiseToRawBytes (fromShelleyScriptHash (L.hashScript s))
-                   , BS.cons (plutusTag s) (originalBytes s)
-                   )
-                 | o <- outs
-                 , L.SJust s <- [o ^. L.referenceScriptTxOutL]
-                 ]
-     in Preimages datums scripts
+        -- Scripts: the witness set in every era, plus output reference scripts
+        -- from Babbage. Each stored blob is @scriptPrefixTag s <> originalBytes s@
+        -- — exactly the bytes 'L.hashScript' hashes, so the stored script hashes
+        -- back to the key it is filed under.
+        scriptRow sh s =
+          (serialiseToRawBytes (fromShelleyScriptHash sh), scriptPrefixTag s <> originalBytes s)
+        scripts =
+          [scriptRow sh s | (sh, s) <- Map.toList (ledgerTx ^. L.witsTxL . L.scriptTxWitsL)]
+            <> case sbe of
+              ShelleyBasedEraShelley -> []
+              ShelleyBasedEraAllegra -> []
+              ShelleyBasedEraMary -> []
+              ShelleyBasedEraAlonzo -> []
+              ShelleyBasedEraBabbage ->
+                [scriptRow (L.hashScript s) s | o <- outs, L.SJust s <- [o ^. L.referenceScriptTxOutL]]
+              ShelleyBasedEraConway ->
+                [scriptRow (L.hashScript s) s | o <- outs, L.SJust s <- [o ^. L.referenceScriptTxOutL]]
+     in DatumsAndScripts datums scripts
 
 -- | Project the matcher's view out of a decoded output.
 toContext :: DecodedOutput -> OutputContext

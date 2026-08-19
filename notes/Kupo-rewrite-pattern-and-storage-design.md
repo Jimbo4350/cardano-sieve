@@ -65,7 +65,7 @@ inherit phantom ones:
   `ON DELETE CASCADE`. The output→policy index that backs policy/asset
   matching (asset-name precision comes from filtering the `value` blob).
 - **`binary_data`** — `binary_data_hash → binary_data`. Shared, de-duplicated
-  datum-preimage store, referenced by hash from `inputs.datum_hash`.
+  datum store, referenced by hash from `inputs.datum_hash`.
 - **`scripts`** — `script_hash → script`. Shared, de-duplicated script store,
   referenced by hash.
 - **`patterns`** — the persisted set of active patterns (survives restart,
@@ -144,7 +144,8 @@ Carried over from kupo, tied in as follows:
   tables. Likely extended with a per-pattern start-point (see open questions).
 - **`checkpoints`** — resumption points + rollback rewind basis. Orthogonal;
   mandatory given we keep rollback handling.
-- **`binary_data`** / **`scripts`** — shared, de-duplicated preimage stores,
+- **`binary_data`** / **`scripts`** — shared, de-duplicated datum and script
+  stores,
   referenced by hash from `outputs` (and by `spends` if we store spending
   redeemers there). Carry over unchanged.
 - **`policies`** (and any asset-name index) — the join table that backs
@@ -250,13 +251,13 @@ Tables (columns are `BLOB` unless noted; `?` = nullable):
   policy/asset index over full history; unspent-by-policy joins to `unspent` by
   PK.
 - **binary_data** (`datum_hash` PK, `datum`), **scripts** (`script_hash` PK,
-  `script`) — deduplicated preimage bodies. **Not yet populated:** sieve
-  currently stores only the hashes (on `outputs`/`unspent`), not the bodies.
-  Kupo stores both — datum bodies in `binary_data` (from *both* inline datums
-  and witness-set datums, via `witnessedDatums`) and reference-script bodies in
-  `scripts` — and serves them via `GET /datums/{hash}` / `GET /scripts/{hash}`
-  and inline under `?resolve_hashes`. Capturing the bodies is the deferred
-  preimage cut.
+  `script`) — the deduplicated datums and scripts. **Not yet populated:** sieve
+  currently stores only the hashes (on `outputs`/`unspent`), not the datums and
+  scripts themselves. Kupo stores both — datums in `binary_data` (from *both*
+  inline datums and witness-set datums, via `witnessedDatums`) and reference
+  scripts in `scripts` — and serves them via `GET /datums/{hash}` /
+  `GET /scripts/{hash}` and inline under `?resolve_hashes`. Capturing the
+  datums and scripts is the deferred cut.
 - **patterns** (`selector` TEXT PK) — active selectors (text form coupled to
   Phase 8). **checkpoints** (`slot_no` INT PK, `header_hash`) — sparse pruned
   resume points.
@@ -290,7 +291,7 @@ PK join on the unspent-by-policy path.
 **Q1 — How fat is the `unspent` row? — RESOLVED.** Thin-but-covering: the
 `unspent` row carries the columns we filter and commonly return (address,
 value, datum hash) plus all the query indexes, and PK-joins back to `outputs`
-only for rare heavy fields (datum preimage, script). See "Selector coverage:
+only for rare heavy fields (datum, script). See "Selector coverage:
 what can be queried, and where the indexes live" above for the reasoning, and
 "Storage
 schema (Phase 3)" for the realised tables (note the `policies` index was later

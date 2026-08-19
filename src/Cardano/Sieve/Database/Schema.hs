@@ -12,7 +12,7 @@
 --   * @spends@ — append-only spend provenance, keyed by the consumed output.
 --
 -- supported by @blocks@ (durable slot → header-hash, for @created_at@ /
--- @spent_at@ in results), the deduplicated @binary_data@ and @scripts@ preimage
+-- @spent_at@ in results), the deduplicated @binary_data@ (datums) and @scripts@
 -- stores, @policies@ (the policy/asset index, over full history) with its
 -- @policy_ids@ interning dictionary, and the @patterns@ / @checkpoints@
 -- bookkeeping tables.
@@ -89,7 +89,7 @@ tables =
     \)"
   , -- The live UTxO set: INSERT on create, DELETE by primary key on spend.
     -- Thin-but-covering — carries the columns queries filter and return, and
-    -- holds all the query indexes, joining out only for heavy preimages.
+    -- holds all the query indexes, joining out only for heavy datums/scripts.
     "CREATE TABLE IF NOT EXISTS unspent \
     \( output_reference      BLOB    NOT NULL PRIMARY KEY \
     \, output_num            INTEGER NOT NULL UNIQUE \
@@ -126,12 +126,12 @@ tables =
     \( slot_no     INTEGER NOT NULL PRIMARY KEY \
     \, header_hash BLOB    NOT NULL \
     \)"
-  , -- Deduplicated datum preimages, referenced by hash from outputs/unspent.
+  , -- Deduplicated datums, referenced by hash from outputs/unspent.
     "CREATE TABLE IF NOT EXISTS binary_data \
     \( datum_hash BLOB NOT NULL PRIMARY KEY \
     \, datum      BLOB NOT NULL \
     \)"
-  , -- Deduplicated script preimages, referenced by hash from outputs/unspent.
+  , -- Deduplicated scripts, referenced by hash from outputs/unspent.
     "CREATE TABLE IF NOT EXISTS scripts \
     \( script_hash BLOB NOT NULL PRIMARY KEY \
     \, script      BLOB NOT NULL \

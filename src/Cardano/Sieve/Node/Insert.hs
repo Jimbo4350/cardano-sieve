@@ -36,7 +36,7 @@ module Cardano.Sieve.Node.Insert
   , RedeemerCapture (..)
   , StoredOutput (..)
   , SpentInput (..)
-  , Preimages (..)
+  , DatumsAndScripts (..)
   , openDatabase
   , closeDatabase
   , applyBlock
@@ -97,7 +97,7 @@ import Database.SQLite.Simple
 -- | How an output supplied its datum: written out in full on the output itself,
 -- or referenced only by hash. Reported as @datum_type@ in match responses, and
 -- it is the one thing a datum hash alone cannot tell you — with @DatumByHash@
--- the body may not exist anywhere yet, whereas @DatumInline@ guarantees it was
+-- the datum may not exist anywhere yet, whereas @DatumInline@ guarantees it was
 -- on chain with the output.
 data DatumType = DatumInline | DatumByHash
   deriving (Eq, Show)
@@ -176,7 +176,7 @@ data PolicyIndexing = DeferPolicies | MaintainPolicies
 data RedeemerCapture = CaptureRedeemers | SkipRedeemers
   deriving (Eq, Show)
 
--- | Datum and script /preimages/ from one block: the bodies behind the hashes
+-- | The datums and scripts one block carries: the bytes behind the hashes
 -- stored on output rows, for the deduplicated @binary_data@ and @scripts@ tables.
 -- Produced by "Cardano.Sieve.Node.Decode"; written by 'applyBlock'.
 --
@@ -184,18 +184,18 @@ data RedeemerCapture = CaptureRedeemers | SkipRedeemers
 -- datum referenced by hash from an output is supplied in the /witness set/ of a
 -- transaction, and that is frequently a later transaction than the one that
 -- created the output.
-data Preimages = Preimages
-  { pmDatums :: [(ByteString, ByteString)]
+data DatumsAndScripts = DatumsAndScripts
+  { dsDatums :: [(ByteString, ByteString)]
   -- ^ (datum hash, datum bytes).
-  , pmScripts :: [(ByteString, ByteString)]
+  , dsScripts :: [(ByteString, ByteString)]
   -- ^ (script hash, script bytes).
   }
 
-instance Semigroup Preimages where
-  a <> b = Preimages (pmDatums a <> pmDatums b) (pmScripts a <> pmScripts b)
+instance Semigroup DatumsAndScripts where
+  a <> b = DatumsAndScripts (dsDatums a <> dsDatums b) (dsScripts a <> dsScripts b)
 
-instance Monoid Preimages where
-  mempty = Preimages [] []
+instance Monoid DatumsAndScripts where
+  mempty = DatumsAndScripts [] []
 
 -- | A handle to the SQLite database; output writes are batched.
 data DbHandle = DbHandle
@@ -450,7 +450,7 @@ applyBlock
   -> ByteString
   -> [StoredOutput]
   -> [SpentInput]
-  -> Preimages
+  -> DatumsAndScripts
   -> IO ()
 applyBlock _ _ _ _ [] [] _ = pure ()
 applyBlock
@@ -464,7 +464,7 @@ applyBlock
   headerHash
   created
   spent
-  preimages = do
+  datumsAndScripts = do
     n <- readIORef pending
     when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
     -- Where we are on the chain, for resuming after a restart. Written for every
@@ -505,9 +505,9 @@ applyBlock
       withStatement conn insertSpendSql $ \spendIns ->
         withStatement conn deleteUnspentSql $ \delUns ->
           mapM_ (recordSpend spendIns delUns slot) spent
-    -- Preimages are gathered from the WHOLE block, so gate them on the block
-    -- being relevant to the configured selectors — otherwise a narrow selector
-    -- drags in every datum and script on the chain.
+    -- Datums and scripts are gathered from the WHOLE block, so gate them on
+    -- the block being relevant to the configured selectors — otherwise a
+    -- narrow selector drags in every datum and script on the chain.
     --
     -- The gate is "produced a tracked output". Widening it to "or spent a
     -- tracked input" would cost a lookup per input on the sync hot path, and
@@ -516,8 +516,8 @@ applyBlock
     -- narrow selector the narrower gate stores strictly less, which is the
     -- safe direction.
     unless (null created) $ do
-      mapM_ (insertPreimage conn "binary_data" "datum_hash" "datum") (pmDatums preimages)
-      mapM_ (insertPreimage conn "scripts" "script_hash" "script") (pmScripts preimages)
+      mapM_ (insertDatumOrScript conn "binary_data" "datum_hash" "datum") (dsDatums datumsAndScripts)
+      mapM_ (insertDatumOrScript conn "scripts" "script_hash" "script") (dsScripts datumsAndScripts)
     let n' = n + length created + length spent
     if n' >= batchSize
       then execute_ conn "COMMIT" >> writeIORef pending 0
@@ -668,18 +668,18 @@ policyNumOf conn pid = do
     Only num : _ -> pure num
     [] -> error "policyNumOf: policy_ids row absent immediately after INSERT OR IGNORE"
 
--- | Store one preimage, keyed by its hash. @INSERT OR IGNORE@ does the dedup: the
--- same datum or script recurs across many transactions, and the hash is the
--- primary key, so repeats cost a failed index probe rather than a row.
+-- | Store one datum or script, keyed by its hash. @INSERT OR IGNORE@ does the
+-- dedup: the same datum or script recurs across many transactions, and the
+-- hash is the primary key, so repeats cost a failed index probe rather than a row.
 --
 -- The table and column names are supplied by the caller rather than duplicating
 -- this function per table; they are compile-time literals here, never user input.
-insertPreimage :: Connection -> Query -> Query -> Query -> (ByteString, ByteString) -> IO ()
-insertPreimage conn table hashCol bodyCol (h, body) =
+insertDatumOrScript :: Connection -> Query -> Query -> Query -> (ByteString, ByteString) -> IO ()
+insertDatumOrScript conn table hashCol blobCol (h, blob) =
   execute
     conn
-    ("INSERT OR IGNORE INTO " <> table <> " (" <> hashCol <> ", " <> bodyCol <> ") VALUES (?, ?)")
-    (h, body)
+    ("INSERT OR IGNORE INTO " <> table <> " (" <> hashCol <> ", " <> blobCol <> ") VALUES (?, ?)")
+    (h, blob)
 
 -- | Record one spend. Appends to @spends@ only when the consumed output is one
 -- we track (the @WHERE EXISTS@ against @outputs@), and removes it from the live
