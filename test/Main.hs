@@ -42,7 +42,7 @@ import Cardano.Api
   )
 
 import Cardano.Sieve.Node.Insert
-  ( DbHandle
+  ( DbHandle (dbConn)
   , DirtyDatabase
   , Durability (Durable, UnsafeBulk)
   , PolicyIndexing (DeferPolicies, MaintainPolicies)
@@ -54,8 +54,8 @@ import Cardano.Sieve.Node.Insert
   , closeDatabase
   , openDatabase
   , reconcileSelectors
-  , resumePoints
   , rollbackAbove
+  , sampleCheckpoints
   )
 import Cardano.Sieve.Selector
   ( BootstrapFilter (IncludeBootstrap, OnlyShelley)
@@ -294,12 +294,12 @@ checkpointTests =
                   applyBlock db MaintainPolicies sl (blockHash (fromIntegral sl)) [storedOutput outputRef] [] mempty
               )
               [100, 200, 300]
-            points <- resumePoints db
+            points <- sampleCheckpoints (dbConn db)
             map fst points @?= [300, 200, 100]
     , testCase "no checkpoints means no resume points" $
         withTempDb "cp-empty" $ \path ->
           withDb path $ \db -> do
-            points <- resumePoints db
+            points <- sampleCheckpoints (dbConn db)
             points @?= []
     ]
  where

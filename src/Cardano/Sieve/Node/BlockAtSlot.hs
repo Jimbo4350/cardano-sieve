@@ -11,7 +11,7 @@
 -- node tip, and the same later refinement (a pooled connection) applies —
 -- and it walks until the target slot, because sieve's checkpoints, though
 -- stored per applied block, may start at a @--since@ rather than genesis.
-module Cardano.Sieve.Node.FetchBlock
+module Cardano.Sieve.Node.BlockAtSlot
   ( fetchBlockAtSlot
   )
 where

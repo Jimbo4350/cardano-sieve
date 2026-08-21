@@ -43,9 +43,10 @@ import Cardano.Api
   , serialiseToRawBytes
   )
 
-import Cardano.Sieve.Node.Decode (datumsAndScriptsInBlock, selectedStored, spentInputs)
+import Cardano.Sieve.Node.Decode (datumsAndScriptsInBlock, spentInputs)
+import Cardano.Sieve.Node.Encode (selectedStored)
 import Cardano.Sieve.Node.Insert
-  ( DbHandle
+  ( DbHandle (dbConn)
   , Durability (Durable, UnsafeBulk)
   , PolicyIndexing (DeferPolicies, MaintainPolicies)
   , RedeemerCapture
@@ -55,8 +56,8 @@ import Cardano.Sieve.Node.Insert
   , flushBatch
   , openDatabase
   , reconcileSelectors
-  , resumePoints
   , rollbackAbove
+  , sampleCheckpoints
   )
 import Cardano.Sieve.Selector (Selector, selectorToText)
 import Cardano.Slotting.Slot (SlotNo (SlotNo), WithOrigin (At, Origin), unSlotNo)
@@ -807,7 +808,7 @@ startPoints :: DbHandle -> ChainPoint -> IO [ChainPoint]
 startPoints dbHandle since = case since of
   ChainPoint{} -> pure [since]
   ChainPointAtGenesis -> do
-    stored <- resumePoints dbHandle
+    stored <- sampleCheckpoints (dbConn dbHandle)
     case (stored, traverse toChainPoint stored) of
       ([], _) -> pure [ChainPointAtGenesis]
       (newest : _, Just points) -> do

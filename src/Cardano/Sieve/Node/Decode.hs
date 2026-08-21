@@ -1,42 +1,21 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 
--- | The decode + sieve stage: turn a decoded block into the outputs that match
--- the configured selectors, ready to persist.
---
--- It bridges the pure matcher ("Cardano.Sieve.Selector") and the write path
--- ("Cardano.Sieve.Node.Insert"):
---
---   * 'outputsInBlock' walks a block's transactions and builds a
---     'DecodedOutput' per output (the minimal decode the matcher and schema
---     need). Byron blocks yield no transactions ('getBlockTxs' returns @[]@).
---   * 'selectedOutputs' keeps the outputs that satisfy /any/ selector.
---   * 'selectedStored' serialises those to 'StoredOutput's for the writer.
---
--- Each output is read as the experimental 'TxOut' (a wrapper over the ledger
--- output), and its fields are read with ledger lenses: address via
--- 'addrTxOutL', value via 'valueTxOutL', the datum via 'datumTxOutF', and the
--- reference script via 'referenceScriptTxOutL'. Datums and reference scripts
--- only exist from Alonzo and Babbage onwards respectively, so those reads sit
--- inside the matching 'ShelleyBasedEra' branches (Alonzo+ and Babbage+).
---
--- Value encoding: @cardano-api@'s 'Value' has no raw-bytes/CBOR instance, so
--- 'toStored' goes through "Cardano.Sieve.Value", which writes the ledger's compact
--- @MaryValue@ CBOR shape.
+-- | Decode a block's outputs and keep the ones that match the configured
+-- selectors: 'outputsInBlock' decodes, 'selectedOutputs' filters.
 module Cardano.Sieve.Node.Decode
   ( DecodedOutput (..)
   , outputsInBlock
   , datumsAndScriptsInBlock
   , toContext
   , selectedOutputs
-  , selectedStored
   , spentInputs
+  , encodeOutputRef
   )
 where
 
 import Cardano.Api
   ( AddressAny
-  , AssetId (AssetId)
   , BlockInMode (BlockInMode)
   , ShelleyBasedEra (..)
   , Tx (ShelleyTx)
@@ -71,16 +50,12 @@ import Cardano.Sieve.Node.Insert
   , DatumsAndScripts (..)
   , RedeemerCapture (CaptureRedeemers, SkipRedeemers)
   , SpentInput (..)
-  , StoredOutput (..)
   )
 import Cardano.Sieve.Selector
   ( OutputContext (..)
   , Selector
-  , delegationHash
-  , paymentHash
   , satisfies
   )
-import Cardano.Sieve.Value (encodeValue)
 
 import Data.ByteString (ByteString)
 import Data.ByteString.Builder (toLazyByteString, word64BE)
@@ -90,7 +65,6 @@ import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Word (Word64)
-import GHC.Exts (toList)
 import Lens.Micro ((^.))
 
 -- | Everything one output contributes, decoded once: the fields
@@ -284,10 +258,6 @@ selectedOutputs :: [Selector] -> BlockInMode -> [DecodedOutput]
 selectedOutputs selectors blk =
   filter (\o -> any (satisfies (toContext o)) selectors) (outputsInBlock blk)
 
--- | The selected outputs of a block, serialised for the writer.
-selectedStored :: [Selector] -> BlockInMode -> [StoredOutput]
-selectedStored selectors = map toStored . selectedOutputs selectors
-
 -- | Every consumed input of every transaction in a block. These are surfaced
 -- for /all/ inputs (an input carries no data to run a selector against); the
 -- writer keeps only the ones whose consumed output is tracked.
@@ -362,34 +332,9 @@ txSpends capture (ShelleyTx sbe ledgerTx) =
     originalBytes . fst
       <$> Map.lookup (mkSpendingPurpose (AsIx (fromIntegral ix))) (unRedeemers rdmrs)
 
--- | Serialise a selected output to the bytes the schema stores.
-toStored :: DecodedOutput -> StoredOutput
-toStored o =
-  StoredOutput
-    { soOutputRef = encodeOutputRef (doOutputRef o)
-    , soTransactionIndex = fromIntegral (doTransactionIndex o)
-    , soAddress = serialiseToRawBytes (doAddress o)
-    , soPayCred = paymentHash (doAddress o)
-    , soDelegCred = delegationHash (doAddress o)
-    , soValue = encodeValue (doValue o)
-    , soDatumHash = snd <$> doDatum o
-    , soDatumType = fst <$> doDatum o
-    , soReferenceScriptHash = doReferenceScriptHash o
-    , soAssets = assetsOf (doValue o)
-    }
-
 -- | Encode an output reference as the transaction id bytes followed by the
 -- output index as a big-endian 'Word64'. Fixed-width and order-preserving.
 encodeOutputRef :: TxIn -> ByteString
 encodeOutputRef (TxIn txid (TxIx ix)) =
   serialiseToRawBytes txid
     <> LBS.toStrict (toLazyByteString (word64BE (fromIntegral ix)))
-
--- | The distinct (policy id, asset name) pairs of the positive-quantity assets
--- in a value (ada excluded). Both are raw bytes; the asset name may be empty.
-assetsOf :: Value -> [(ByteString, ByteString)]
-assetsOf v =
-  Set.toList
-    ( Set.fromList
-        [(serialiseToRawBytes pid, serialiseToRawBytes name) | (AssetId pid name, q) <- toList v, q > 0]
-    )

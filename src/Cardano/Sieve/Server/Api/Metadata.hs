@@ -35,7 +35,7 @@ import Cardano.Api.Ledger qualified as L
 
 import Cardano.Ledger.Alonzo.Core (TxAuxDataHash (unTxAuxDataHash), hashTxAuxData, originalBytes)
 import Cardano.Ledger.Metadata (Metadatum (..))
-import Cardano.Sieve.Node.FetchBlock (fetchBlockAtSlot)
+import Cardano.Sieve.Node.BlockAtSlot (fetchBlockAtSlot)
 import Cardano.Sieve.Server.Api.Common (badRequest, hexText, withReadConnection)
 import Cardano.Slotting.Slot (SlotNo (SlotNo))
 

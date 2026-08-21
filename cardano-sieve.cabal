@@ -40,9 +40,10 @@ library
                    Cardano.Sieve.Selector
                    Cardano.Sieve.Value
                    Cardano.Sieve.Database.Schema
+                   Cardano.Sieve.Node.BlockAtSlot
                    Cardano.Sieve.Node.Decode
+                   Cardano.Sieve.Node.Encode
                    Cardano.Sieve.Node.Fetch
-                   Cardano.Sieve.Node.FetchBlock
                    Cardano.Sieve.Node.Insert
   build-depends:
     , aeson                    >=2.2

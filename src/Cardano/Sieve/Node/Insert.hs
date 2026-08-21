@@ -29,7 +29,7 @@
 -- during bulk sync would be paying 2.28 million statements for rows a single
 -- set-based pass can produce.
 module Cardano.Sieve.Node.Insert
-  ( DbHandle
+  ( DbHandle (dbConn)
   , Durability (..)
   , DirtyDatabase (..)
   , DatumType (..)
@@ -48,7 +48,6 @@ module Cardano.Sieve.Node.Insert
   , busyTimeoutMs
   , flushBatch
   , reconcileSelectors
-  , resumePoints
   , sampleCheckpoints
   , SelectorMismatch (..)
   , StoredSelectorUnparseable (..)
@@ -870,7 +869,9 @@ reconcileSelectors DbHandle{dbConn = conn} cliSelectors = do
 
 -- * Resume
 
--- | Points to offer the node when resuming, newest first.
+-- | The exponential checkpoint sample, newest first: the points offered to the
+-- node when resuming, and what @GET \/checkpoints@ serves — one function so the
+-- two can never drift.
 --
 -- @MsgFindIntersect@ takes a LIST and the node replies with the newest point it
 -- recognises, so this is not "where we stopped" but "everywhere we might
@@ -883,33 +884,19 @@ reconcileSelectors DbHandle{dbConn = conn} cliSelectors = do
 -- an implausibly deep one still finds something without carrying every
 -- checkpoint over the wire.
 --
--- Capped at 'resumePointCount' entries. Genesis is not included; the caller
--- appends it as the last resort.
-resumePoints :: DbHandle -> IO [(Int64, ByteString)]
-resumePoints DbHandle{dbConn = conn} = sampleCheckpoints conn
-
--- | The exponential checkpoint sample, on a bare connection: what 'resumePoints'
--- offers the node and what @GET \/checkpoints@ serves — one function so the two
--- can never drift.
+-- Capped at 'resumePointCount' entries. Genesis is not included; the resuming
+-- caller appends it as the last resort.
 sampleCheckpoints :: Connection -> IO [(Int64, ByteString)]
 sampleCheckpoints conn = do
   rows <- query_ conn "SELECT slot_no, header_hash FROM checkpoints ORDER BY slot_no DESC"
-  pure (withOldest rows (pick 0 1 rows))
- where
-  -- Take row 0, then stride 1, 2, 4, 8 … forward through the descending list.
-  pick _ _ [] = []
-  pick taken stride (x : xs)
-    | taken >= resumePointCount = []
-    | otherwise = x : pick (taken + 1) (stride * 2) (drop (stride - 1) xs)
-
-  -- Always end on the oldest checkpoint we hold. The exponential steps overshoot
-  -- the end of the list, so without this the deepest point on offer is an
-  -- arbitrary one partway back, and anything older falls all the way to genesis
-  -- — re-reading the whole chain to recover from a rollback we had the data to
-  -- survive.
-  withOldest rows picked = case (reverse rows, reverse picked) of
-    (oldest : _, deepest : _) | fst oldest /= fst deepest -> picked <> [oldest]
-    _ -> picked
+  -- Positions 2^k - 1 through the descending list, plus the last row: without
+  -- the oldest checkpoint on offer, a rollback deeper than the sample falls
+  -- back to genesis instead of a point we hold. The set dedupes the overlap.
+  let n = length rows
+      wanted =
+        Set.fromList $
+          [n - 1 | n > 0] <> takeWhile (< n) [2 ^ k - 1 | k <- [0 .. resumePointCount - 1]]
+  pure [row | (i, row) <- zip [0 ..] rows, i `Set.member` wanted]
 
 -- | How many points to offer. Enough to span a deep rollback at exponential
 -- spacing (the 20th reaches ~500,000 checkpoints back) without making the
