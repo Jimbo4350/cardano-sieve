@@ -504,16 +504,17 @@ applyBlock
       withStatement conn insertSpendSql $ \spendIns ->
         withStatement conn deleteUnspentSql $ \delUns ->
           mapM_ (recordSpend spendIns delUns slot) spent
-    -- Datums and scripts are gathered from the WHOLE block, so gate them on
-    -- the block being relevant to the configured selectors — otherwise a
-    -- narrow selector drags in every datum and script on the chain.
+    -- Datums and scripts are gathered from the WHOLE block, so write them
+    -- only when the block was relevant to the configured selectors —
+    -- otherwise a narrow selector would still store every datum and script
+    -- on the chain.
     --
-    -- The gate is "produced a tracked output". Widening it to "or spent a
-    -- tracked input" would cost a lookup per input on the sync hot path, and
-    -- under a wildcard selector (how the benchmark runs) any block with
+    -- Relevant means "produced a tracked output". Widening that to "or spent
+    -- a tracked input" would cost a lookup per input on the sync hot path,
+    -- and under a wildcard selector (how the benchmark runs) any block with
     -- transactions produces tracked outputs, so the two coincide. Under a
-    -- narrow selector the narrower gate stores strictly less, which is the
-    -- safe direction.
+    -- narrow selector the narrower condition stores strictly less, which is
+    -- the safe direction.
     unless (null created) $ do
       mapM_ (insertDatumOrScript conn "binary_data" "datum_hash" "datum") (dsDatums datumsAndScripts)
       mapM_ (insertDatumOrScript conn "scripts" "script_hash" "script") (dsScripts datumsAndScripts)

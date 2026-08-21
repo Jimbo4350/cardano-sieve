@@ -38,20 +38,14 @@ import Ouroboros.Network.Protocol.ChainSync.Client qualified as CS
 
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 
--- | The first block at or after @target@, walking forward from @ancestor@ —
--- a point the node should recognise (a stored checkpoint, or genesis).
+-- | The first block at or after @target@, walking forward from @ancestor@ (a
+-- point the node recognises: a stored checkpoint, or genesis). The walk is
+-- normally one block; a target past the node's tip blocks until the chain
+-- reaches it. A slot nobody minted in answers with the NEXT block — the
+-- endpoint reports the actual header hash so a client can tell.
 --
--- 'Nothing' when the node does not recognise the ancestor, or when the chain
--- rolls back mid-walk: both mean a rollback won a race against this request,
--- and both get the \"no ancestor\" answer upstream. The walk is normally a
--- single block — the at-or-before ancestor of @target − 1@ is the block
--- immediately preceding @target@ wherever checkpoints are dense — and a
--- target past the node's tip blocks until the chain reaches it.
---
--- Note the contract: this returns the first block AT OR
--- PAST the target, with no check that a block sits exactly at it. A slot
--- nobody minted in answers with the next block's content — which is why the
--- endpoint reports the block's actual header hash for the client to verify.
+-- 'Nothing' means a rollback won the race: the ancestor was not recognised,
+-- or the chain rolled back mid-walk.
 fetchBlockAtSlot :: SocketPath -> NetworkId -> ChainPoint -> SlotNo -> IO (Maybe BlockInMode)
 fetchBlockAtSlot socketPath networkId ancestor target = do
   result <- newIORef Nothing

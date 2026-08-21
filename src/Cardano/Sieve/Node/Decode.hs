@@ -34,9 +34,6 @@ import Cardano.Api
 import Cardano.Api.Experimental.Tx (TxOut (TxOut))
 import Cardano.Api.Ledger qualified as L
 
--- @originalBytes@ (the memoised CBOR a ledger decoder kept) is not re-exported by
--- @Cardano.Api.Ledger@, same as 'IsValid' and 'collateralReturnTxBodyL'; take it
--- from the ledger directly.
 import Cardano.Ledger.Alonzo.Core (originalBytes, scriptPrefixTag)
 import Cardano.Ledger.Alonzo.Scripts
   ( AsIx (AsIx)
@@ -81,8 +78,8 @@ data DecodedOutput = DecodedOutput
   -- ^ The datum's type and hash, when the output carries one.
   , doReferenceScriptHash :: Maybe ByteString
   , doMetadataTags :: Set Word64
-  -- ^ Top-level metadata labels on the producing transaction (shared by all its
-  -- outputs); empty if none.
+  -- ^ Metadata labels of the producing transaction. Metadata is per-transaction,
+  -- so every output of the same transaction carries the same set; empty if none.
   }
 
 -- | Every output of every transaction in a block. Byron blocks contribute
@@ -156,9 +153,9 @@ outputsInTx txIx (ShelleyTx sbe ledgerTx) =
         -- explicitly, not silently take the pre-Babbage path. On a
         -- Babbage/Conway isValid=false (phase-2 failure) tx the transaction's
         -- outputs were never created; the only created output is the collateral
-        -- return, at index = number of outputs. Each branch builds
-        -- DecodedOutputs directly (mkOutput applied where the ledger era is
-        -- concrete) so the case result carries no era index.
+        -- return, at index = number of outputs. The collateral return is
+        -- optional: SNothing is a tx that declared none, forfeiting the whole
+        -- collateral to fees and creating no output at all.
         case sbe of
           ShelleyBasedEraShelley -> txOutputs
           ShelleyBasedEraAllegra -> txOutputs
@@ -181,21 +178,14 @@ outputsInTx txIx (ShelleyTx sbe ledgerTx) =
 -- /inline/ datum and the /reference script/ straight off each output, where the
 -- bytes are already in hand for free.
 --
--- The caller decides whether to write these: see the relevance gate in
--- "Cardano.Sieve.Node.Insert" — store a block's datums and scripts only if that
--- block produced a tracked output, so a narrow selector does not drag in the
--- whole chain's datums.
+-- The collection here is unconditional; it is 'applyBlock' that decides
+-- whether to write, and it writes a block's datums and scripts only when the
+-- block produced a matched output. Without that condition every datum and
+-- script on the chain would be stored no matter how narrow the selectors.
 datumsAndScriptsInBlock :: BlockInMode -> DatumsAndScripts
 datumsAndScriptsInBlock (BlockInMode _ block) = foldMap datumsAndScriptsInTx (getBlockTxs block)
 
--- | The datums and scripts of one transaction. Every era is enumerated (no wildcard) so a
--- future era must be handled explicitly rather than silently yielding nothing.
--- Note on shape: the era-specific lenses ('datsTxWitsL' needs @AlonzoEraTxWits@,
--- 'datumTxOutF' @AlonzoEraTxOut@, 'referenceScriptTxOutL' @BabbageEraTxOut@) are
--- applied INSIDE the concrete @case sbe of@ branches. 'shelleyBasedEraConstraints'
--- only brings the era-generic constraints into scope, so hoisting those reads into
--- a @let@ fails to typecheck — the same trap as building the collateral output via
--- a polymorphic helper. Only the era-agnostic post-processing is factored out.
+-- | The datums and scripts of one transaction.
 datumsAndScriptsInTx :: Tx era -> DatumsAndScripts
 datumsAndScriptsInTx (ShelleyTx sbe ledgerTx) =
   shelleyBasedEraConstraints sbe $
@@ -226,8 +216,8 @@ datumsAndScriptsInTx (ShelleyTx sbe ledgerTx) =
 
         -- Scripts: the witness set in every era, plus output reference scripts
         -- from Babbage. Each stored blob is @scriptPrefixTag s <> originalBytes s@
-        -- — exactly the bytes 'L.hashScript' hashes, so the stored script hashes
-        -- back to the key it is filed under.
+        -- — exactly the bytes 'L.hashScript' hashes, so hashing a stored script
+        -- reproduces its own @script_hash@ column.
         scriptRow sh s =
           (serialiseToRawBytes (fromShelleyScriptHash sh), scriptPrefixTag s <> originalBytes s)
         scripts =
