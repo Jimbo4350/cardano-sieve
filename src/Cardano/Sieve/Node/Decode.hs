@@ -279,7 +279,7 @@ txSpends capture (ShelleyTx sbe ledgerTx) =
 
         -- On a Babbage/Conway isValid=false tx the regular inputs are NOT
         -- consumed; the collateral inputs are. Pre-Babbage: the regular inputs.
-        consumedOf isv collateral = case isv of
+        consumedInputs isv collateral = case isv of
           IsValid True -> regular
           IsValid False -> collateral
 
@@ -289,9 +289,13 @@ txSpends capture (ShelleyTx sbe ledgerTx) =
           ShelleyBasedEraMary -> regular
           ShelleyBasedEraAlonzo -> regular
           ShelleyBasedEraBabbage ->
-            consumedOf (ledgerTx ^. isValidTxL) (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
+            consumedInputs
+              (ledgerTx ^. isValidTxL)
+              (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
           ShelleyBasedEraConway ->
-            consumedOf (ledgerTx ^. isValidTxL) (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
+            consumedInputs
+              (ledgerTx ^. isValidTxL)
+              (F.toList (ledgerTx ^. L.bodyTxL . L.collateralInputsTxBodyL))
         -- Redeemers exist from Alonzo onwards. 'mkSpendingPurpose' is a method of
         -- @AlonzoEraScript@, so the call sits inside the concrete branches — but
         -- unlike the per-era constructors it is one expression for all three.

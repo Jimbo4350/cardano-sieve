@@ -9,7 +9,11 @@
 -- The indexing loop is a single-threaded, pipelined ChainSync client
 -- with no application-level queue. The buffering below the application (node
 -- send buffer, kernel, mux ingress) provides flow control; pipelining depth is
--- the only bound on in-flight data.
+-- the only bound on in-flight data. References: the mux ingress\/egress queues
+-- are described in
+-- <https://ouroboros-network.cardano.intersectmbo.org/network-mux/Network-Mux.html Network.Mux>
+-- and the multiplexing chapter of
+-- <https://ouroboros-network.cardano.intersectmbo.org/pdfs/network-spec the network spec>.
 --
 -- There are two clients, both starting from a configurable point (@--since@,
 -- genesis by default), and both handling a rolled-forward block the same way,
@@ -160,7 +164,7 @@ runSync socketPath networkId dbPath batchSize durability cliSelectors mkClient =
         -- selectors stored in the database, so a bare restart continues as before.
         selectors <- reconcileSelectors dbHandle cliSelectors
         progress <- newProgress
-        stamped
+        logLine
           ( "sync starting  db "
               <> dbPath
               <> "  batch-size "
@@ -169,10 +173,10 @@ runSync socketPath networkId dbPath batchSize durability cliSelectors mkClient =
               <> duration heartbeatSeconds
               <> ")"
           )
-        stamped ("indexing selectors: " <> describeSelectors selectors)
+        logLine ("indexing selectors: " <> describeSelectors selectors)
         case durability of
           UnsafeBulk ->
-            stamped
+            logLine
               "bulk mode: journaling off for catch-up — a clean exit (Ctrl-C) is safe, \
               \but a crash means delete the database and resync"
           Durable -> pure ()
@@ -265,7 +269,7 @@ tick ref slotNo target outputs spends = do
           , pgBlocksAtReport = pgBlocks folded
           , pgSlotAtReport = unSlotNo slotNo
           }
-      stamped (progressLine folded now slotNo target)
+      logLine (progressLine folded now slotNo target)
 
 -- | The heartbeat line, e.g.
 --
@@ -335,7 +339,7 @@ summarise ref = do
   now <- getMonotonicTime
   pg <- readIORef ref
   let secs = max 1e-6 (now - pgStartedAt pg)
-  stamped
+  logLine
     ( "sync done  blocks "
         <> commas (pgBlocks pg)
         <> "  outputs "
@@ -356,8 +360,8 @@ summarise ref = do
 -- time rather than a relative elapsed figure. Local time, second resolution:
 -- enough to line an event up against @cardano-node@'s own log without being
 -- noise.
-stamped :: String -> IO ()
-stamped msg = do
+logLine :: String -> IO ()
+logLine msg = do
   now <- getCurrentTime
   tz <- getCurrentTimeZone
   putStrLn (formatTime defaultTimeLocale "%H:%M:%S" (utcToLocalTime tz now) <> "  " <> msg)
@@ -610,7 +614,7 @@ followingClient dbHandle progress capture selectors since =
     CSP.SendMsgFindIntersect points $
       CSP.ClientPipelinedStIntersect
         { CSP.recvMsgIntersectFound = \point serverTip -> do
-            stamped ("resuming from " <> describePoint point)
+            logLine ("resuming from " <> describePoint point)
             pure (clientIdle built Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             -- Only reachable for an explicit --since, since the resume ladder
@@ -661,12 +665,12 @@ followingClient dbHandle progress capture selectors since =
                 -- it happens with the heartbeat silenced (no blocks are being
                 -- rolled forward while it runs), so without these two lines
                 -- sieve looks hung at exactly the moment it finishes catching up.
-                stamped
+                logLine
                   "reached tip — deriving the policy index and building query indexes (this can take a few minutes)"
                 t0 <- getMonotonicTime
                 buildIndexesOn dbHandle
                 t1 <- getMonotonicTime
-                stamped
+                logLine
                   ( "policy + query indexes built in "
                       <> duration (t1 - t0)
                       <> " — database now durable (WAL), following the tip"
@@ -709,7 +713,7 @@ boundedClient dbHandle progress capture selectors since untilSlot =
     CSP.SendMsgFindIntersect points $
       CSP.ClientPipelinedStIntersect
         { CSP.recvMsgIntersectFound = \point serverTip -> do
-            stamped ("resuming from " <> describePoint point)
+            logLine ("resuming from " <> describePoint point)
             pure (clientIdle Indexing Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             fail ("--since point not on the node's chain: " <> show since)
@@ -812,7 +816,7 @@ startPoints dbHandle since = case since of
     case (stored, traverse toChainPoint stored) of
       ([], _) -> pure [ChainPointAtGenesis]
       (newest : _, Just points) -> do
-        stamped
+        logLine
           ( "resuming: offering "
               <> show (length points)
               <> " checkpoint(s), newest slot "
@@ -822,7 +826,7 @@ startPoints dbHandle since = case since of
       -- A header hash the current build cannot read means the row is not one we
       -- wrote. Start over rather than guess at it.
       (_, Nothing) -> do
-        stamped "checkpoints unreadable — starting from genesis"
+        logLine "checkpoints unreadable — starting from genesis"
         pure [ChainPointAtGenesis]
  where
   toChainPoint (slot, hash) =
