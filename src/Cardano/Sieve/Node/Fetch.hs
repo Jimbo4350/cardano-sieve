@@ -63,6 +63,16 @@ import Cardano.Sieve.Node.Insert
   , rollbackAbove
   , sampleCheckpoints
   )
+import Cardano.Sieve.Node.Progress
+  ( Progress
+  , commas
+  , duration
+  , heartbeatSeconds
+  , logLine
+  , newProgress
+  , summarise
+  , tick
+  )
 import Cardano.Sieve.Selector (Selector, selectorToText)
 import Cardano.Slotting.Slot (SlotNo (SlotNo), WithOrigin (At, Origin), unSlotNo)
 import Ouroboros.Network.Protocol.ChainSync.ClientPipelined qualified as CSP
@@ -78,13 +88,9 @@ import Data.Int (Int64)
 import Data.List (intercalate)
 import Data.Proxy (Proxy (Proxy))
 import Data.Text qualified as T
-import Data.Time.Clock (getCurrentTime)
-import Data.Time.Format (defaultTimeLocale, formatTime)
-import Data.Time.LocalTime (getCurrentTimeZone, utcToLocalTime)
-import Data.Word (Word16, Word64)
+import Data.Word (Word16)
 import GHC.Clock (getMonotonicTime)
 import Network.TypedProtocol.Core (N (S), Nat (Succ, Zero))
-import Numeric (showFFloat)
 
 -- | Follow a local node's chain forever, starting at @since@ (genesis by
 -- default): sieve each block's outputs against the selectors and persist the
@@ -99,7 +105,7 @@ fetch
   -> [Selector]
   -> ChainPoint
   -> IO ()
-fetch socketPath networkId dbPath batchSize durability capture selectors since =
+fetch socketPath networkId dbPath batchSize durability redeemerCapture selectors since =
   runSync
     socketPath
     networkId
@@ -107,7 +113,7 @@ fetch socketPath networkId dbPath batchSize durability capture selectors since =
     batchSize
     durability
     selectors
-    (\dbHandle progress active -> followingClient dbHandle progress capture active since)
+    (\dbHandle progress active -> followingClient dbHandle progress redeemerCapture active since)
 
 -- | Same as 'fetch', but index only from @since@ up to and including @untilSlot@,
 -- then stop. For bounded backfills and benchmark runs.
@@ -122,7 +128,7 @@ fetchBounded
   -> ChainPoint
   -> SlotNo
   -> IO ()
-fetchBounded socketPath networkId dbPath batchSize durability capture selectors since untilSlot =
+fetchBounded socketPath networkId dbPath batchSize durability redeemerCapture selectors since untilSlot =
   runSync
     socketPath
     networkId
@@ -130,7 +136,7 @@ fetchBounded socketPath networkId dbPath batchSize durability capture selectors 
     batchSize
     durability
     selectors
-    (\dbHandle progress active -> boundedClient dbHandle progress capture active since untilSlot)
+    (\dbHandle progress active -> boundedClient dbHandle progress redeemerCapture active since untilSlot)
 
 -- | Open the database, connect to the local node, and drive the given
 -- pipelined ChainSync client, flushing the database on exit. The bounded and
@@ -207,165 +213,6 @@ runSync socketPath networkId dbPath batchSize durability cliSelectors mkClient =
       , localTxMonitoringClient = Nothing
       }
 
--- | Rolling counters behind the periodic sync heartbeat.
---
--- A bulk sync processes millions of blocks, so a line per block is unreadable
--- and costs real throughput in the hot loop (it is why the benchmark used to
--- discard sieve's output wholesale). Instead every roll-forward folds its work
--- into these counters — cheap, no I/O — and a line is emitted only once
--- 'heartbeatSeconds' have passed.
-data Progress = Progress
-  { pgStartedAt :: !Double
-  -- ^ Monotonic seconds when the sync began; the basis for @elapsed@.
-  , pgReportedAt :: !Double
-  -- ^ Monotonic seconds when the last line was emitted. Also the left edge of
-  -- the window the reported block rate is computed over.
-  , pgBlocks :: !Int
-  -- ^ Blocks rolled forward since the start.
-  , pgOutputs :: !Int
-  -- ^ Matched outputs written since the start.
-  , pgSpends :: !Int
-  -- ^ Spends recorded since the start.
-  , pgBlocksAtReport :: !Int
-  -- ^ 'pgBlocks' as of the last emitted line, so the rate is the /recent/ rate
-  -- rather than a start-to-now average that hides a slowdown.
-  , pgSlotAtReport :: !Word64
-  -- ^ Slot reached as of the last emitted line. Drives the ETA, which needs a
-  -- /slot/ rate rather than the block rate: the distance left to cover is
-  -- measured in slots, and on a chain with empty slots the two differ.
-  }
-
--- | Emit at most one progress line per this many seconds.
-heartbeatSeconds :: Double
-heartbeatSeconds = 5
-
-newProgress :: IO (IORef Progress)
-newProgress = do
-  now <- getMonotonicTime
-  newIORef (Progress now now 0 0 0 0 0)
-
--- | Fold one block's work into the counters, emitting a progress line if the
--- heartbeat interval has elapsed. One clock read per block on the common path.
---
--- @target@ is the slot the sync is heading for, when known — @--until@ for a
--- bounded run, the server's tip for a following one — and drives the percentage.
-tick :: IORef Progress -> SlotNo -> Maybe SlotNo -> Int -> Int -> IO ()
-tick ref slotNo target outputs spends = do
-  now <- getMonotonicTime
-  pg <- readIORef ref
-  let folded =
-        pg
-          { pgBlocks = pgBlocks pg + 1
-          , pgOutputs = pgOutputs pg + outputs
-          , pgSpends = pgSpends pg + spends
-          }
-  if now - pgReportedAt folded < heartbeatSeconds
-    then writeIORef ref folded
-    else do
-      writeIORef
-        ref
-        folded
-          { pgReportedAt = now
-          , pgBlocksAtReport = pgBlocks folded
-          , pgSlotAtReport = unSlotNo slotNo
-          }
-      logLine (progressLine folded now slotNo target)
-
--- | The heartbeat line, e.g.
---
--- > 14:22:07  syncing   32.1%  slot 1,284,213/3,999,989  1,843 blk/s  eta 24m35s  blocks 61,204  outputs 418,337  spends 205,118  elapsed 35s
---
--- and once there is no target left to head for:
---
--- > 14:48:19  at tip    slot 3,999,989  12 blk/s  blocks 1,204,551  outputs 8,418,337  spends 7,205,118  elapsed 26m12s
-progressLine :: Progress -> Double -> SlotNo -> Maybe SlotNo -> String
-progressLine pg now slotNo target =
-  case target of
-    Just t | unSlotNo t > unSlotNo slotNo -> heading t
-    -- No target, or we have caught up with it. A percentage and an ETA are
-    -- meaningless here, and printing "100.0%" every 5s while following the tip
-    -- reads like a stuck sync.
-    _ -> atTip
- where
-  heading t =
-    "syncing   "
-      <> pad 6 (showFFloat (Just 1) (100 * ratio t) "%")
-      <> "  slot "
-      <> commas (unSlotNo slotNo)
-      <> "/"
-      <> commas (unSlotNo t)
-      <> "  "
-      <> commas (round rate :: Word64)
-      <> " blk/s  eta "
-      <> eta t
-      <> counters
-
-  atTip =
-    "at tip    slot "
-      <> commas (unSlotNo slotNo)
-      <> "  "
-      <> commas (round rate :: Word64)
-      <> " blk/s"
-      <> counters
-
-  counters =
-    "  blocks "
-      <> commas (pgBlocks pg)
-      <> "  outputs "
-      <> commas (pgOutputs pg)
-      <> "  spends "
-      <> commas (pgSpends pg)
-      <> "  elapsed "
-      <> duration (now - pgStartedAt pg)
-
-  ratio t = fromIntegral (unSlotNo slotNo) / fromIntegral (unSlotNo t) :: Double
-
-  -- Slots per second over the heartbeat window, not blocks: the remaining
-  -- distance is measured in slots, and on a chain with empty slots the two rates
-  -- differ by whatever fraction of slots carry a block.
-  eta t
-    | slotRate <= 0 = "?"
-    | otherwise = duration (fromIntegral (unSlotNo t - unSlotNo slotNo) / slotRate)
-
-  slotRate = fromIntegral (unSlotNo slotNo - pgSlotAtReport pg) / window :: Double
-
-  -- Guard the divisor: two blocks can share a clock reading.
-  window = max 1e-6 (now - pgReportedAt pg)
-  rate = fromIntegral (pgBlocks pg - pgBlocksAtReport pg) / window :: Double
-
--- | The closing line when a bounded sync finishes.
-summarise :: IORef Progress -> IO ()
-summarise ref = do
-  now <- getMonotonicTime
-  pg <- readIORef ref
-  let secs = max 1e-6 (now - pgStartedAt pg)
-  logLine
-    ( "sync done  blocks "
-        <> commas (pgBlocks pg)
-        <> "  outputs "
-        <> commas (pgOutputs pg)
-        <> "  spends "
-        <> commas (pgSpends pg)
-        <> "  elapsed "
-        <> duration secs
-        <> "  avg "
-        <> commas (round (fromIntegral (pgBlocks pg) / secs) :: Word64)
-        <> " blk/s"
-    )
-
--- | Emit one log line, prefixed with the wall-clock time.
---
--- A bulk sync runs for tens of minutes and its output is usually read after the
--- fact, out of a redirected file, so \"when did it slow down\" needs an absolute
--- time rather than a relative elapsed figure. Local time, second resolution:
--- enough to line an event up against @cardano-node@'s own log without being
--- noise.
-logLine :: String -> IO ()
-logLine msg = do
-  now <- getCurrentTime
-  tz <- getCurrentTimeZone
-  putStrLn (formatTime defaultTimeLocale "%H:%M:%S" (utcToLocalTime tz now) <> "  " <> msg)
-
 -- | The selector set for the startup line.
 --
 -- Worth printing because the set is no longer necessarily the one on the command
@@ -375,30 +222,6 @@ describeSelectors :: [Selector] -> String
 describeSelectors = \case
   [] -> "none (nothing will be indexed)"
   xs -> intercalate ", " (map (T.unpack . selectorToText) xs)
-
--- | Seconds as a compact human duration: @45s@, @6m12s@, @2h04m@.
-duration :: Double -> String
-duration secs
-  | secs < 60 = show s <> "s"
-  | secs < 3600 = show m <> "m" <> pad0 (s - m * 60) <> "s"
-  | otherwise = show h <> "h" <> pad0 (m - h * 60) <> "m"
- where
-  s = max 0 (round secs) :: Int
-  m = s `div` 60
-  h = m `div` 60
-  pad0 n = if n < 10 then '0' : show n else show n
-
--- | Thousands separators. Seven-figure block and output counts are unreadable
--- without them, and these lines exist to be skimmed.
-commas :: Show a => a -> String
-commas = reverse . intercalate "," . chunksOf3 . reverse . show
- where
-  chunksOf3 [] = []
-  chunksOf3 xs = let (a, b) = splitAt 3 xs in a : chunksOf3 b
-
--- | Left-pad to a fixed width so the percentage column does not jitter.
-pad :: Int -> String -> String
-pad n s = replicate (n - length s) ' ' <> s
 
 -- | Sieve one block's outputs against the selectors, persist the matches, and
 -- record spends of any tracked outputs the block's transactions consumed;
@@ -413,11 +236,11 @@ sieveBlock
   -> Maybe SlotNo
   -> BlockInMode
   -> IO BlockHeader
-sieveBlock dbHandle progress capture policyIndexing selectors target blockInMode@(BlockInMode _ block) = do
+sieveBlock dbHandle progress redeemerCapture policyIndexing selectors target blockInMode@(BlockInMode _ block) = do
   let header = getBlockHeader block
       BlockHeader slotNo hash _blockNo = header
       selected = selectedStored selectors blockInMode
-      spent = spentInputs capture blockInMode
+      spent = spentInputs redeemerCapture blockInMode
   applyBlock
     dbHandle
     policyIndexing
@@ -430,19 +253,19 @@ sieveBlock dbHandle progress capture policyIndexing selectors target blockInMode
   pure header
 
 -- | Whether the deferred query indexes have been built yet. The follower builds
--- them once, the first time it reaches the node's tip; a named state reads
--- better than a bare 'Bool' at the roll-forward guard.
+-- them once, the first time it reaches the node's tip.
 data IndexState = IndexesPending | IndexesBuilt
 
--- | Which half of its life 'boundedClient' is in.
+-- | Which half of its life 'boundedClient' is in. The bound is the @--until@
+-- slot, inclusive: the last slot the run indexes.
 --
 -- Two phases rather than one, because @SendMsgDone@ is only legal with nothing
--- in flight: on reaching @--until@ the client is still owed the ~50 responses it
+-- in flight: on reaching the bound the client is still owed the ~50 responses it
 -- pipelined ahead, and must collect them all before it may finish.
 data BoundedPhase
   = -- | Before the bound: consult 'pipelineDecisionMax', request more, and write
     -- what arrives.
-    Indexing
+    Syncing
   | -- | Past the bound: request nothing, discard what arrives, and finish once
     -- the pipeline is empty.
     Draining
@@ -478,12 +301,18 @@ data BoundedPhase
 -- The consequence worth internalising: far from the tip the client settles into
 -- collect-one, request-one at @n = maxInFlight@, so @Collect@ comes back on
 -- roughly every other call — once per block. Near the tip the second trigger fires
--- at @n = 1@, so @n@ oscillates 0..1. Either way @Collect@ is frequent; it is NOT
--- the thing that rations commits.
+-- at @n = 1@, so @n@ oscillates 0..1. Either way @Collect@ is frequent — so if
+-- @Collect@ meant commit, bulk sync would commit once per block. It does not:
+-- collecting only takes delivery of a response. Whether the flush runs is the
+-- driver's separate question — has the response even arrived? — and during bulk
+-- sync the network runs ahead of SQLite, so the answer is almost always yes and
+-- commits stay rationed by the batch counter. See 'collectFlushingWhenIdle'.
 --
 -- Note also that @Request@ — the non-pipelined, blocking form used when caught up
--- — is not handled distinctly below: the @_@ branch treats it as @Pipeline@. That
--- works, but ignores an explicit \"you are at the tip\" signal from the protocol.
+-- — is not handled distinctly below: the @_@ branch treats it as @Pipeline@,
+-- which just pipelines one request and collects it straight back. Deliberate,
+-- not an oversight — the client detects the tip from the empty pipeline instead —
+-- but it does ignore an explicit \"you are at the tip\" signal from the protocol.
 
 -- | Build the \"collect one pipelined response\" instruction, spelling out /two/
 -- alternatives for the driver to choose between:
@@ -491,12 +320,7 @@ data BoundedPhase
 --   * the response is already here — process it, the ordinary path;
 --   * it is not here — COMMIT the rows written so far, instead of blocking with
 --     them left uncommitted.
---
--- This function does not collect anything and does not commit anything. It
--- returns a value describing both alternatives; the driver runs one of them
--- later. That indirection is the whole of ADR-020 Decision 2, the /idle flush/,
--- and it is the part most likely to be misread — so:
---
+
 -- == Two separate decisions, and the one that matters is not ours
 --
 -- It is easy to read this as \"we flush every time 'pipelineDecisionMax' says
@@ -538,8 +362,7 @@ data BoundedPhase
 -- arrived?\" on every collect regardless — we are only supplying what to do with
 -- the \"no\" answer, which was previously thrown away as 'Nothing'.
 --
--- That matters because the obvious alternatives are all worse, and ADR-020
--- Decision 2 rejected them by name:
+-- That matters because the obvious alternatives are all worse:
 --
 --   * __A row-count cap alone__ \"leaves a near-empty batch open for minutes at
 --     the tip (stale, unqueryable data)\" — blocks arrive every ~20s carrying a
@@ -548,7 +371,7 @@ data BoundedPhase
 --   * __A timer__ \"reintroduces a thread and a tunable\" — something has to wake
 --     up and fire it, and someone has to pick the interval, and the interval is
 --     wrong in both directions (too eager during bulk sync, too lazy at the tip).
---   * __A mailbox drain__ needs exactly the queue and thread ADR-020 removed.
+--   * __A queue-fed writer thread__ needs exactly the queue and thread.
 --
 -- Flush-on-idle needs none of that: bulk sync and tip-following get different
 -- behaviour out of the same rule, with no mode switch between them and no
@@ -568,9 +391,7 @@ data BoundedPhase
 --   * __Starved during bulk sync__ — the node failed to deliver even the oldest
 --     of ~50 outstanding requests. Should be rare against a local node serving
 --     from disk. If it is NOT rare, bulk sync degrades towards a commit per
---     block, which is the expensive end of the batch-size curve (41.7s versus
---     31.6s over @origin..2,000,000@). This is measured, not assumed — see the
---     verification task; until then treat the bulk-sync claim as unconfirmed.
+--     block.
 --
 -- 'flushBatch' is a no-op when nothing is pending, so an idle flush with no
 -- written rows costs one 'IORef' read.
@@ -587,6 +408,9 @@ collectFlushingWhenIdle
   -> CSP.ClientPipelinedStIdle (S n) BlockInMode ChainPoint ChainTip IO ()
 collectFlushingWhenIdle dbHandle next =
   CSP.CollectResponse
+    -- The idle branch: runs only when the driver finds no response buffered —
+    -- nothing has arrived off the socket that we have not already consumed, so
+    -- the outstanding requests are still unanswered: the tip, or a starved node.
     (Just (flushBatch dbHandle >> pure (CSP.CollectResponse Nothing next)))
     next
 
@@ -601,7 +425,7 @@ followingClient
   -> [Selector]
   -> ChainPoint
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-followingClient dbHandle progress capture selectors since =
+followingClient dbHandle progress redeemerCapture selectors since =
   CSP.ChainSyncClientPipelined $ do
     built <- newIORef IndexesPending
     points <- startPoints dbHandle since
@@ -617,8 +441,9 @@ followingClient dbHandle progress capture selectors since =
             logLine ("resuming from " <> describePoint point)
             pure (clientIdle built Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
-            -- Only reachable for an explicit --since, since the resume ladder
-            -- always ends at genesis, which every chain has.
+            -- Only an explicit --since can land here: it is offered as the sole
+            -- point, so the node can reject it. Otherwise 'startPoints' ends its
+            -- candidate list with genesis, which is on every chain.
             fail ("--since point not on the node's chain: " <> show since)
         }
 
@@ -641,17 +466,26 @@ followingClient dbHandle progress capture selectors since =
   clientNext built n =
     CSP.ClientStNext
       { CSP.recvMsgRollForward = \blockInMode serverTip -> do
-          -- The policy index follows the same phase as the deferred indexes:
-          -- skipped while catching up, maintained per block once at the tip. The
-          -- block that TRIGGERS the transition is still processed as deferred —
-          -- its rows are committed before 'buildIndexesOn' runs, so the bulk
-          -- derive below covers it.
+          -- The policies table is derived data (policy id -> output, redundant
+          -- with the outputs' value bundles), so during catch-up no policies
+          -- rows are written at all: 'buildIndexesOn' derives the whole table
+          -- in one pass on reaching the tip, and only blocks after that
+          -- maintain it per block. The handoff has no gap — the block that
+          -- catches the tip is itself processed deferred, but its outputs are
+          -- in the database before the derive scans, so the derive covers it.
           st0 <- readIORef built
           let policyIndexing = case st0 of
                 IndexesPending -> DeferPolicies
                 IndexesBuilt -> MaintainPolicies
           BlockHeader _ _ blockNo <-
-            sieveBlock dbHandle progress capture policyIndexing selectors (chainTipSlot serverTip) blockInMode
+            sieveBlock
+              dbHandle
+              progress
+              redeemerCapture
+              policyIndexing
+              selectors
+              (chainTipSlot serverTip)
+              blockInMode
           let tip = fromChainTip serverTip
           -- On first catching the node's tip, build the deferred query indexes
           -- once: bulk catch-up ran index-free, and from here tip updates are
@@ -700,7 +534,7 @@ boundedClient
   -> ChainPoint
   -> SlotNo
   -> CSP.ChainSyncClientPipelined BlockInMode ChainPoint ChainTip IO ()
-boundedClient dbHandle progress capture selectors since untilSlot =
+boundedClient dbHandle progress redeemerCapture selectors since untilSlot =
   CSP.ChainSyncClientPipelined (clientIntersect <$> startPoints dbHandle since)
  where
   maxInFlight :: Word16
@@ -714,7 +548,7 @@ boundedClient dbHandle progress capture selectors since untilSlot =
       CSP.ClientPipelinedStIntersect
         { CSP.recvMsgIntersectFound = \point serverTip -> do
             logLine ("resuming from " <> describePoint point)
-            pure (clientIdle Indexing Origin (fromChainTip serverTip) Zero)
+            pure (clientIdle Syncing Origin (fromChainTip serverTip) Zero)
         , CSP.recvMsgIntersectNotFound = \_serverTip ->
             fail ("--since point not on the node's chain: " <> show since)
         }
@@ -734,14 +568,14 @@ boundedClient dbHandle progress capture selectors since untilSlot =
           -- discarded, and 'runSync''s bracket commits what is pending on the way
           -- out.
           Succ predN -> CSP.CollectResponse Nothing (clientNext Draining predN)
-      Indexing ->
+      Syncing ->
         case pipelineDecisionMax maxInFlight n clientTip serverTip of
           Collect -> case n of
-            Succ predN -> collectFlushingWhenIdle dbHandle (clientNext Indexing predN)
+            Succ predN -> collectFlushingWhenIdle dbHandle (clientNext Syncing predN)
           _ ->
             CSP.SendMsgRequestNextPipelined
               (pure ())
-              (clientIdle Indexing clientTip serverTip (Succ n))
+              (clientIdle Syncing clientTip serverTip (Succ n))
 
   clientNext
     :: BoundedPhase -> Nat n -> CSP.ClientStNext n BlockInMode ChainPoint ChainTip IO ()
@@ -750,7 +584,7 @@ boundedClient dbHandle progress capture selectors since untilSlot =
       { CSP.recvMsgRollForward = \blockInMode serverTip ->
           case phase of
             Draining -> pure (clientIdle Draining Origin (fromChainTip serverTip) n)
-            Indexing -> do
+            Syncing -> do
               -- Peek the slot BEFORE indexing: a block past the bound must not
               -- be written. --until is inclusive, so index
               -- iff slot <= untilSlot; the first block beyond the bound flips us
@@ -764,15 +598,16 @@ boundedClient dbHandle progress capture selectors since untilSlot =
                   -- Always deferred: a bounded run never reaches the tip
                   -- transition, and --build-indexes derives the policy index
                   -- along with the rest.
-                  _ <- sieveBlock dbHandle progress capture DeferPolicies selectors (Just untilSlot) blockInMode
-                  let next = if slotNo >= untilSlot then Draining else Indexing
+                  _ <-
+                    sieveBlock dbHandle progress redeemerCapture DeferPolicies selectors (Just untilSlot) blockInMode
+                  let next = if slotNo >= untilSlot then Draining else Syncing
                   pure (clientIdle next (At blockNo) (fromChainTip serverTip) n)
       , CSP.recvMsgRollBackward = \point serverTip ->
           case phase of
             Draining -> pure (clientIdle Draining Origin (fromChainTip serverTip) n)
-            Indexing -> do
+            Syncing -> do
               rollbackAbove dbHandle (chainPointSlot point)
-              pure (clientIdle Indexing Origin (fromChainTip serverTip) n)
+              pure (clientIdle Syncing Origin (fromChainTip serverTip) n)
       }
 
 -- | The server tip as a 'WithOrigin' block number, for 'pipelineDecisionMax'.

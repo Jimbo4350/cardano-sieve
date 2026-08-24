@@ -17,7 +17,7 @@
 -- Writes are /batched/: inserts accumulate inside a single open transaction and
 -- only COMMIT every N outputs, amortising SQLite's per-commit @fsync@ over the
 -- batch. The open transaction is SQLite's own buffer, so this needs no
--- application-level queue (ADR-020 Decision 1). The final partial batch is
+-- application-level queue. The final partial batch is
 -- committed by 'closeDatabase'; run it via 'Control.Exception.finally' so it
 -- also fires when the caller is torn down by an async exception.
 --
@@ -94,10 +94,7 @@ import Database.SQLite.Simple
   )
 
 -- | How an output supplied its datum: written out in full on the output itself,
--- or referenced only by hash. Reported as @datum_type@ in match responses, and
--- it is the one thing a datum hash alone cannot tell you — with @DatumByHash@
--- the datum may not exist anywhere yet, whereas @DatumInline@ guarantees it was
--- on chain with the output.
+-- or referenced only by hash.
 data DatumType = DatumInline | DatumByHash
   deriving (Eq, Show)
 
@@ -155,15 +152,16 @@ data SpentInput = SpentInput
   -- the schema cannot distinguish — see 'RedeemerCapture'.
   }
 
--- | Whether 'applyBlock' maintains the @policies@\/@policy_ids@ index per row,
--- or leaves it for 'buildPolicyIndex' to derive later.
+-- | Whether 'applyBlock' writes @policies@\/@policy_ids@ rows as it stores
+-- each output, or leaves them for 'buildPolicyIndex' to derive in bulk later.
 --
--- Deferred during catch-up because the per-row spelling is the single largest
--- item in the write phase — two interning statements plus an insert per asset
--- row, 2.28 million statements over @origin..2,000,000@ — for a table that a
--- one-shot set-based pass reproduces from @outputs.value@. Maintained again
--- once at the tip, where blocks arrive every ~20s and the per-row cost is
--- irrelevant.
+-- The policies index maps policy\/asset ids to the outputs carrying them, so
+-- asset queries need not decode every @outputs.value@ blob. It is pure derived
+-- data — the same (policy, asset) pairs already sit inside the stored value —
+-- which is what makes deferring it safe. Deferred during catch-up because the
+-- per-row spelling is the single largest item in the write phase (two
+-- interning statements plus an insert per asset row); maintained per row at
+-- the tip, where blocks arrive every ~20s and the cost is irrelevant.
 data PolicyIndexing = DeferPolicies | MaintainPolicies
   deriving (Eq, Show)
 
@@ -272,11 +270,16 @@ buildIndexesOn db = do
 --
 -- One Haskell pass decodes each stored value (SQLite cannot read CBOR; this is
 -- the only part that cannot be SQL) into a temporary staging table of
--- @(output_num, policy_id, asset_name)@ triples. Everything after is set-based:
--- one statement tops up the dictionary with the policies not yet in it, and one
--- @INSERT … SELECT … JOIN@ writes the index — the join IS the interning,
--- replacing per-row lookups with a single relational operation. No cache,
--- nothing held in memory beyond the statement.
+-- @(output_num, policy_id, asset_name)@ triples. Everything after is two
+-- set-based statements. @policy_ids@ is a dictionary: each distinct policy
+-- blob is stored once under a small integer key, and @policies@ rows carry
+-- the key instead of repeating the blob. The first statement tops the
+-- dictionary up with the policies not yet in it; the second, an
+-- @INSERT … SELECT … JOIN@ against the dictionary, translates every staging
+-- row's blob to its key and writes the index. The join is the per-row
+-- \"find this blob's key\" lookup re-expressed as one relational operation
+-- over the whole set — so no per-row queries and no Haskell-side cache of
+-- seen policies.
 --
 -- Idempotent, and more: it /completes/ a partial index rather than assuming
 -- emptiness. A database that was maintained for a while, then extended with
@@ -401,7 +404,7 @@ prepare durability path conn = do
   -- same instant, and whichever connection touches it first briefly holds an
   -- exclusive lock rebuilding the WAL index — so even the @user_version@ read
   -- below can lose that collision, and with no timeout it errored instead of
-  -- waiting out the microseconds, killing the process on ~9% of sync+serve
+  -- waiting out the microseconds, killing the process on sync+serve
   -- startups. The pragma itself is a connection setting, not a file access,
   -- so it cannot be the loser. 'Cardano.Sieve.Server.Api.Common.withReadConnection' is
   -- the reader-side mirror of this, for the same reason.
@@ -466,12 +469,16 @@ applyBlock
   datumsAndScripts = do
     n <- readIORef pending
     when (n == 0) $ execute_ conn "BEGIN TRANSACTION"
-    -- Where we are on the chain, for resuming after a restart. Written for every
-    -- APPLIED block rather than every block seen: the empty-block fast path above
-    -- returns before this, so a quiet stretch leaves no checkpoint and a resume
-    -- rewinds to the last block that actually mattered. Correct — replaying
-    -- blocks is idempotent, every insert here is OR IGNORE — and it keeps the
-    -- fast path free.
+    -- A checkpoint row records how far the sync has got; after a restart,
+    -- 'startPoints' offers these to the node as resume points.
+    --
+    -- Only applied blocks get one: the empty-block equation above returns
+    -- before this, so a stretch of blocks with nothing to store leaves no
+    -- checkpoint, and a restart rewinds to the last block that stored
+    -- something, re-downloading the boring stretch. That replay is harmless —
+    -- every insert here is OR IGNORE, so re-applied blocks are no-ops — and
+    -- checkpointing every block seen would put a write on the fast path,
+    -- whose point is to do none.
     --
     -- Rides the caller's open transaction, so the checkpoint and the rows it
     -- vouches for commit together. Never one without the other.
@@ -479,13 +486,10 @@ applyBlock
       conn
       "INSERT OR IGNORE INTO checkpoints (slot_no, header_hash) VALUES (?, ?)"
       (slot, headerHash)
-    -- Unconditional for any APPLIED block, because the schema's contract is
-    -- "one row per block that produced a matched output OR A SPEND": a block
-    -- can spend tracked outputs while creating nothing that matches, and
-    -- gating this on created outputs left those spends rendering
-    -- @spent_at.header_hash@ as null. Unreachable under a wildcard selector —
-    -- every transaction creates matching outputs — which is why no benchmark
-    -- ever saw it.
+    -- Unconditional for any applied block: the schema's contract is one row
+    -- per block that produced a matched output OR a spend. A block can spend
+    -- tracked outputs while creating nothing that matches (funds moving away
+    -- from a tracked address).
     execute
       conn
       "INSERT OR IGNORE INTO blocks (slot_no, header_hash) VALUES (?, ?)"

@@ -45,6 +45,7 @@ library
                    Cardano.Sieve.Node.Encode
                    Cardano.Sieve.Node.Fetch
                    Cardano.Sieve.Node.Insert
+                   Cardano.Sieve.Node.Progress
   build-depends:
     , aeson                    >=2.2
     , async                    ^>=2.2
